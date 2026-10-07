@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+*.spec
+.venv/
+_gpustacker_work/
+*.fit
+*.fits
+*.xisf
+*.npy

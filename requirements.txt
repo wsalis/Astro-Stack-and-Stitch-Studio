@@ -1,0 +1,9 @@
+numpy>=1.24,<3.0
+astropy>=6.0
+xisf>=0.9
+scipy>=1.11
+astroalign>=2.6
+sep>=1.4
+torch>=2.2
+psutil>=5.9
+pytest>=8.0,<9.0

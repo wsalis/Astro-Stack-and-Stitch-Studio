@@ -1,0 +1,33 @@
+[project]
+name = "gpustacker"
+version = "0.1.0"
+description = "GPU-accelerated deep-sky stacking with ImageMM multi-frame deconvolution"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24,<3.0",
+    "astropy>=6.0",
+    "xisf>=0.9",
+    "scipy>=1.11",
+    "astroalign>=2.6",
+    "sep>=1.4",
+    "torch>=2.2",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0,<9.0"]
+
+[project.scripts]
+gpustacker = "gpustacker.cli:main"
+gpustacker-gui = "gpustacker.gui:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["gpustacker*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
