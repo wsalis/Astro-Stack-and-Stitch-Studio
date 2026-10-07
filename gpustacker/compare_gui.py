@@ -66,8 +66,11 @@ class CompareWindow:
         if isinstance(root, (tk.Tk, tk.Toplevel)):
             root.geometry("1120x620")
             root.minsize(900, 480)
+        if isinstance(root, tk.Toplevel):
+            root.transient(root.master)
         configure_dark_theme(root)
         self._build()
+        root.lift()
         initial = list(gpus or [])
         if gpu is not None:
             initial.insert(0, gpu)
@@ -78,7 +81,8 @@ class CompareWindow:
 
     def _add_candidate_paths(self, paths: list[Path] | tuple[str, ...] | None = None) -> None:
         if paths is None:
-            paths = filedialog.askopenfilenames(title="Select GPUStacker masters", filetypes=STACK_TYPES)
+            paths = filedialog.askopenfilenames(title="Select GPUStacker masters", filetypes=STACK_TYPES, parent=self.root)
+            self.root.lift()
         for path in paths:
             candidate = Path(path)
             if candidate not in self.candidate_paths:
@@ -102,7 +106,8 @@ class CompareWindow:
         self._render_candidates()
 
     def _browse_reference(self) -> None:
-        chosen = filedialog.askopenfilename(title="Select reference stack", filetypes=STACK_TYPES)
+        chosen = filedialog.askopenfilename(title="Select reference stack", filetypes=STACK_TYPES, parent=self.root)
+        self.root.lift()
         if chosen:
             self.ref_var.set(chosen)
 
@@ -173,7 +178,7 @@ class CompareWindow:
         candidates = list(self.candidate_paths)
         reference = Path(self.ref_var.get()) if self.ref_var.get() else None
         if not candidates or any(not path.is_file() for path in candidates) or reference is None or not reference.is_file():
-            messagebox.showerror("Compare", "Select existing candidate masters and a reference stack")
+            messagebox.showerror("Compare", "Select existing candidate masters and a reference stack", parent=self.root)
             return
         self.run_btn.configure(state="disabled")
         self.save_btn.configure(state="disabled")
@@ -247,7 +252,8 @@ class CompareWindow:
         if not self.results:
             return
         default = self.candidate_paths[0].with_suffix(".compare.json").name if len(self.results) == 1 else "compare_all.compare.json"
-        chosen = filedialog.asksaveasfilename(defaultextension=".json", initialfile=default, filetypes=[("JSON", "*.json")])
+        chosen = filedialog.asksaveasfilename(defaultextension=".json", initialfile=default, filetypes=[("JSON", "*.json")], parent=self.root)
+        self.root.lift()
         if chosen:
             write_report(self.results[0] if len(self.results) == 1 else self.results, Path(chosen))
             self._log(f"Saved {chosen}")

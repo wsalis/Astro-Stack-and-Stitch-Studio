@@ -350,6 +350,71 @@ and re-shoot - the side that sharpens was too far out. Save CSV... writes the pe
 CLI: gpustacker tilt <frames or folder> [--cells N] [--csv out.csv] [--gui].""",
     ),
     (
+        "Mosaic",
+        """Mosaic... assembles finished master tiles (one stack per panel, e.g. from a Batch run grouped by
+OBJECT) into a single seamless image. It replaces the PixInsight GradientCorrection ->
+MosaicByCoordinates -> PhotometricMosaic sequence with one pass.
+
+Inputs: 2 or more masters, FITS or XISF, mono or RGB (not mixed). Each needs a WCS; GPUStacker
+masters are plate solved with ASTAP (SIP distortion included). Tiles without a WCS are solved on
+the fly when "Plate solve tiles without WCS" is on and ASTAP is installed. Drizzled masters work
+too - the output scale defaults to the finest tile. Order matters: tile 1 is the photometric
+reference (its sky level, gain and rotation are kept).
+
+Steps, in order:
+  1. Gradient correction per tile. A polynomial sky model (degree 1-3, default 2) is fitted to
+     block medians with asymmetric clipping, so nebulosity (bright blocks) is excluded from the
+     fit and the model follows the darkest, sky-dominated blocks. The model is subtracted and its
+     median level put back, so ADU levels stay comparable. Degree 0 = off. The log reports the
+     peak-to-peak gradient removed from each tile as a percentage of the sky.
+  2. Canvas: a TAN projection centred on the tiles, at the finest tile's pixel scale (or the one
+     you enter), with tile 1's rotation ("first") or north up ("north"). Keeping tile 1's
+     rotation means tile 1 lands on the canvas with an integer shift at matching scale.
+  3. Reprojection: every canvas pixel is mapped through the output WCS and the tile's SIP WCS
+     back into the tile and sampled with Lanczos-3 (or bicubic/bilinear) on the GPU. Flux is
+     scaled by the pixel-area ratio so a tile at a different scale keeps its surface brightness.
+     Pixels whose 7x7 Lanczos footprint touches missing data are dropped (no bright edge rims).
+  4. Refine registration: stars are detected in every overlap on both tiles and matched; the
+     median offsets give a least-squares shift per tile (tile 1 fixed). Shifts under 0.05 px are
+     ignored, over 50 px are treated as a bad plate solution and skipped. The log shows the
+     residual star scatter per overlap - expect 0.1-0.3 px with SIP solutions.
+  5. Photometric match: 32 px block medians in every overlap feed one robust joint solve per
+     channel for gain and offset per tile (plus an optional residual plane per tile, which mops
+     up gradient-correction differences between neighbours). Everything is tied to tile 1, with
+     weak priors (gain 1, plane 0) that only matter when an overlap is featureless sky. The log
+     shows each overlap's median |difference| before and after.
+    6. Blend. "feather" (default): plain weighted feather of the full image. "seam": the background
+      is combined with a wide feather (Feather px, from each tile's edge inward) while stars and
+      fine detail come from a single tile per place with a narrow transition (Seam px, along the
+      line where the feather weights cross). This avoids doubling a residual 0.3 px misregistration,
+      but can create halos around bright stars when overlapping tile details differ. The seam mode
+      is implemented as hard-seam composite + blurred (feathered - hard-seam) difference.
+
+Output: <name>.fit with a clean TAN WCS for the canvas (PLTSOLVD, usable in PixInsight /
+Astrometry tools), MOSTILES, MOSSCALE, MOSGRAD, MOSFEATH, MOSSEAM, MOSPHOT, per-tile MOSTILnn /
+MOSGNnnn (mean gain). <name>_coverage.fit = tiles per pixel. Pixels no tile covers are 0.
+Auto-crop (on by default) keeps the largest axis-aligned rectangle with coverage from at least one
+tile, removing all black borders. Turn it off to retain the full canvas. The cropped FITS and
+coverage map keep a matching WCS.
+
+Tips
+  Visible seam in the background -> raise Feather (200-400 px on 3000 px tiles), keep Gradient
+  degree 2, make sure Residual plane is on.
+  Doubled or elongated stars near a seam -> look at the "scatter" in the log; if it is above
+  ~0.5 px the plate solutions disagree (re-solve, or stack panels with the same reference
+  settings) - the "seam" blend hides the overlap region's offset but not an in-tile distortion.
+  Brightness step at the seam of a nebula -> Photometric match handles gain; if one tile has
+  very different nebula coverage the plane term may overfit: turn Residual plane off.
+  Mixed pixel scales (one drizzled tile) -> set Pixel scale explicitly to the coarser value to
+  avoid upsampling noise.
+  Memory: tiles are warped and blended in row bands on the GPU; a 4-panel 6000 x 6000 RGB canvas
+  needs about 1.5 GB of host RAM.
+
+CLI: gpustacker mosaic <tiles or folder> -o mosaic.fit [--gradient 2] [--feather 100] [--seam 4]
+     [--blend seam|feather] [--scale "/px] [--orientation first|north] [--no-refine]
+     [--no-photometric] [--no-plane] [--no-solve] [--cpu]. Omit -o or pass --gui for the window.""",
+    ),
+    (
         "Troubleshooting",
         """"All frames were excluded" / very few stars
   Lower "star sigma" to 3-4, or disable the stars filter (set to 0). Check that debayer is right;

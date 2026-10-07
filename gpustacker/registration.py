@@ -173,23 +173,24 @@ def _warp_lanczos(image: torch.Tensor, sx: torch.Tensor, sy: torch.Tensor, a: in
     stars), while the sharpening from the negative lobes is otherwise kept intact."""
 
     channels, height, width = image.shape
+    out_shape = tuple(sx.shape)  # output grid may differ from the source image (mosaic reprojection)
     x0 = torch.floor(sx)
     y0 = torch.floor(sy)
     offs = torch.arange(-a + 1, a + 1, device=image.device, dtype=torch.float32)  # 2a taps
-    wx = _lanczos_weights((sx - x0).unsqueeze(0) - offs.view(-1, 1, 1))  # (2a, H, W)
+    wx = _lanczos_weights((sx - x0).unsqueeze(0) - offs.view(-1, 1, 1))  # (2a, Ho, Wo)
     wy = _lanczos_weights((sy - y0).unsqueeze(0) - offs.view(-1, 1, 1))
     xi_all = (x0.unsqueeze(0) + offs.view(-1, 1, 1)).clamp(0, width - 1).long()
     yi_all = (y0.unsqueeze(0) + offs.view(-1, 1, 1)).clamp(0, height - 1).long()
     flat = image.reshape(channels, -1)
-    acc = torch.zeros_like(image)
-    wsum = torch.zeros((height, width), device=image.device)
-    floor = torch.full_like(image, float("inf"))
+    acc = torch.zeros((channels, *out_shape), device=image.device, dtype=image.dtype)
+    wsum = torch.zeros(out_shape, device=image.device)
+    floor = torch.full((channels, *out_shape), float("inf"), device=image.device, dtype=image.dtype)
     for iy in range(2 * a):
         row = yi_all[iy] * width
         for ix in range(2 * a):
             w = wy[iy] * wx[ix]
             idx = (row + xi_all[ix]).reshape(-1)
-            vals = flat[:, idx].reshape(channels, height, width)
+            vals = flat[:, idx].reshape(channels, *out_shape)
             acc += vals * w
             wsum += w
             floor = torch.minimum(floor, vals)

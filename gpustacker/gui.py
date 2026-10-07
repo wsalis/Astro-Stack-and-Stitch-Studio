@@ -448,6 +448,7 @@ class GPUStackerApp:
         self.cancel_btn.pack(side="left", padx=6)
         ttk.Button(bar, text="Compare…", command=self._open_compare).pack(side="left")
         ttk.Button(bar, text="Tilt…", command=self._open_tilt).pack(side="left", padx=(6, 0))
+        ttk.Button(bar, text="Mosaic…", command=self._open_mosaic).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="Help", command=self._open_help).pack(side="left", padx=6)
         self.status_var = tk.StringVar(value="Idle")
         ttk.Label(bar, textvariable=self.status_var).pack(side="right")
@@ -755,6 +756,18 @@ class GPUStackerApp:
         from .tilt_gui import TiltWindow
 
         TiltWindow(tk.Toplevel(self.root), list(self.lights))
+
+    def _open_mosaic(self) -> None:
+        from .mosaic_gui import MosaicWindow
+
+        # Preload the masters of the last batch run (one per panel) when they exist on disk.
+        tiles: list[Path] = []
+        out = Path(self.output_var.get()) if self.output_var.get() else None
+        if out is not None and self.batch_var.get():
+            folder = out if out.is_dir() or out.suffix.lower() not in (".fit", ".fits", ".fts") else out.parent
+            if folder.is_dir():
+                tiles = [p for p in sorted(folder.glob("*.fit")) if is_gpustacker_output(p) and not any(p.stem.endswith(s) for s in ("_coverage", "_rejection", "_drizzle", "_drizzle_weight", "_mfdeconv"))]
+        MosaicWindow(tk.Toplevel(self.root), tiles or None)
 
     def _open_help(self) -> None:
         HelpWindow(tk.Toplevel(self.root))

@@ -14,6 +14,7 @@ from .cosmetic import CosmeticSettings
 from .drizzle import DrizzleSettings
 from .io import discover_frames, is_gpustacker_output
 from .mfdeconv import MFDECONV_PRESETS, MFDeconvSettings
+from .mosaic import BLEND_MODES, INTERPOLATIONS, ORIENTATIONS
 from .normalization import LocalNormSettings
 from .pipeline import PipelineSettings, StackingPipeline
 from .quality import WEIGHTING_CHOICES, FilterSettings
@@ -34,6 +35,21 @@ def _collect_lights(items: list[str]) -> list[Path]:
     if skipped:
         print(f"Skipping {len(skipped)} GPUStacker output file(s) found among the lights", flush=True)
     return [p for p in lights if p not in skipped]
+
+
+def _collect_tiles(items: list[str]) -> list[Path]:
+    """Master tiles are GPUStacker outputs themselves, so nothing is skipped; maps are left out."""
+
+    tiles: list[Path] = []
+    for item in items:
+        p = Path(item)
+        if p.is_dir():
+            tiles.extend(discover_frames(p, skip_outputs=False))
+        elif p.exists():
+            tiles.append(p)
+        else:
+            tiles.extend(sorted(Path().glob(item)))
+    return [p for p in tiles if not any(p.stem.endswith(s) for s in ("_coverage", "_rejection", "_drizzle_weight"))]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -125,6 +141,28 @@ def build_parser() -> argparse.ArgumentParser:
     tl.add_argument("--cells", type=int, default=4, help="Grid size per axis (default 4)")
     tl.add_argument("--csv", type=Path, help="Write per-frame tilt table to this CSV")
     tl.add_argument("--gui", action="store_true", help="Open the inspector window with the given frames preloaded")
+
+    ms = sub.add_parser("mosaic", help="Gradient-correct, register (by WCS) and seamlessly blend plate-solved master tiles into one mosaic")
+    ms.add_argument("tiles", nargs="*", help="Master tile files (FITS/XISF with WCS, or plate-solvable by ASTAP); omit to open the GUI")
+    ms.add_argument("-o", "--output", type=Path, help="Output mosaic FITS path")
+    ms.add_argument("--gradient", type=int, default=2, help="Per-tile sky gradient polynomial degree, 0 = off (default 2)")
+    ms.add_argument("--gradient-block", type=int, default=64, help="Block size in px for the sky samples (default 64)")
+    ms.add_argument("--scale", type=float, default=0.0, help="Output pixel scale in arcsec/px (default: finest tile)")
+    ms.add_argument("--orientation", choices=list(ORIENTATIONS), default="first", help="first = keep tile 1's rotation (default), north = north up")
+    ms.add_argument("--interp", choices=list(INTERPOLATIONS), default="lanczos3")
+    ms.add_argument("--no-refine", action="store_true", help="Do not refine tile positions from matched stars in the overlaps")
+    ms.add_argument("--no-photometric", action="store_true", help="Skip gain/offset matching in the overlaps")
+    ms.add_argument("--no-plane", action="store_true", help="Photometric match without the per-tile residual plane")
+    ms.add_argument("--feather", type=float, default=100.0, help="Background blend width in px (default 100)")
+    ms.add_argument("--seam", type=float, default=4.0, help="Detail/star seam width in px (default 4)")
+    ms.add_argument("--blend", choices=list(BLEND_MODES), default="feather", help="feather = plain feather (default); seam = feathered background + single-tile detail")
+    ms.add_argument("--no-autocrop", action="store_true", help="Keep the full canvas, including uncovered black borders")
+    ms.add_argument("--no-solve", action="store_true", help="Fail on tiles without WCS instead of plate solving them with ASTAP")
+    ms.add_argument("--astap", type=Path, help="Path to astap_cli/astap executable (default: auto-detect)")
+    ms.add_argument("--no-maps", action="store_true", help="Do not write the coverage map")
+    ms.add_argument("--cpu", action="store_true", help="Force CPU backend")
+    ms.add_argument("--vram-fraction", type=float, default=0.75)
+    ms.add_argument("--gui", action="store_true", help="Open the mosaic window with the given tiles preloaded")
     return parser
 
 
@@ -252,6 +290,51 @@ def main(argv: list[str] | None = None) -> int:
         if args.csv:
             write_tilt_csv(maps + ([session] if len(maps) >= 2 else []), args.csv)
             print(f"Wrote {args.csv}")
+        return 0
+
+    if args.command == "mosaic":
+        tiles = _collect_tiles(args.tiles) if args.tiles else []
+        if not tiles or args.gui or args.output is None:
+            from .mosaic_gui import main as mosaic_gui_main
+
+            return mosaic_gui_main(tiles or None, args.output)
+        from .mosaic import MosaicBuilder, MosaicSettings
+
+        mosaic_settings = MosaicSettings(
+            tiles=tiles,
+            output=args.output,
+            gradient_degree=args.gradient,
+            gradient_block=args.gradient_block,
+            pixel_scale=args.scale,
+            orientation=args.orientation,
+            interpolation=args.interp,
+            refine=not args.no_refine,
+            photometric=not args.no_photometric,
+            match_gradient=not args.no_plane,
+            feather=args.feather,
+            seam_width=args.seam,
+            blend_mode=args.blend,
+            auto_crop=not args.no_autocrop,
+            plate_solve=not args.no_solve,
+            astap_path=args.astap,
+            save_coverage=not args.no_maps,
+            device="cpu" if args.cpu else "auto",
+            vram_fraction=args.vram_fraction,
+        )
+        last_pct = {"pct": -1}
+
+        def mosaic_progress(frac: float, msg: str) -> None:
+            pct = int(frac * 100)
+            if pct != last_pct["pct"]:
+                last_pct["pct"] = pct
+                print(f"  [{pct:3d}%] {msg}", flush=True)
+
+        try:
+            result = MosaicBuilder(mosaic_settings, status, mosaic_progress).run()
+        except KeyboardInterrupt:
+            print("Interrupted", file=sys.stderr)
+            return 130
+        print(f"Mosaic -> {result.output}")
         return 0
 
     settings = settings_from_args(args)

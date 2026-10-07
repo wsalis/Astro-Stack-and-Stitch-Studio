@@ -33,6 +33,15 @@ def _max_rectangle(mask: np.ndarray) -> tuple[int, int, int, int]:
     return best
 
 
+def largest_valid_box(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    """Largest all-True axis-aligned rectangle in a 2-D mask, as (y0, y1, x0, x1)."""
+
+    if mask.ndim != 2 or not mask.any():
+        return None
+    y0, y1, x0, x1 = _max_rectangle(mask)
+    return (y0, y1, x0, x1) if y1 > y0 and x1 > x0 else None
+
+
 def full_depth_box(coverage: np.ndarray, min_frames: int, coarse: int = 4) -> tuple[int, int, int, int] | None:
     """Largest rectangle where coverage >= min_frames everywhere, as (y0, y1, x0, x1)."""
 
