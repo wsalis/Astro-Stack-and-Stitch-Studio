@@ -3,6 +3,7 @@ name = "gpustacker"
 version = "0.1.0"
 description = "GPU-accelerated deep-sky stacking with ImageMM multi-frame deconvolution"
 readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24,<3.0",

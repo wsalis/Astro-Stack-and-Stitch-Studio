@@ -72,6 +72,10 @@ ImageMM knobs: `--mf-iters`, `--mf-kappa` (step clip), `--mf-relax` (damping),
 py -3 -m pytest -q
 ```
 
+## License
+
+GPUStacker is licensed under the MIT License. See [LICENSE](LICENSE).
+
 ## Credits
 
 The deconvolution follows Sukurdeep (2025, AJ 170, doi:10.3847/1538-3881/adfb72) and

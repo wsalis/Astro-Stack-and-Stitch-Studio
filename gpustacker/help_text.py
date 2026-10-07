@@ -157,6 +157,13 @@ Selected weighting masters (off by default)
   master, including the primary, gets a _weight-<method> suffix.
   Calibration and registration are shared; stacking and local normalisation repeat per method.
 
+  Variant norm (only enabled for multiple weightings when Local norm is on)
+    Reuse primary maps  Apply the local-normalisation maps fitted for the first weighting to every
+                        additional weighting. Faster and isolates the effect of changing weights.
+    Refit per method   Fit a separate set of local-normalisation maps for each weighting. Better
+                        adapts each stack to its own weighted result, but changes both the weights
+                        and the fitted background correction in the comparison.
+
 Normalise
   Subtract each frame's sky and scale its flux onto the reference (per channel) before combining.
   Scale comes from aperture photometry (1/transparency), falling back to the noise ratio. Always
@@ -280,7 +287,16 @@ Blend       Mix the MFDeconv result with the regular master: 0 = master unchange
             deconvolution, 0.3 = 30 % deconvolved correction. This affects only the MFDeconv
             output; the regular master is untouched.
 Strength: gentle | normal | strong | custom
-  Presets for the fields below; editing a field switches to custom.
+  Presets for the fields below; editing a preset-controlled field switches to custom. Presets set
+  frames, maximum iterations, kappa, relax, Huber delta, dering sigma and early-stop tolerance:
+    gentle  24 frames, 10 iterations, kappa 1.5, relax 0.6, Huber -1.5 RMS, dering 2.0 sigma,
+      stop tolerance 0.10. The most restrained preset; usually stops early.
+    normal  24 frames, 15 iterations, kappa 1.5, relax 0.6, Huber -1.5 RMS, dering 2.0 sigma,
+      stop tolerance 0.05. Moderate preset and the GUI default.
+    strong  12 frames, 30 iterations, kappa 2.0, relax 0.6, Huber -1.5 RMS, dering 1.5 sigma,
+      stop tolerance 0.02. Allows larger updates and more iterations; inspect for ringing,
+      halos and noise amplification.
+    custom  Keep the field values you set; no preset values are applied.
 Frames      Number of sharpest eligible frames fed to the solver (12-24). Stack weight breaks FWHM
             ties; this selection affects only MFDeconv, not the regular master. More = better noise,
             slower.
@@ -352,67 +368,124 @@ CLI: gpustacker tilt <frames or folder> [--cells N] [--csv out.csv] [--gui].""",
     (
         "Mosaic",
         """Mosaic... assembles finished master tiles (one stack per panel, e.g. from a Batch run grouped by
-OBJECT) into a single seamless image. It replaces the PixInsight GradientCorrection ->
-MosaicByCoordinates -> PhotometricMosaic sequence with one pass.
+OBJECT) into a single image. Inputs are 2 or more FITS/XISF masters, all mono or all RGB; mixed mono
+and RGB tiles are not supported. Each tile needs a valid WCS, or must be solvable by ASTAP when
+"Plate solve tiles without WCS" is enabled. Drizzled masters are supported. Tile order matters:
+tile 1 is the reference for photometric matching and fixes the canvas orientation when Orientation
+is "first".
 
-Inputs: 2 or more masters, FITS or XISF, mono or RGB (not mixed). Each needs a WCS; GPUStacker
-masters are plate solved with ASTAP (SIP distortion included). Tiles without a WCS are solved on
-the fly when "Plate solve tiles without WCS" is on and ASTAP is installed. Drizzled masters work
-too - the output scale defaults to the finest tile. Order matters: tile 1 is the photometric
-reference (its sky level, gain and rotation are kept).
+Processing overview:
+  1. Optionally remove a smooth sky model independently from each tile. It is fitted to block
+     medians with asymmetric clipping intended to exclude brighter nebula blocks. This is a broad
+     background model, not a guarantee that real extended nebulosity will be protected.
+  2. Build a shared TAN-projection canvas; reproject each tile through its WCS/SIP solution.
+  3. Optionally refine relative tile shifts from matched stars in overlaps.
+  4. Optionally solve per-channel gain and offset in overlaps relative to tile 1, with an optional
+     per-tile linear residual plane.
+  5. Blend the matched tiles and optionally crop uncovered canvas borders.
 
-Steps, in order:
-  1. Gradient correction per tile. A polynomial sky model (degree 1-3, default 2) is fitted to
-     block medians with asymmetric clipping, so nebulosity (bright blocks) is excluded from the
-     fit and the model follows the darkest, sky-dominated blocks. The model is subtracted and its
-     median level put back, so ADU levels stay comparable. Degree 0 = off. The log reports the
-     peak-to-peak gradient removed from each tile as a percentage of the sky.
-  2. Canvas: a TAN projection centred on the tiles, at the finest tile's pixel scale (or the one
-     you enter), with tile 1's rotation ("first") or north up ("north"). Keeping tile 1's
-     rotation means tile 1 lands on the canvas with an integer shift at matching scale.
-  3. Reprojection: every canvas pixel is mapped through the output WCS and the tile's SIP WCS
-     back into the tile and sampled with Lanczos-3 (or bicubic/bilinear) on the GPU. Flux is
-     scaled by the pixel-area ratio so a tile at a different scale keeps its surface brightness.
-     Pixels whose 7x7 Lanczos footprint touches missing data are dropped (no bright edge rims).
-  4. Refine registration: stars are detected in every overlap on both tiles and matched; the
-     median offsets give a least-squares shift per tile (tile 1 fixed). Shifts under 0.05 px are
-     ignored, over 50 px are treated as a bad plate solution and skipped. The log shows the
-     residual star scatter per overlap - expect 0.1-0.3 px with SIP solutions.
-  5. Photometric match: 32 px block medians in every overlap feed one robust joint solve per
-     channel for gain and offset per tile (plus an optional residual plane per tile, which mops
-     up gradient-correction differences between neighbours). Everything is tied to tile 1, with
-     weak priors (gain 1, plane 0) that only matter when an overlap is featureless sky. The log
-     shows each overlap's median |difference| before and after.
-    6. Blend. "feather" (default): plain weighted feather of the full image. "seam": the background
-      is combined with a wide feather (Feather px, from each tile's edge inward) while stars and
-      fine detail come from a single tile per place with a narrow transition (Seam px, along the
-      line where the feather weights cross). This avoids doubling a residual 0.3 px misregistration,
-      but can create halos around bright stars when overlapping tile details differ. The seam mode
-      is implemented as hard-seam composite + blurred (feathered - hard-seam) difference.
+Gradient degree  (default 2; choices 0, 1, 2, 3)
+  0  Disable per-tile polynomial gradient removal.
+  1  Fit a planar background (constant plus x and y slopes).
+  2  Add quadratic curvature terms; this is the default.
+  3  Add cubic terms for more spatially complex smooth backgrounds.
+  Higher degree can remove a more complex gradient, but can also subtract broad, real nebula
+  structure if it is mistaken for sky. The fit is per channel. The log reports the model's
+  peak-to-peak amplitude for each tile. This setting is separate from Residual plane per tile.
 
-Output: <name>.fit with a clean TAN WCS for the canvas (PLTSOLVD, usable in PixInsight /
-Astrometry tools), MOSTILES, MOSSCALE, MOSGRAD, MOSFEATH, MOSSEAM, MOSPHOT, per-tile MOSTILnn /
-MOSGNnnn (mean gain). <name>_coverage.fit = tiles per pixel. Pixels no tile covers are 0.
-Auto-crop (on by default) keeps the largest axis-aligned rectangle with coverage from at least one
-tile, removing all black borders. Turn it off to retain the full canvas. The cropped FITS and
-coverage map keep a matching WCS.
+Sky block px  (default 64)
+  Size of the square blocks whose medians are used to estimate the sky model. Smaller blocks give
+  the fit more spatial samples and can follow finer background changes, but are more sensitive to
+  nebula and local structure. Larger blocks smooth over local detail and give fewer samples, but may
+  miss smaller-scale gradients. Try changing this independently of Gradient degree.
+
+Pixel scale  (default 0 = finest input scale)
+  0 uses the finest tile's arcseconds per pixel. Enter a positive scale to choose the output scale
+  explicitly. For mixed scales, using the coarser input scale avoids upsampling the coarser tile.
+
+Orientation  (first | north)
+  first  Keep tile 1's rotation; this is the default and lets tile 1 retain an integer shift when
+         input and output scales match.
+  north  Make celestial north point up on the output canvas.
+
+Interpolation  (lanczos3 | bicubic | bilinear)
+  lanczos3  Sharpest reconstruction; default.
+  bicubic   Smoother cubic interpolation; can soften fine detail slightly.
+  bilinear  Simplest and softest interpolation; useful for a quick test, not usually preferred for
+            final detail.
+
+Refine registration from overlap stars  (on by default)
+  Match stars in overlapping tiles and solve a small relative shift for each tile; tile 1 is fixed.
+  Turn off to use the WCS alignment without this star-based correction. This changes tile alignment,
+  not the background model.
+
+Photometric match  (on by default)
+  Jointly match each tile's per-channel gain and offset to tile 1 using overlap samples. Turn off to
+  keep input brightness and colour scaling unadjusted by the overlap solve; use this only when the
+  tile levels are already matched or when diagnosing an unwanted overlap correction.
+
+Residual plane per tile  (on by default; used only with Photometric match)
+  Add independent x and y slope terms per channel for each non-reference tile while fitting overlap
+  photometry. This can reduce a background mismatch across an overlap, but it is not the per-tile
+  gradient-removal step above and may introduce or strengthen a broad cast across a tile. Turn it
+  off if the mosaic's large-scale gradient becomes more prominent; check that overlap backgrounds
+  still join acceptably. Tile 1 is the fixed reference and receives no gain, offset or plane fit.
+
+Blend  (feather | seam; default feather)
+  feather  Smoothly average all overlapping tile pixels using distance-from-edge weights. Simple
+           and generally appropriate when stars align well.
+  seam     Use one tile's detail at each location with a narrow transition, while retaining a wide-
+           feather background. Helps avoid doubled stars from small residual misalignments; may
+           show a halo if overlapping tile details differ. This is not a gradient-removal control.
+
+Feather px  (default 100)
+  Width, in output pixels, of the wide background blend inward from each tile edge. Increase it to
+  spread a background transition over more area; it cannot correct a gradient already present
+  within a tile. Especially relevant to the background part of "seam" blending.
+
+Seam px  (default 4)
+  Transition width for the single-tile detail selection in "seam" blend mode. It does not affect
+  "feather" mode. Wider transitions soften the detail hand-off; narrower transitions keep the
+  hand-off localized.
+
+Auto-crop  (on by default)
+  Keep the largest axis-aligned rectangle with coverage from at least one tile, removing uncovered
+  black borders. Turn off to retain the full projection canvas and its uncovered area.
+
+Plate solve tiles without WCS  (on by default)
+  If enabled, use ASTAP to solve tiles lacking WCS; ASTAP and a suitable star database must be
+  installed. If disabled, a tile without usable WCS causes the mosaic run to fail.
+
+Save coverage map  (on by default)
+  Write <name>_coverage.fit, whose pixel values count how many tiles cover each output location;
+  uncovered pixels are 0. The same crop and WCS are applied to the map as to the mosaic.
+
+CPU only  (off by default)
+  Force mosaic warping and blending onto the CPU instead of using the selected GPU backend. Use for
+  troubleshooting or when GPU memory is unavailable; it will generally be slower.
+
+Output: <name>.fit has the shared TAN WCS and mosaic metadata (tile count, output scale, gradient
+degree, blend widths and photometric settings). The coverage FITS records tile coverage. In the log,
+check overlap star scatter to assess alignment and median absolute difference before/after matching
+to assess photometric joins.
 
 Tips
-  Visible seam in the background -> raise Feather (200-400 px on 3000 px tiles), keep Gradient
-  degree 2, make sure Residual plane is on.
-  Doubled or elongated stars near a seam -> look at the "scatter" in the log; if it is above
-  ~0.5 px the plate solutions disagree (re-solve, or stack panels with the same reference
-  settings) - the "seam" blend hides the overlap region's offset but not an in-tile distortion.
-  Brightness step at the seam of a nebula -> Photometric match handles gain; if one tile has
-  very different nebula coverage the plane term may overfit: turn Residual plane off.
-  Mixed pixel scales (one drizzled tile) -> set Pixel scale explicitly to the coarser value to
-  avoid upsampling noise.
-  Memory: tiles are warped and blended in row bands on the GPU; a 4-panel 6000 x 6000 RGB canvas
-  needs about 1.5 GB of host RAM.
+  A broad color/background cast remains across the mosaic -> compare the source tiles and try
+  Residual plane per tile off. If that helps, keep it off if overlaps remain acceptable. Changing
+  Feather or Seam does not remove an in-tile gradient.
+  A visible background step at a tile join -> keep Photometric match on; try Residual plane per tile
+  only if it improves the actual overlap without worsening the broad background.
+  Doubled or elongated stars near a join -> inspect overlap star scatter in the log. High scatter
+  points to mismatched WCS or distortion; "seam" blending can hide small overlap offsets, but cannot
+  fix distortion within a tile.
+  Gradient degree 3 or smaller Sky block px changes the nebula's broad shape -> the model may be
+  treating extended signal as sky; compare against degree 0 and the original tile backgrounds.
+  Mixed pixel scales -> set Pixel scale explicitly to the coarser value to avoid upsampling noise.
 
-CLI: gpustacker mosaic <tiles or folder> -o mosaic.fit [--gradient 2] [--feather 100] [--seam 4]
-     [--blend seam|feather] [--scale "/px] [--orientation first|north] [--no-refine]
-     [--no-photometric] [--no-plane] [--no-solve] [--cpu]. Omit -o or pass --gui for the window.""",
+CLI: gpustacker mosaic <tiles or folder> -o mosaic.fit. Options: --gradient {0,1,2,3},
+--gradient-block px, --scale arcsec/px, --orientation {first,north}, --interp {lanczos3,bicubic,bilinear},
+--no-refine, --no-photometric, --no-plane, --feather px, --seam px, --blend {feather,seam},
+--no-autocrop, --no-solve, --no-maps, --cpu. Omit -o or pass --gui to open the window.""",
     ),
     (
         "Troubleshooting",
