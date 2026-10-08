@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from gpustacker.debayer import debayer_bilinear
-from gpustacker.io import load_frame, normalize_layout, save_fits
+from gpustacker.io import load_frame, load_meta, normalize_layout, save_fits
 from gpustacker.stacking import FrameNorm, FrameStore, StackSettings, combine_tensor, stack_store
 
 
@@ -36,6 +36,19 @@ def test_fits_roundtrip(tmp_path):
     assert loaded.shape == (3, 8, 9)
     assert np.allclose(loaded, data)
     assert meta.header["NFRAMES"] == 3
+
+
+def test_load_meta_reads_fits_header_without_pixels(tmp_path, monkeypatch):
+    path = save_fits(tmp_path / "metadata.fit", np.zeros((3, 12, 20), dtype=np.float32))
+
+    def fail_pixel_load(*_args, **_kwargs):
+        raise AssertionError("load_meta should not decode image pixels")
+
+    monkeypatch.setattr("gpustacker.io.load_frame", fail_pixel_load)
+    meta = load_meta(path)
+
+    assert meta.shape == (12, 20)
+    assert meta.channels == 3
 
 
 def test_debayer_flat_field_is_flat():

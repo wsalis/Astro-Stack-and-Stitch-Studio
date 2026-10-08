@@ -348,6 +348,22 @@ class MosaicWindow:
         ttk.Label(frame, text="Mosaic complete", font=("Segoe UI", 12, "bold")).pack(anchor="w")
         ttk.Label(frame, text=f"Total time: {format_duration(elapsed)}").pack(anchor="w", pady=(6, 0))
         ttk.Label(frame, text=f"{len(result.tiles)} tiles -> {result.shape[1]} x {result.shape[0]} px at {result.pixel_scale:.3f}\"/px").pack(anchor="w")
+        findings = result.analysis.findings
+        if findings:
+            ttk.Label(frame, text=f"Analyzer: {len(findings)} item(s) to review", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(8, 0))
+            for finding in findings[:3]:
+                ttk.Label(
+                    frame,
+                    text=f"{finding.message}\nTry: {finding.suggestion}",
+                    wraplength=560,
+                    justify="left",
+                ).pack(anchor="w", pady=(4, 0))
+            if len(findings) > 3:
+                ttk.Label(frame, text="Additional findings are in the analysis report.", foreground=NEUTRAL).pack(anchor="w", pady=(4, 0))
+        else:
+            ttk.Label(frame, text="Analyzer: no localized overlap or star-alignment risks detected").pack(anchor="w", pady=(8, 0))
+        if result.analysis_output is not None:
+            ttk.Label(frame, text=f"Analysis report: {result.analysis_output.name}", foreground=NEUTRAL).pack(anchor="w", pady=(4, 0))
         worst = max((o.rms for o in result.overlaps if o.rms == o.rms), default=float("nan"))
         if worst == worst:
             ttk.Label(frame, text=f"Worst overlap star scatter: {worst:.2f} px").pack(anchor="w")

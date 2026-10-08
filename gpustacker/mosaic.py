@@ -11,6 +11,7 @@ seam so slightly misregistered stars are never doubled.
 
 from __future__ import annotations
 
+import json
 import math
 import tempfile
 import time
@@ -122,6 +123,22 @@ class OverlapStats:
     rms: float  # star position scatter after refinement [px]
     residual_before: float  # median |difference| in overlap blocks before photometric match
     residual_after: float
+    residual_p90: float = float("nan")
+    hotspots: list[dict[str, float | int]] = field(default_factory=list)
+
+
+@dataclass
+class MosaicFinding:
+    severity: str
+    code: str
+    message: str
+    suggestion: str
+
+
+@dataclass
+class MosaicAnalysis:
+    overlaps: list[dict[str, Any]] = field(default_factory=list)
+    findings: list[MosaicFinding] = field(default_factory=list)
 
 
 @dataclass
@@ -133,6 +150,8 @@ class MosaicResult:
     tiles: list[Tile]
     overlaps: list[OverlapStats]
     seconds: float = 0.0
+    analysis: MosaicAnalysis = field(default_factory=MosaicAnalysis)
+    analysis_output: Path | None = None
 
 
 # ---------------------------------------------------------------------------- WCS helpers
@@ -410,6 +429,7 @@ class MosaicBuilder:
             for t in tiles:
                 c = t.image.shape[0]
                 t.gain, t.offset, t.plane = np.ones(c), np.zeros(c), np.zeros((c, 2))
+        analysis = self.analyze_overlaps(tiles, overlaps)
         self.progress(0.75, "Blending")
         image, coverage = self.blend(tiles)
         self._check()
@@ -419,10 +439,11 @@ class MosaicBuilder:
             crop_box = None
         self.progress(0.95, "Saving")
         out, cov_path = self.save(tiles, image, coverage, crop_box)
+        analysis_path = self.save_analysis(analysis)
         seconds = time.perf_counter() - t0
         self.progress(1.0, "Done")
         self.status(f"Mosaic {self.canvas[1]} x {self.canvas[0]} px at {self.out_scale:.3f}\"/px -> {out} ({seconds:.1f}s)")
-        return MosaicResult(out, cov_path, self.canvas, self.out_scale, tiles, overlaps, seconds)
+        return MosaicResult(out, cov_path, self.canvas, self.out_scale, tiles, overlaps, seconds, analysis, analysis_path)
 
     def crop_to_coverage(self, image: np.ndarray, coverage: np.ndarray) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int, int] | None]:
         """Crop image and coverage to the largest rectangle without uncovered pixels."""
@@ -1026,6 +1047,139 @@ class MosaicBuilder:
             del smooth
         out[:, coverage == 0] = 0.0
         return out, coverage
+
+    # ---------------------------------------------------------- mosaic analysis
+
+    def analyze_overlaps(self, tiles: list[Tile], stats: list[OverlapStats]) -> MosaicAnalysis:
+        pairs = self.overlap_pairs(tiles)
+        analysis = MosaicAnalysis()
+        by_pair = {(st.i, st.j): st for st in stats}
+        if not pairs:
+            analysis.findings.append(MosaicFinding(
+                "info", "no_overlaps", "No usable tile overlaps were available for seam analysis.",
+                "Review tile coverage and plate solutions; seams cannot be assessed without shared area.",
+            ))
+            self.status("Mosaic analysis: no usable overlaps; seam quality could not be assessed")
+            return analysis
+
+        block = 32
+        height, width = self.canvas
+        for i, j, box, both in pairs:
+            ia, _ = self._crop(tiles[i], box)
+            ib, _ = self._crop(tiles[j], box)
+            ma, _ = block_medians(np.where(both[None], ia, np.nan), block, 0.5)
+            mb, _ = block_medians(np.where(both[None], ib, np.nan), block, 0.5)
+            keep = np.isfinite(ma).all(axis=0) & np.isfinite(mb).all(axis=0)
+            if not keep.any():
+                continue
+            by, bx = np.nonzero(keep)
+            x = ((bx + 0.5) * block + box[0]) / width * 2 - 1
+            y = ((by + 0.5) * block + box[1]) / height * 2 - 1
+            before = np.median(np.abs(ma[:, keep] - mb[:, keep]), axis=0)
+            corrected_a = self._apply_photometry_samples(tiles[i], ma[:, keep], x, y)
+            corrected_b = self._apply_photometry_samples(tiles[j], mb[:, keep], x, y)
+            residual = np.median(np.abs(corrected_a - corrected_b), axis=0)
+            median = float(np.median(residual))
+            p90 = float(np.percentile(residual, 90))
+            scale = float(1.4826 * np.median(np.abs(residual - median)))
+            scale = max(scale, 1e-6)
+            global_scores = (residual - median) / scale
+            from scipy.ndimage import median_filter
+
+            residual_grid = np.full(keep.shape, median, dtype=np.float32)
+            residual_grid[keep] = residual
+            local_median = median_filter(residual_grid, size=5, mode="nearest")
+            local_deviation = median_filter(np.abs(residual_grid - local_median), size=5, mode="nearest")
+            local_scale = np.maximum(1.4826 * local_deviation, scale * 0.1)
+            local_scores = np.maximum(0.0, (residual_grid[by, bx] - local_median[by, bx]) / local_scale[by, bx])
+            scores = np.maximum(global_scores, local_scores)
+            signal_level = float(np.median(np.abs(0.5 * (ma[:, keep] + mb[:, keep]))))
+            residual_floor = max(1e-6, 0.005 * signal_level)
+            hot_indices = np.flatnonzero((scores >= 4.5) & (residual >= residual_floor))
+            if len(hot_indices):
+                hot_indices = hot_indices[np.argsort(scores[hot_indices])[::-1][:8]]
+            hotspots = [
+                {
+                    "x": int(round((bx[k] + 0.5) * block + box[0])),
+                    "y": int(round((by[k] + 0.5) * block + box[1])),
+                    "residual": float(residual[k]),
+                    "score": float(scores[k]),
+                }
+                for k in hot_indices
+            ]
+            st = by_pair.get((i, j))
+            if st is None:
+                st = OverlapStats(i, j, int(both.sum()), 0, (0.0, 0.0), float("nan"), float("nan"), float("nan"))
+                stats.append(st)
+                by_pair[(i, j)] = st
+            st.residual_before = float(np.median(before))
+            st.residual_after = median
+            st.residual_p90 = p90
+            st.hotspots = hotspots
+            pair_name = f"{tiles[i].name} / {tiles[j].name}"
+            if np.isfinite(st.rms) and st.stars >= 20 and st.rms > 1.0:
+                suggestion = "Check both tile plate solutions and overlap star matches. Try Blend=Seam to reduce doubled-star visibility; feather width will not fix astrometric disagreement."
+                analysis.findings.append(MosaicFinding(
+                    "warning", "star_alignment", f"{pair_name}: overlap star scatter is {st.rms:.2f} px ({st.stars} matches).", suggestion,
+                ))
+            if hotspots:
+                location = hotspots[0]
+                suggestion = "Inspect the listed canvas coordinates and compare Blend=Seam with Blend=Feather."
+                if not self.settings.photometric:
+                    suggestion += " Also try Photometric match."
+                elif not self.settings.match_gradient:
+                    suggestion += " If the mismatch follows a broad background trend, try enabling the residual plane."
+                else:
+                    suggestion += " If it follows a broad background trend, test a neighboring gradient degree rather than increasing it blindly."
+                analysis.findings.append(MosaicFinding(
+                    "warning", "localized_overlap_residual",
+                    f"{pair_name}: localized overlap mismatch near ({location['x']}, {location['y']}); block residual {location['residual']:.3g}, p90 {p90:.3g}.",
+                    suggestion,
+                ))
+            analysis.overlaps.append({
+                "tiles": [tiles[i].name, tiles[j].name],
+                "common_pixels": int(both.sum()),
+                "matched_stars": int(st.stars),
+                "star_scatter_px": float(st.rms) if np.isfinite(st.rms) else None,
+                "median_abs_residual_before": st.residual_before,
+                "median_abs_residual_after": st.residual_after,
+                "p90_abs_residual_after": st.residual_p90,
+                "hotspot_residual_floor": residual_floor,
+                "hotspots": hotspots,
+            })
+
+        if analysis.findings:
+            for finding in analysis.findings:
+                self.status(f"Mosaic analysis [{finding.severity}]: {finding.message} Try: {finding.suggestion}")
+        else:
+            self.status("Mosaic analysis: no localized overlap or star-alignment risks detected")
+        return analysis
+
+    def save_analysis(self, analysis: MosaicAnalysis) -> Path:
+        path = self.settings.output.with_name(f"{self.settings.output.stem}_mosaic_report.json")
+        payload = {
+            "schema_version": 1,
+            "output": str(self.settings.output),
+            "settings": {
+                "gradient_degree": self.settings.gradient_degree,
+                "gradient_block": self.settings.gradient_block,
+                "interpolation": self.settings.interpolation,
+                "refine_registration": self.settings.refine,
+                "photometric_match": self.settings.photometric,
+                "match_gradient": self.settings.match_gradient,
+                "feather_px": self.settings.feather,
+                "seam_width_px": self.settings.seam_width,
+                "blend_mode": self.settings.blend_mode,
+            },
+            "findings": [
+                {"severity": f.severity, "code": f.code, "message": f.message, "suggestion": f.suggestion}
+                for f in analysis.findings
+            ],
+            "overlaps": analysis.overlaps,
+        }
+        path.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
+        self.status(f"Mosaic analysis report -> {path}")
+        return path
 
     # ------------------------------------------------------------------ output
 

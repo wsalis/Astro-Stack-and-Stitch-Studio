@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import csv
 import json
+import math
 import os
 import queue
+import statistics
 import subprocess
 import sys
 import threading
 import time
+from collections import Counter
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -22,13 +26,15 @@ from .help_text import HELP_SECTIONS
 from .io import discover_frames, is_gpustacker_output
 from .mfdeconv import MFDECONV_PRESETS, MFDeconvSettings
 from .normalization import LocalNormSettings
-from .pipeline import PipelineResult, PipelineSettings, StackingPipeline, weighting_output_path
+from .pipeline import FrameInfo, PipelineResult, PipelineSettings, StackingPipeline, weighting_output_path
 from .quality import WEIGHTING_CHOICES, FilterSettings
+from .storage import DiskSpaceEstimate, estimate_stack_disk_space, format_bytes
 from .stacking import StackSettings
 
 IMAGE_TYPES = [("Astro images", "*.fit *.fits *.fts *.xisf"), ("All files", "*.*")]
 SETTINGS_PATH = Path.home() / ".gpustacker" / "gui_settings.json"
-_TRANSIENT_VARS = {"count_var", "status_var"}
+_AUTO_REFERENCE = "Automatic (sharpest eligible frame)"
+_TRANSIENT_VARS = {"count_var", "status_var", "reference_display_var"}
 
 
 def format_duration(seconds: float) -> str:
@@ -73,6 +79,99 @@ def integration_summary(result: PipelineResult, possible: int) -> str:
     return f"{len(stacked)}/{possible} frames integrated, {format_duration(exposure) if exposure else 'unknown exposure'} integration"
 
 
+def rank_reference_frames(lights: list[Path], metrics_path: Path) -> dict[str, dict[str, float | int | None]] | None:
+    """Rank lights from a matching prior frame report without rereading image data."""
+
+    if not metrics_path.is_file() or len({path.name for path in lights}) != len(lights):
+        return None
+    try:
+        with metrics_path.open(newline="", encoding="utf-8") as stream:
+            rows = list(csv.DictReader(stream))
+    except (OSError, csv.Error):
+        return None
+    return _rank_reference_rows(lights, rows)
+
+
+def rank_reference_infos(infos: list[FrameInfo]) -> dict[str, dict[str, float | int | None]] | None:
+    rows = []
+    for info in infos:
+        exposure = info.meta.exposure
+        bright_flux = float(sum(sorted(info.stars.flux)[-30:]))
+        focal_length = None
+        for key in ("FOCALLEN", "FOCAL_LEN", "FOCAL_LENGTH"):
+            try:
+                focal_length = float(info.meta.header[key])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(focal_length) and focal_length > 0:
+                break
+            focal_length = None
+        rows.append({
+            "file": info.path.name,
+            "stars": info.stars.total_detected,
+            "fwhm_px": info.fwhm,
+            "noise": info.noise,
+            "exposure_s": exposure,
+            "focal_length_mm": focal_length,
+            "bright_star_rate": bright_flux / exposure if exposure and exposure > 0 else None,
+            "excluded": info.rejected_reason or "",
+        })
+    return _rank_reference_rows([info.path for info in infos], rows)
+
+
+def _rank_reference_rows(lights: list[Path], rows: list[dict]) -> dict[str, dict[str, float | int | None]] | None:
+    if len({path.name for path in lights}) != len(lights) or Counter(row.get("file", "") for row in rows) != Counter(path.name for path in lights):
+        return None
+
+    def number(row: dict, key: str) -> float | None:
+        try:
+            value = float(row[key])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    metrics = {row["file"]: {
+        "stars": number(row, "stars"),
+        "fwhm": number(row, "fwhm_px"),
+        "noise": number(row, "noise"),
+        "exposure": number(row, "exposure_s"),
+        "focal_length": number(row, "focal_length_mm"),
+        "bright_star_rate": number(row, "bright_star_rate"),
+        "excluded": 1 if row.get("excluded", "").strip() else 0,
+    } for row in rows}
+    usable = [m for m in metrics.values() if not m["excluded"] and m["stars"] is not None and m["fwhm"] is not None and m["noise"] is not None]
+    if not usable:
+        return None
+
+    median_stars = statistics.median(m["stars"] for m in usable if m["stars"] is not None)
+    focal_known = all(m["focal_length"] is not None and m["focal_length"] > 0 for m in usable)
+    exposure_known = all(m["exposure"] is not None and m["exposure"] > 0 for m in usable)
+    for metric in usable:
+        noise = metric["noise"]
+        exposure = metric["exposure"]
+        metric["adjusted_noise"] = noise / math.sqrt(exposure) if exposure_known else noise
+        metric["sharpness"] = metric["fwhm"] / metric["focal_length"] if focal_known else metric["fwhm"]
+    median_noise = statistics.median(m["adjusted_noise"] for m in usable)
+
+    def sort_key(item: tuple[str, dict[str, float | int | None]]) -> tuple:
+        name, metric = item
+        if metric["excluded"] or metric["sharpness"] is None or metric["adjusted_noise"] is None:
+            return (2, math.inf, name)
+        below_star_cut = metric["stars"] < 0.8 * median_stars
+        score = metric["sharpness"] * (1.0 + 0.1 * metric["adjusted_noise"] / max(median_noise, 1e-9))
+        return (1 if below_star_cut else 0, score, name)
+
+    ranked = sorted(metrics.items(), key=sort_key)
+    rank = 0
+    for _, metric in ranked:
+        if not metric["excluded"] and metric["sharpness"] is not None and metric["adjusted_noise"] is not None:
+            rank += 1
+            metric["rank"] = rank
+        else:
+            metric["rank"] = None
+    return metrics
+
+
 def open_in_file_manager(folder: Path) -> None:
     if sys.platform.startswith("win"):
         os.startfile(str(folder))  # type: ignore[attr-defined]
@@ -90,6 +189,11 @@ class GPUStackerApp:
         root.minsize(900, 640)
         configure_dark_theme(root)
         self.lights: list[Path] = []
+        self._reference_choices: dict[str, Path] = {}
+        self._analysis_cache: dict[str, FrameInfo] | None = None
+        self._analysis_cache_signature: str | None = None
+        self._reference_metrics: dict[str, dict[str, float | int | None]] | None = None
+        self._ranking = False
         self.events: queue.Queue = queue.Queue()
         self.pipeline: StackingPipeline | None = None
         self.worker: threading.Thread | None = None
@@ -166,8 +270,22 @@ class GPUStackerApp:
         scroll = ttk.Scrollbar(box, orient="vertical", command=self.listbox.yview)
         scroll.grid(row=2, column=1, sticky="ns")
         self.listbox.configure(yscrollcommand=scroll.set)
+        reference = ttk.Frame(box)
+        reference.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        reference.columnconfigure(1, weight=1)
+        ttk.Label(reference, text="Reference frame").grid(row=0, column=0, sticky="w")
+        self.reference_path_var = tk.StringVar(value="")
+        self.reference_display_var = tk.StringVar(value=_AUTO_REFERENCE)
+        self.reference_combo = ttk.Combobox(reference, textvariable=self.reference_display_var, state="readonly", postcommand=self._refresh_reference_choices)
+        self.reference_combo.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        self.reference_combo.bind("<<ComboboxSelected>>", self._select_reference)
+        self.rank_reference_button = ttk.Button(reference, text="Analyze & rank", command=self._rank_references)
+        self.rank_reference_button.grid(row=0, column=2, padx=(6, 0))
+        self.reference_stats_var = tk.StringVar(value="No ranking stats yet. Click Analyze & rank.")
+        ttk.Label(reference, textvariable=self.reference_stats_var, foreground="#9aa3b2").grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
         grp = ttk.Frame(box)
-        grp.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        grp.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         grp.columnconfigure(1, weight=1)
         self.batch_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(grp, text="Batch: one master per group", variable=self.batch_var).grid(row=0, column=0, sticky="w")
@@ -462,6 +580,96 @@ class GPUStackerApp:
 
     # ------------------------------------------------------------------ light list
 
+    def _refresh_reference_choices(self) -> None:
+        selected_path = self.reference_path_var.get()
+        metrics = None
+        if self._analysis_cache is not None:
+            try:
+                settings = self._settings()
+                if self._analysis_signature(settings) == self._analysis_cache_signature:
+                    metrics = rank_reference_infos(list(self._analysis_cache.values()))
+                else:
+                    self._invalidate_analysis_cache()
+            except (ValueError, tk.TclError):
+                pass
+        output_text = self.output_var.get() if hasattr(self, "output_var") else ""
+        if metrics is None and output_text:
+            metrics = rank_reference_frames(self.lights, Path(output_text).with_suffix(".frames.csv"))
+        self._reference_metrics = metrics
+        ordered_lights = self.lights
+        if metrics is not None:
+            ordered_lights = sorted(self.lights, key=lambda path: metrics[path.name]["rank"] or math.inf)
+        name_counts: dict[str, int] = {}
+        for path in self.lights:
+            name_counts[path.name] = name_counts.get(path.name, 0) + 1
+
+        choices: dict[str, Path] = {}
+        for path in ordered_lights:
+            label = path.name
+            if name_counts[label] > 1:
+                label = f"{path.name} ({path.parent.name})"
+            if label in choices:
+                label = str(path)
+            metric = metrics.get(path.name) if metrics is not None else None
+            if metric is not None:
+                if metric["rank"] is not None:
+                    prefix = f"#{int(metric['rank']):02d} | "
+                elif metric["excluded"]:
+                    prefix = "Excluded | "
+                else:
+                    prefix = ""
+                label = prefix + label
+            choices[label] = path
+
+        self._reference_choices = choices
+        self.reference_combo.configure(values=(_AUTO_REFERENCE, *choices))
+        selected_label = next(
+            (
+                label
+                for label, path in choices.items()
+                if selected_path and path.resolve() == Path(selected_path).resolve()
+            ),
+            _AUTO_REFERENCE,
+        )
+        if selected_label == _AUTO_REFERENCE:
+            self.reference_path_var.set("")
+        self.reference_display_var.set(selected_label)
+        self._update_reference_stats()
+
+    def _select_reference(self, _event=None) -> None:
+        path = self._reference_choices.get(self.reference_display_var.get())
+        self.reference_path_var.set(str(path) if path is not None else "")
+        self._update_reference_stats()
+
+    def _update_reference_stats(self) -> None:
+        if not self._reference_metrics:
+            self.reference_stats_var.set("No ranking stats yet. Click Analyze & rank.")
+            return
+        path = self.reference_path_var.get()
+        if not path:
+            self.reference_stats_var.set("Choose a frame to see its stats; lower FWHM is sharper.")
+            return
+        metric = self._reference_metrics.get(Path(path).name)
+        if metric is None:
+            self.reference_stats_var.set("No statistics available for this frame.")
+            return
+        parts = []
+        if metric["rank"] is not None:
+            parts.append(f"Rank #{int(metric['rank'])}")
+        if metric["fwhm"] is not None:
+            parts.append(f"FWHM {metric['fwhm']:.2f}px")
+        if metric["stars"] is not None:
+            parts.append(f"{int(metric['stars'])} stars")
+        if metric["noise"] is not None:
+            parts.append(f"noise {metric['noise']:.3g}")
+        if metric["exposure"] is not None:
+            parts.append(f"{metric['exposure']:g}s")
+        if metric["focal_length"] is not None:
+            parts.append(f"{metric['focal_length']:g}mm")
+        if metric["bright_star_rate"] is not None:
+            parts.append(f"signal/s {metric['bright_star_rate']:.3g}")
+        self.reference_stats_var.set("  |  ".join(parts) if parts else "No statistics available for this frame.")
+
     def _refresh_list(self) -> None:
         self.listbox.delete(0, "end")
         for p in self.lights:
@@ -469,6 +677,7 @@ class GPUStackerApp:
         self.count_var.set(f"{len(self.lights)} frames")
         if self.lights and not self.output_var.get():
             self.output_var.set(str(self.lights[0].parent / "gpustack.fit"))
+        self._refresh_reference_choices()
 
     def _add_files(self) -> None:
         chosen = filedialog.askopenfilenames(filetypes=IMAGE_TYPES)
@@ -498,16 +707,76 @@ class GPUStackerApp:
         if outputs:
             self._append_log(f"Skipped {len(outputs)} GPUStacker output file(s)")
         self.lights.extend(p for p in fresh if p not in outputs)
+        self._invalidate_analysis_cache()
         self._refresh_list()
 
     def _remove_selected(self) -> None:
         for idx in sorted(self.listbox.curselection(), reverse=True):
             del self.lights[idx]
+        self._invalidate_analysis_cache()
         self._refresh_list()
 
     def _clear(self) -> None:
         self.lights.clear()
+        self._invalidate_analysis_cache()
         self._refresh_list()
+
+    def _invalidate_analysis_cache(self) -> None:
+        self._analysis_cache = None
+        self._analysis_cache_signature = None
+        self._reference_metrics = None
+
+    def _analysis_signature(self, settings: PipelineSettings) -> str:
+        def fingerprint(path: Path | None) -> tuple | None:
+            if path is None:
+                return None
+            try:
+                stat = path.stat()
+                return str(path.resolve()), stat.st_size, stat.st_mtime_ns
+            except OSError:
+                return str(path)
+
+        values = {
+            "lights": [fingerprint(path) for path in settings.lights],
+            "masters": [fingerprint(settings.bias), fingerprint(settings.dark), fingerprint(settings.flat)],
+            "cosmetic": settings.cosmetic,
+            "cosmetic_settings": vars(settings.cosmetic_settings),
+            "debayer": settings.debayer,
+            "debayer_method": settings.debayer_method,
+            "bayer_pattern": settings.bayer_pattern,
+            "detection_sigma": settings.detection_sigma,
+            "min_stars": settings.min_stars,
+        }
+        return json.dumps(values, sort_keys=True)
+
+    def _rank_references(self) -> None:
+        try:
+            settings = self._settings()
+        except (ValueError, tk.TclError) as exc:
+            messagebox.showerror("GPUStacker", str(exc))
+            return
+        self.rank_reference_button.configure(state="disabled")
+        self.run_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
+        self._ranking = True
+        self._cancel_requested = False
+        self.progress["value"] = 0
+        self.status_var.set("Analyzing frames for reference ranking…")
+        signature = self._analysis_signature(settings)
+        self.worker = threading.Thread(target=self._rank_worker, args=(settings, signature), daemon=True)
+        self.worker.start()
+
+    def _rank_worker(self, settings: PipelineSettings, signature: str) -> None:
+        status = lambda message: self.events.put(("log", message))
+        progress = lambda fraction, message: self.events.put(("progress", (fraction, message)))
+        try:
+            pipeline = StackingPipeline(settings, status, progress)
+            self.pipeline = pipeline
+            infos = pipeline.analyse()
+            pipeline.apply_prefilters(infos)
+            self.events.put(("ranked", (infos, signature)))
+        except Exception as exc:
+            self.events.put(("rank_error", f"{type(exc).__name__}: {exc}"))
 
     def _pick_output(self) -> None:
         chosen = filedialog.asksaveasfilename(defaultextension=".fit", filetypes=[("FITS", "*.fit *.fits")])
@@ -544,9 +813,10 @@ class GPUStackerApp:
                 use_variance_maps=bool(self.mf_var.get()),
             )
         weightings = [mode for mode in self.weightings_var.get().split(",") if mode in WEIGHTING_CHOICES] or ["psfsw"]
-        return PipelineSettings(
+        settings = PipelineSettings(
             lights=list(self.lights),
             output=Path(self.output_var.get()),
+            reference=opt(self.reference_path_var.get()),
             bias=opt(self.bias_var.get()),
             dark=opt(self.dark_var.get()),
             flat=opt(self.flat_var.get()),
@@ -585,6 +855,11 @@ class GPUStackerApp:
             device="cpu" if self.cpu_var.get() else "auto",
             workers=int(self.workers_var.get()),
         )
+        if self._analysis_cache is not None and self._analysis_signature(settings) == self._analysis_cache_signature:
+            settings.analysis_cache = self._analysis_cache
+        elif self._analysis_cache is not None:
+            self._invalidate_analysis_cache()
+        return settings
 
     def _update_weighting_label(self) -> None:
         selected = [mode for mode in self.weightings_var.get().split(",") if mode in WEIGHTING_CHOICES]
@@ -629,7 +904,7 @@ class GPUStackerApp:
         ttk.Button(buttons, text="Cancel", command=popup.destroy).pack(side="right")
         ttk.Button(buttons, text="Apply", style="Primary.TButton", command=apply).pack(side="right", padx=6)
 
-    def _confirm_stack(self, outputs: list[Path], notes: list[str] | None = None) -> bool:
+    def _confirm_stack(self, outputs: list[Path], notes: list[str] | None = None, disk_estimate: DiskSpaceEstimate | None = None) -> bool:
         dialog = tk.Toplevel(self.root)
         dialog.title("Confirm Stack outputs")
         dialog.transient(self.root)
@@ -639,6 +914,27 @@ class GPUStackerApp:
         frame = ttk.Frame(dialog, padding=12)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text=f"This run is expected to generate {len(outputs)} file(s):").pack(anchor="w", pady=(0, 8))
+        if disk_estimate is None:
+            ttk.Label(frame, text="Disk-space estimate unavailable; verify free space on the output drive.", foreground="#d6ad62", wraplength=720, justify="left").pack(anchor="w", pady=(0, 8))
+        else:
+            space_color = "#d6ad62" if disk_estimate.recommended_bytes > disk_estimate.free_bytes else DARK_TEXT
+            space_line = (
+                f"Estimated peak disk use: {format_bytes(disk_estimate.expected_bytes)} "
+                f"(working files {format_bytes(disk_estimate.working_bytes)} + outputs {format_bytes(disk_estimate.output_bytes)}). "
+                f"Free on {disk_estimate.volume}: {format_bytes(disk_estimate.free_bytes)}."
+            )
+            if disk_estimate.expected_bytes > disk_estimate.free_bytes:
+                space_line += f" WARNING: short by about {format_bytes(disk_estimate.expected_bytes - disk_estimate.free_bytes)}."
+            elif disk_estimate.recommended_bytes > disk_estimate.free_bytes:
+                space_line += " WARNING: less than 10% headroom remains."
+            ttk.Label(frame, text=space_line, foreground=space_color, wraplength=720, justify="left").pack(anchor="w", pady=(0, 4))
+            ttk.Label(
+                frame,
+                text="Estimate assumes the first input's dimensions and all selected frames; filters may reduce scratch use. Registered files are removed after stacking unless Keep registered is enabled.",
+                foreground="#9aa3b2",
+                wraplength=720,
+                justify="left",
+            ).pack(anchor="w", pady=(0, 8))
         body = ttk.Frame(frame)
         body.pack(fill="both", expand=True)
         files = tk.Listbox(body, exportselection=False, bg=DARK_FIELD, fg=DARK_TEXT, relief="flat", highlightthickness=1, highlightbackground=DARK_BORDER, font=("Consolas", 9))
@@ -697,7 +993,15 @@ class GPUStackerApp:
         if not planned:
             messagebox.showerror("GPUStacker", "No stack outputs are planned. Check the selected frames and batch groups.")
             return
-        if not self._confirm_stack(planned, notes):
+        scratch_frames = None
+        if batch_groups is not None:
+            scratch_frames = max((len(group.lights) for group in batch_groups if len(group.lights) >= 2), default=0)
+        storage_dir = batch_output_dir if batch_output_dir is not None else settings.output.parent
+        try:
+            disk_estimate = estimate_stack_disk_space(settings, planned, storage_dir, scratch_frames or None)
+        except Exception:
+            disk_estimate = None
+        if not self._confirm_stack(planned, notes, disk_estimate):
             return
         self._save_settings()
         self._set_running(True)
@@ -826,6 +1130,23 @@ class GPUStackerApp:
                     self.status_var.set("Done")
                     self._set_running(False)
                     self._show_finished(Path(folder), lines, elapsed)
+                elif kind == "ranked":
+                    infos, signature = payload
+                    self._analysis_cache = {str(info.path.resolve()): info for info in infos}
+                    self._analysis_cache_signature = signature
+                    self._reference_metrics = rank_reference_infos(infos)
+                    self._ranking = False
+                    self._set_running(False)
+                    self._refresh_reference_choices()
+                    self.status_var.set("Reference ranking ready")
+                elif kind == "rank_error":
+                    self._ranking = False
+                    self._set_running(False)
+                    if self._cancel_requested:
+                        self.status_var.set("Ranking cancelled")
+                    else:
+                        self._append_log(payload)
+                        self.status_var.set("Ranking failed")
                 elif kind == "error":
                     self._append_log(payload)
                     self.status_var.set("Failed")
@@ -835,8 +1156,10 @@ class GPUStackerApp:
         self.root.after(100, self._poll)
 
     def _set_running(self, running: bool) -> None:
-        self.run_btn.configure(state="disabled" if running else "normal")
-        self.cancel_btn.configure(state="normal" if running else "disabled")
+        active = running or self._ranking
+        self.run_btn.configure(state="disabled" if active else "normal")
+        self.rank_reference_button.configure(state="disabled" if active else "normal")
+        self.cancel_btn.configure(state="normal" if active else "disabled")
         if running:
             self.progress["value"] = 0
             self.status_var.set("Starting…")

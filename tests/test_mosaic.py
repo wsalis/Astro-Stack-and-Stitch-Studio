@@ -113,6 +113,7 @@ def test_mosaic_two_tiles_seamless(two_tiles, backend, tmp_path):
     builder = MosaicBuilder(settings, log.append)
     result = builder.run()
     assert out.is_file() and result.coverage_output is not None and result.coverage_output.is_file()
+    assert not any(f.code == "localized_overlap_residual" for f in result.analysis.findings)
     mosaic = fits.getdata(out).astype(np.float32)
     cov = fits.getdata(result.coverage_output)
     hdr = fits.getheader(out)
@@ -150,6 +151,34 @@ def test_mosaic_two_tiles_seamless(two_tiles, backend, tmp_path):
     assert any("Photometry tile_b" in line for line in log)
     b_tile = result.tiles[1]
     assert b_tile.gain[0] == pytest.approx(1 / 1.25, rel=0.05)
+
+
+def test_mosaic_analyzer_finds_localized_overlap_residual(two_tiles, backend, tmp_path):
+    import json
+
+    pa, pb, _, _ = two_tiles
+    data = fits.getdata(pb).copy()
+    header = fits.getheader(pb)
+    data[160:256, 140:236] += 300.0
+    fits.PrimaryHDU(data=data, header=header).writeto(pb, overwrite=True)
+    settings = MosaicSettings(
+        tiles=[pa, pb], output=tmp_path / "mosaic.fit", gradient_degree=1,
+        gradient_block=32, feather=60.0, plate_solve=False, auto_crop=False,
+        device="cpu" if not backend.is_cuda else "auto",
+    )
+    builder = MosaicBuilder(settings)
+
+    result = builder.run()
+
+    assert result.analysis_output is not None and result.analysis_output.is_file()
+    report = json.loads(result.analysis_output.read_text(encoding="utf-8"))
+    assert any(f["code"] == "localized_overlap_residual" for f in report["findings"])
+    assert "Blend=Seam" in next(f["suggestion"] for f in report["findings"] if f["code"] == "localized_overlap_residual")
+    tile_wcs = wcs_from_header(dict(header), data.shape)
+    world = tile_wcs.all_pix2world(188.0, 208.0, 0)
+    expected = builder.out_wcs.all_world2pix(*world, 0)
+    hotspots = report["overlaps"][0]["hotspots"]
+    assert any(np.hypot(h["x"] - expected[0], h["y"] - expected[1]) < 60 for h in hotspots)
 
 
 def test_mosaic_autocrop_removes_uncovered_border(two_tiles, backend, tmp_path):

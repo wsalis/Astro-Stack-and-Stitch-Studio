@@ -130,11 +130,13 @@ def test_run_batch_two_groups(light_dir, tmp_path):
             hdul[0].header["FILTER"] = "L"
     groups = group_frames(files, ("OBJECT", "FILTER"))
     assert [len(g.lights) for g in groups] == [3, 3]
-    settings = PipelineSettings(lights=files, output=tmp_path / "x.fit", device="cpu", local_norm=LocalNormSettings(enabled=False), save_maps=False)
+    settings = PipelineSettings(lights=files, output=tmp_path / "x.fit", reference=files[0], device="cpu", local_norm=LocalNormSettings(enabled=False), save_maps=False)
     log: list[str] = []
     result = run_batch(settings, groups, tmp_path / "masters", "{OBJECT}_{FILTER}", log.append)
     outs = [p for _, p, _ in result.outputs]
     assert all(p is not None and p.exists() for p in outs)
     assert {p.name for p in outs} == {"Panel_1_L.fit", "Panel_2_L.fit"}
+    assert result.results[0].frames[result.results[0].reference_index].path == files[0]
+    assert result.results[1].frames[result.results[1].reference_index].path in groups[1].lights
     assert any("Batch finished: 2/2" in line for line in log)
     assert not list((tmp_path / "masters").glob("_gpustacker_work*"))

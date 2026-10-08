@@ -150,7 +150,10 @@ def run_batch(settings, groups: list[FrameGroup], output_dir: Path, name_templat
             results.append((group, None, f"fewer than {min_frames} frames"))
             pipeline_results.append(None)
             continue
-        group_settings = replace(settings, lights=list(group.lights), output=out, work_dir=output_dir / f"_gpustacker_work_{name}")
+        reference = settings.reference
+        if reference is not None and not any(path.resolve() == reference.resolve() for path in group.lights):
+            reference = None
+        group_settings = replace(settings, lights=list(group.lights), output=out, work_dir=output_dir / f"_gpustacker_work_{name}", reference=reference)
         try:
             pipeline = StackingPipeline(group_settings, status_cb, lambda f, m, gi=gi: progress_cb((gi + f) / total, f"[{gi + 1}/{total}] {m}"))
             if on_pipeline is not None:

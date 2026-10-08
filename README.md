@@ -47,6 +47,7 @@ Key options: `--method {winsorized,gesd,sigma,percentile,median,none}`, `--sigma
 Outputs next to the stack: `<name>_coverage.fit` (frames per pixel), `<name>_rejection.fit`
 (rejected fraction per pixel), `<name>.frames.csv` (per-frame stats, weights, transparency,
 alignment, exclusions), `<name>.report.json`, and `<name>_mfdeconv.fit` when enabled.
+Mosaic builds also write `<name>_mosaic_report.json` with overlap residual hotspots, alignment warnings, and settings to compare when investigating a seam.
 When multiple weightings are selected, all masters, including the primary, use
 `<name>_weight-<method>.fit`; a single selected weighting keeps `<name>.fit`. Compare accepts
 multiple candidate masters in the GUI or repeatable CLI `--also` arguments against one reference.

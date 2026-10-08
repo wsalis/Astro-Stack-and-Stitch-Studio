@@ -154,7 +154,56 @@ def load_frame(path: Path | str) -> tuple[np.ndarray, FrameMeta]:
 
 
 def load_meta(path: Path | str) -> FrameMeta:
-    _, meta = load_frame(path)
+    """Read frame metadata and geometry without decoding the image pixels."""
+
+    p = Path(path)
+    if p.suffix.lower() == ".xisf":
+        from xisf import XISF
+
+        image = XISF(str(p)).get_images_metadata()[0]
+        width, height, channels = image["geometry"]
+        header = {
+            key: entries[0].get("value")
+            for key, entries in image.get("FITSKeywords", {}).items()
+            if entries
+        }
+    else:
+        from astropy.io import fits
+
+        with fits.open(p, memmap=True, do_not_scale_image_data=True) as hdul:
+            hdu = next((h for h in hdul if int(h.header.get("NAXIS", 0)) >= 2), None)
+            if hdu is None:
+                raise ValueError(f"No image data in {p}")
+            header = {k: v for k, v in hdu.header.items() if k and k not in ("COMMENT", "HISTORY")}
+        axes = [int(header.get(f"NAXIS{i}", 1)) for i in range(1, int(header["NAXIS"]) + 1)]
+        raw_shape = tuple(reversed(axes))
+        if len(raw_shape) == 2:
+            channels, height, width = 1, raw_shape[0], raw_shape[1]
+        elif len(raw_shape) == 3:
+            if raw_shape[-1] in (1, 3) and raw_shape[0] not in (1, 3):
+                height, width, channels = raw_shape
+            elif raw_shape[-1] in (1, 3) and raw_shape[0] in (1, 3) and raw_shape[0] > raw_shape[-1]:
+                height, width, channels = raw_shape
+            else:
+                channels, height, width = raw_shape
+        else:
+            raise ValueError(f"Unsupported image dimensionality: {raw_shape}")
+
+    meta = FrameMeta(
+        path=p,
+        shape=(int(height), int(width)),
+        channels=int(channels),
+        exposure=_header_float(header, "EXPTIME", "EXPOSURE"),
+        gain=_header_float(header, "EGAIN", "GAIN"),
+        read_noise=_header_float(header, "RDNOISE", "READNOIS", "RON"),
+        filter_name=_header_str(header, "FILTER"),
+        bayer_pattern=_header_str(header, "BAYERPAT", "COLORTYP"),
+        fwhm=_header_float(header, "FWHM"),
+        date_obs=_header_str(header, "DATE-OBS"),
+        header=header,
+    )
+    if meta.bayer_pattern and meta.bayer_pattern.upper() not in ("RGGB", "BGGR", "GRBG", "GBRG"):
+        meta.bayer_pattern = None
     return meta
 
 

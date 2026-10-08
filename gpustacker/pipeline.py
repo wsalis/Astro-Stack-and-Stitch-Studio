@@ -10,7 +10,7 @@ import time
 import copy
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Literal
 
@@ -70,6 +70,7 @@ class PipelineSettings:
     lights: list[Path]
     output: Path
     work_dir: Path | None = None
+    analysis_cache: dict[str, FrameInfo] | None = field(default=None, repr=False, compare=False)
     bias: Path | None = None
     dark: Path | None = None
     flat: Path | None = None
@@ -138,6 +139,21 @@ def select_mfdeconv_indices(infos: list[FrameInfo], count: int) -> list[int]:
     eligible = [f for f in infos if f.store_index is not None and f.rejected_reason is None]
     eligible.sort(key=lambda f: (not np.isfinite(f.fwhm), f.fwhm if np.isfinite(f.fwhm) else float("inf"), -f.weight))
     return [f.store_index for f in eligible[: max(2, count)] if f.store_index is not None]
+
+
+def _bright_star_flux(info: FrameInfo) -> float:
+    return float(np.sum(np.sort(info.stars.flux)[-30:]))
+
+
+def _focal_length_mm(header: dict) -> float | None:
+    for key in ("FOCALLEN", "FOCAL_LEN", "FOCAL_LENGTH"):
+        try:
+            value = float(header[key])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if np.isfinite(value) and value > 0:
+            return value
+    return None
 
 
 @dataclass
@@ -394,9 +410,12 @@ class StackingPipeline:
             raise ValueError("No usable frames (too few stars detected everywhere)")
         median_stars = float(np.median([f.stars.total_detected for f in usable]))
         pool = [f for f in usable if f.stars.total_detected >= 0.8 * median_stars] or usable
-        # haze lowers noise as well as star flux, so a noise term alone would favour hazy frames;
-        # the summed flux of the brightest stars is a transparency proxy available before photometry
-        bright = {f.index: float(np.sum(np.sort(f.stars.flux)[::-1][:30])) for f in pool}
+        # Exposure-normalized star flux avoids systematically favoring longer subs.
+        normalize_exposure = all(f.meta.exposure is not None and f.meta.exposure > 0 for f in pool)
+        bright = {
+            f.index: _bright_star_flux(f) / f.meta.exposure if normalize_exposure else _bright_star_flux(f)
+            for f in pool
+        }
         top_bright = float(np.percentile(list(bright.values()), 90))
         clear = [f for f in pool if bright[f.index] >= 0.9 * top_bright] or pool
         med_noise = float(np.median([u.noise for u in usable]))
@@ -587,7 +606,27 @@ class StackingPipeline:
         if len(selected_weightings) > 1:
             s.output = weighting_output_path(output_base, s.weighting)
         work_dir = s.work_dir or (s.output.parent / "_gpustacker_work")
-        infos = self.analyse()
+        cache = s.analysis_cache
+        if cache is not None and all(str(path.resolve()) in cache for path in s.lights):
+            infos = []
+            for index, path in enumerate(s.lights):
+                cached = cache[str(path.resolve())]
+                rejected = f"only {cached.stars.total_detected} stars" if cached.stars.total_detected < s.min_stars else None
+                infos.append(replace(
+                    cached,
+                    index=index,
+                    alignment=None,
+                    weight=1.0,
+                    transparency=float("nan"),
+                    phot_stars=0,
+                    flux_scaled=False,
+                    rejected_reason=rejected,
+                    store_index=None,
+                ))
+            self.status(f"Reusing analysis for {len(infos)} frame(s)")
+            s.analysis_cache = None
+        else:
+            infos = self.analyse()
         self.apply_prefilters(infos)
         tilt = self.tilt_summary(infos)
         ref_index = self.choose_reference(infos)
@@ -876,7 +915,10 @@ class StackingPipeline:
                 {
                     "index": f.index,
                     "file": f.path.name,
+                    "exposure_s": f.meta.exposure,
+                    "focal_length_mm": _focal_length_mm(f.meta.header),
                     "stars": f.stars.total_detected,
+                    "bright_star_rate": _bright_star_flux(f) / f.meta.exposure if f.meta.exposure and f.meta.exposure > 0 else None,
                     "fwhm_px": None if not np.isfinite(f.fwhm) else round(f.fwhm, 3),
                     "fwhm_grid": None if f.fwhm_grid is None else " / ".join(" ".join("nan" if not np.isfinite(v) else f"{v:.2f}" for v in row) for row in f.fwhm_grid),
                     "fwhm_grid_counts": None if f.fwhm_count_grid is None else " / ".join(" ".join(str(int(v)) for v in row) for row in f.fwhm_count_grid),

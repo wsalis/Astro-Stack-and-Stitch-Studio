@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import csv
+from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 import gpustacker.compare as compare_module
-from gpustacker.gui import planned_output_files
+from gpustacker.gui import planned_output_files, rank_reference_frames
 from gpustacker.cli import build_parser, main
 from gpustacker.drizzle import DrizzleSettings
 from gpustacker.io import load_frame
@@ -42,6 +44,62 @@ def test_mfdeconv_blend_endpoints_and_fraction():
     np.testing.assert_allclose(blend_mfdeconv(master, deconvolved, 0.25), [[[15.0, 25.0]]])
     with np.testing.assert_raises(ValueError):
         PipelineSettings(lights=[], output=Path("unused.fit"), mfdeconv_blend=1.2)
+
+
+def test_reference_ranking_uses_scale_and_matching_report(tmp_path):
+    short = tmp_path / "short.fit"
+    long = tmp_path / "long.fit"
+    metrics_path = tmp_path / "stack.frames.csv"
+    with metrics_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=("file", "stars", "fwhm_px", "noise", "exposure_s", "focal_length_mm", "bright_star_rate", "excluded"))
+        writer.writeheader()
+        writer.writerow({"file": short.name, "stars": 100, "fwhm_px": 2.0, "noise": 2 * np.sqrt(180), "exposure_s": 180, "focal_length_mm": 360, "bright_star_rate": 50, "excluded": ""})
+        writer.writerow({"file": long.name, "stars": 100, "fwhm_px": 2.5, "noise": 2 * np.sqrt(300), "exposure_s": 300, "focal_length_mm": 600, "bright_star_rate": 50, "excluded": ""})
+
+    metrics = rank_reference_frames([short, long], metrics_path)
+    assert metrics is not None
+    assert metrics[long.name]["rank"] == 1
+    assert metrics[short.name]["rank"] == 2
+    assert rank_reference_frames([short], metrics_path) is None
+
+
+def test_automatic_reference_compares_bright_star_signal_per_second():
+    frames = []
+    for index, (exposure, rate, fwhm) in enumerate(((180.0, 95.0, 1.8), (300.0, 100.0, 2.1), (300.0, 105.0, 2.5))):
+        frames.append(SimpleNamespace(
+            index=index,
+            rejected_reason=None,
+            fwhm=fwhm,
+            noise=1.0,
+            meta=SimpleNamespace(exposure=exposure),
+            stars=SimpleNamespace(total_detected=100, flux=np.full(30, exposure * rate)),
+        ))
+    pipeline = SimpleNamespace(settings=SimpleNamespace(reference=None))
+
+    assert StackingPipeline.choose_reference(pipeline, frames) == 0
+
+
+def test_pipeline_reuses_preflight_analysis(light_dir, tmp_path, monkeypatch):
+    settings = PipelineSettings(
+        lights=sorted(light_dir.glob("*.fit")),
+        output=tmp_path / "cached.fit",
+        device="cpu",
+        cosmetic="off",
+        mfdeconv=None,
+        local_norm=LocalNormSettings(enabled=False),
+        filters=FilterSettings(enabled=False),
+        save_maps=False,
+    )
+    analyzed = StackingPipeline(settings).analyse()
+    settings.analysis_cache = {str(info.path.resolve()): info for info in analyzed}
+    pipeline = StackingPipeline(settings)
+    monkeypatch.setattr(pipeline, "analyse", lambda: pytest.fail("analysis should be reused"))
+    messages = []
+    pipeline.status = messages.append
+
+    pipeline.run()
+
+    assert any("Reusing analysis" in message for message in messages)
 
 
 def test_mfdeconv_blend_cli_option():
