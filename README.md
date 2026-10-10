@@ -15,22 +15,23 @@ per-frame CSV, JSON report -> optional ImageMM deconvolution of the best frames.
 
 ```powershell
 cd W:\GPUStacker
-py -3 -m pip install -r requirements.txt
+py -3.13 -m pip install -r requirements.txt
 ```
 
-PyTorch with CUDA must be installed for GPU use (CPU fallback is automatic).
+The requirements pin PyTorch 2.14.1 with CUDA 13.0. A compatible NVIDIA driver is
+required for GPU use; CPU fallback is automatic when CUDA is unavailable.
 
 ## Run
 
 ```powershell
 # GUI
-py -3 run_gpustacker.py gui
+py -3.13 run_gpustacker.py gui
 
 # CLI: folder, files, or globs
-py -3 run_gpustacker.py stack "G:\Target\Lights" -o "G:\Target\stack.fit" --dark master_dark.fit --flat master_flat.fit
-py -3 run_gpustacker.py stack "G:\Target\Lights" -o out.fit --mfdeconv --mf-frames 12 --mf-iters 30
-py -3 run_gpustacker.py stack --help
-py -3 run_gpustacker.py compare master.fit reference.xisf --also master_weight-noise.fit --also master_weight-psfsw-field.fit
+py -3.13 run_gpustacker.py stack "G:\Target\Lights" -o "G:\Target\stack.fit" --dark master_dark.fit --flat master_flat.fit
+py -3.13 run_gpustacker.py stack "G:\Target\Lights" -o out.fit --mfdeconv --mf-frames 12 --mf-iters 30
+py -3.13 run_gpustacker.py stack --help
+py -3.13 run_gpustacker.py compare master.fit reference.xisf --also master_weight-noise.fit --also master_weight-psfsw-field.fit
 ```
 
 Key options: `--method {winsorized,gesd,sigma,percentile,median,none}`, `--sigma-low/high`,
@@ -70,7 +71,7 @@ ImageMM knobs: `--mf-iters`, `--mf-kappa` (step clip), `--mf-relax` (damping),
 ## Tests
 
 ```powershell
-py -3 -m pytest -q
+py -3.13 -m pytest -q
 ```
 
 ## License
