@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import csv
 import math
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -115,9 +117,19 @@ def write_frames_csv(path: Path, rows: list[dict[str, Any]]) -> Path:
     if not rows:
         return path
     keys = list(rows[0].keys())
-    with open(path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=keys)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({k: ("" if v is None else v) for k, v in row.items()})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile("w", newline="", encoding="utf-8", dir=path.parent, prefix=f"{path.name}.", suffix=".tmp", delete=False) as fh:
+            temporary = Path(fh.name)
+            writer = csv.DictWriter(fh, fieldnames=keys)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: ("" if v is None else v) for k, v in row.items()})
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return path

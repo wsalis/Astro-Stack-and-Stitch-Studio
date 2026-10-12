@@ -11,6 +11,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 
+from . import APP_NAME
 from .astro_dark_theme import DARK_BG, DARK_BORDER, DARK_FIELD, DARK_SURFACE, DARK_TEXT, configure_dark_theme
 from .io import discover_frames
 from .tilt import TiltMap, analyse_tilt, describe, frame_scatter, session_median, write_tilt_csv
@@ -47,7 +48,7 @@ class TiltWindow:
         self.session: TiltMap | None = None
         self.scatter = float("nan")
         self.busy = False
-        root.title("GPUStacker — tilt inspector")
+        root.title(f"{APP_NAME} — Tilt inspector")
         if isinstance(root, (tk.Tk, tk.Toplevel)):
             root.geometry("1180x760")
             root.minsize(900, 600)

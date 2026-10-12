@@ -13,15 +13,18 @@ import sys
 import threading
 import time
 from collections import Counter
+
+import numpy as np
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__
+from . import APP_NAME, __version__
 from .astro_dark_theme import DARK_BG, DARK_BORDER, DARK_FIELD, DARK_TEXT, configure_dark_theme
 from .batch import DEFAULT_GROUP_KEYS, FrameGroup, describe_groups, group_frames, run_batch
 from .cosmetic import CosmeticSettings
 from .drizzle import DrizzleSettings
+from .distributed_gui import _protect_token, _unprotect_token
 from .help_text import HELP_SECTIONS
 from .io import discover_frames, is_gpustacker_output
 from .mfdeconv import MFDECONV_PRESETS, MFDeconvSettings
@@ -29,12 +32,12 @@ from .normalization import LocalNormSettings
 from .pipeline import FrameInfo, PipelineResult, PipelineSettings, StackingPipeline, weighting_output_path
 from .quality import WEIGHTING_CHOICES, FilterSettings
 from .storage import DiskSpaceEstimate, estimate_stack_disk_space, format_bytes
-from .stacking import StackSettings
+from .stacking import StackSettings, cleanup_registered_store, registered_store_cleanup_plan
 
 IMAGE_TYPES = [("Astro images", "*.fit *.fits *.fts *.xisf"), ("All files", "*.*")]
 SETTINGS_PATH = Path.home() / ".gpustacker" / "gui_settings.json"
 _AUTO_REFERENCE = "Automatic (sharpest eligible frame)"
-_TRANSIENT_VARS = {"count_var", "status_var", "reference_display_var"}
+_TRANSIENT_VARS = {"count_var", "status_var", "reference_display_var", "reference_stats_var", "reference_choice_status_var", "distributed_token_var"}
 
 
 def format_duration(seconds: float) -> str:
@@ -172,6 +175,50 @@ def _rank_reference_rows(lights: list[Path], rows: list[dict]) -> dict[str, dict
     return metrics
 
 
+def reference_preview_path(display_label: str, choices: dict[str, Path], metrics: dict[str, dict[str, float | int | None]] | None) -> Path | None:
+    """Resolve a preview candidate without changing the run's selected reference."""
+
+    if display_label != _AUTO_REFERENCE:
+        return choices.get(display_label)
+    if metrics is None:
+        return None
+    ranked = [(metric["rank"], name) for name, metric in metrics.items() if metric.get("rank") is not None]
+    if not ranked:
+        return None
+    best_name = min(ranked)[1]
+    return next((path for path in choices.values() if path.name == best_name), None)
+
+
+def reference_preview_rgb(image: np.ndarray, max_dimension: int = 760) -> np.ndarray:
+    """Create a small, independently stretched RGB image for the Tk preview window."""
+
+    arr = np.asarray(image, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = arr[None]
+    if arr.ndim != 3 or arr.shape[0] not in (1, 3):
+        raise ValueError(f"Preview expects one or three channels, got {arr.shape}")
+    channels, height, width = arr.shape
+    stride = max(1, math.ceil(max(height, width) / max_dimension))
+    sample = arr[:, ::stride, ::stride]
+    rgb = np.repeat(sample, 3, axis=0) if channels == 1 else sample
+    stretched = np.empty_like(rgb)
+    for channel in range(3):
+        values = rgb[channel]
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            stretched[channel].fill(0)
+            continue
+        low, high = np.percentile(finite, (1.0, 99.8))
+        if high <= low:
+            stretched[channel].fill(0)
+            continue
+        linear = np.clip((values - low) / (high - low), 0.0, 1.0)
+        stretched[channel] = np.arcsinh(10.0 * linear) / np.arcsinh(10.0)
+    pixels = np.nan_to_num(np.transpose(stretched, (1, 2, 0)), nan=0.0, posinf=1.0, neginf=0.0)
+    pixels = (np.clip(pixels, 0.0, 1.0) * 255.0).astype(np.uint8)
+    return pixels
+
+
 def open_in_file_manager(folder: Path) -> None:
     if sys.platform.startswith("win"):
         os.startfile(str(folder))  # type: ignore[attr-defined]
@@ -184,7 +231,7 @@ def open_in_file_manager(folder: Path) -> None:
 class GPUStackerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        root.title(f"GPUStacker {__version__}")
+        root.title(f"{APP_NAME} {__version__}")
         root.geometry("1100x800")
         root.minsize(900, 640)
         configure_dark_theme(root)
@@ -193,13 +240,27 @@ class GPUStackerApp:
         self._analysis_cache: dict[str, FrameInfo] | None = None
         self._analysis_cache_signature: str | None = None
         self._reference_metrics: dict[str, dict[str, float | int | None]] | None = None
+        self._reference_choices_dirty = True
         self._ranking = False
+        self._previewing = False
+        self._preview_candidate_path: Path | None = None
+        self._preview_window: tk.Toplevel | None = None
+        self._preview_photo: tk.PhotoImage | None = None
         self.events: queue.Queue = queue.Queue()
         self.pipeline: StackingPipeline | None = None
         self.worker: threading.Thread | None = None
         self._cancel_requested = False
+        self._run_active = False
         self._run_started = 0.0
         self._build()
+        for name in (
+            "bias_var", "dark_var", "flat_var", "cosmetic_var", "hot_sigma", "cold_sigma",
+            "debayer_var", "debayer_method_var", "bayer_var", "det_sigma",
+        ):
+            variable = getattr(self, name, None)
+            if isinstance(variable, tk.Variable):
+                variable.trace_add("write", self._reference_analysis_settings_changed)
+        self.output_var.trace_add("write", self._reference_output_changed)
         self._load_settings()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         root.after(100, self._poll)
@@ -212,6 +273,9 @@ class GPUStackerApp:
     def _save_settings(self) -> None:
         try:
             data = {k: v.get() for k, v in self._setting_vars().items()}
+            token = self.distributed_token_var.get()
+            if self.distributed_remember_token_var.get() and token and os.name == "nt":
+                data["protected_distributed_token"] = _protect_token(token)
             SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
             SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except (OSError, tk.TclError, TypeError) as exc:
@@ -231,6 +295,11 @@ class GPUStackerApp:
                     var.set(data[name])
                 except tk.TclError:
                     pass  # type mismatch from an older settings file: keep the default
+        if os.name == "nt" and self.distributed_remember_token_var.get() and data.get("protected_distributed_token"):
+            try:
+                self.distributed_token_var.set(_unprotect_token(data["protected_distributed_token"]))
+            except (OSError, ValueError, UnicodeDecodeError, AttributeError) as exc:
+                self._append_log(f"Saved shared token could not be restored; enter it again. ({exc})")
 
     def _on_close(self) -> None:
         self._save_settings()
@@ -281,11 +350,27 @@ class GPUStackerApp:
         self.reference_combo.bind("<<ComboboxSelected>>", self._select_reference)
         self.rank_reference_button = ttk.Button(reference, text="Analyze & rank", command=self._rank_references)
         self.rank_reference_button.grid(row=0, column=2, padx=(6, 0))
+        actions = ttk.Frame(reference)
+        actions.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self.preview_reference_button = ttk.Button(actions, text="Preview", command=self._preview_reference)
+        self.preview_reference_button.pack(side="left")
+        ttk.Button(actions, text="Use as reference", command=self._use_reference_candidate).pack(side="left", padx=6)
         self.reference_stats_var = tk.StringVar(value="No ranking stats yet. Click Analyze & rank.")
-        ttk.Label(reference, textvariable=self.reference_stats_var, foreground="#9aa3b2").grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        ttk.Label(reference, textvariable=self.reference_stats_var, foreground="#9aa3b2").grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        registered = ttk.Frame(box)
+        registered.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        registered.columnconfigure(1, weight=1)
+        ttk.Label(registered, text="Registered store (overrides listed lights)").grid(row=0, column=0, columnspan=3, sticky="w")
+        self.registered_dir_var = tk.StringVar(value="")
+        ttk.Entry(registered, textvariable=self.registered_dir_var).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+        ttk.Button(registered, text="Browse…", command=self._choose_registered_store).grid(row=1, column=2, padx=(6, 0), pady=(3, 0))
+        self.cleanup_registered_button = ttk.Button(registered, text="Clean up…", command=self._cleanup_registered_store)
+        self.cleanup_registered_button.grid(row=2, column=2, sticky="e", pady=(3, 0))
+        self.reference_choice_status_var = tk.StringVar(value="Run reference: automatic")
+        ttk.Label(reference, textvariable=self.reference_choice_status_var, foreground="#9aa3b2").grid(row=3, column=0, columnspan=3, sticky="w")
 
         grp = ttk.Frame(box)
-        grp.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        grp.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         grp.columnconfigure(1, weight=1)
         self.batch_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(grp, text="Batch: one master per group", variable=self.batch_var).grid(row=0, column=0, sticky="w")
@@ -461,12 +546,18 @@ class GPUStackerApp:
         ttk.Checkbutton(row, text="Coverage/rejection maps", variable=self.maps_var).pack(side="left")
         self.keep_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(row, text="Keep registered frames", variable=self.keep_var).pack(side="left", padx=8)
+
+        ttk.Label(products, text="Run options").grid(row=1, column=0, sticky="w", pady=2)
+        row = ttk.Frame(products)
+        row.grid(row=1, column=1, columnspan=3, sticky="ew")
+        self.resume_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="Resume after failure", variable=self.resume_var).pack(side="left")
         self.solve_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row, text="Plate solve (ASTAP)", variable=self.solve_var).pack(side="left")
 
-        ttk.Label(products, text="Drizzle").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(products, text="Drizzle").grid(row=2, column=0, sticky="w", pady=2)
         drizzle_controls = ttk.Frame(products)
-        drizzle_controls.grid(row=1, column=1, columnspan=2, sticky="ew")
+        drizzle_controls.grid(row=2, column=1, columnspan=2, sticky="ew")
         row = ttk.Frame(drizzle_controls)
         row.pack(anchor="w")
         self.drizzle_var = tk.StringVar(value="off")
@@ -522,12 +613,38 @@ class GPUStackerApp:
             var.trace_add("write", lambda *_: self._mf_field_edited())
         self._apply_mf_preset()
 
+        distributed = ttk.LabelFrame(content, text="Experimental multi-system stacking", padding=5)
+        distributed.grid(row=4, column=0, sticky="ew", pady=4)
+        self.distributed_enabled_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(distributed, text="Use remote worker for stack bands", variable=self.distributed_enabled_var).grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(distributed, text="Worker host").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.distributed_host_var = tk.StringVar()
+        ttk.Entry(distributed, textvariable=self.distributed_host_var, width=28).grid(row=1, column=1, sticky="ew", padx=4, pady=(4, 0))
+        ttk.Label(distributed, text="Port").grid(row=1, column=2, sticky="e", pady=(4, 0))
+        self.distributed_port_var = tk.StringVar(value="47861")
+        ttk.Entry(distributed, textvariable=self.distributed_port_var, width=8).grid(row=1, column=3, sticky="w", padx=(4, 0), pady=(4, 0))
+        ttk.Label(distributed, text="Shared token").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.distributed_token_var = tk.StringVar()
+        ttk.Entry(distributed, textvariable=self.distributed_token_var, show="*").grid(row=2, column=1, columnspan=3, sticky="ew", padx=4, pady=(4, 0))
+        self.distributed_remember_token_var = tk.BooleanVar(value=os.name == "nt")
+        ttk.Checkbutton(
+            distributed,
+            text="Remember token securely",
+            variable=self.distributed_remember_token_var,
+            state="normal" if os.name == "nt" else "disabled",
+        ).grid(row=3, column=1, sticky="w", padx=4, pady=(3, 0))
+        ttk.Label(distributed, text="Rows per task").grid(row=4, column=0, sticky="w", pady=(4, 0))
+        self.distributed_rows_var = tk.IntVar(value=64)
+        ttk.Spinbox(distributed, textvariable=self.distributed_rows_var, from_=1, to=4096, width=8).grid(row=4, column=1, sticky="w", padx=4, pady=(4, 0))
+        ttk.Label(distributed, text="The worker must be enabled in Multi-system setup. Both computers need the same registered-store folder.", foreground="#9aa3b2", wraplength=510).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        distributed.columnconfigure(1, weight=1)
+
         self.output_var = tk.StringVar(value="")
-        ttk.Label(products, text="Output FITS").grid(row=2, column=0, sticky="w", pady=(4, 2))
-        ttk.Entry(products, textvariable=self.output_var).grid(row=2, column=1, sticky="ew", padx=4, pady=(4, 2))
-        ttk.Button(products, text="…", width=3, command=self._pick_output).grid(row=2, column=2, pady=(4, 2))
-        ttk.Button(products, text="Folder…", command=self._pick_output_folder).grid(row=2, column=3, padx=(4, 0), pady=(4, 2))
-        ttk.Label(products, text="Batch mode: this is the output folder", foreground="#9aa3b2").grid(row=3, column=1, sticky="w")
+        ttk.Label(products, text="Output FITS").grid(row=3, column=0, sticky="w", pady=(4, 2))
+        ttk.Entry(products, textvariable=self.output_var).grid(row=3, column=1, sticky="ew", padx=4, pady=(4, 2))
+        ttk.Button(products, text="…", width=3, command=self._pick_output).grid(row=3, column=2, pady=(4, 2))
+        ttk.Button(products, text="Folder…", command=self._pick_output_folder).grid(row=3, column=3, padx=(4, 0), pady=(4, 2))
+        ttk.Label(products, text="Batch mode: this is the output folder", foreground="#9aa3b2").grid(row=4, column=1, sticky="w")
 
     def _apply_mf_preset(self) -> None:
         preset = MFDECONV_PRESETS.get(self.mf_preset.get())
@@ -567,6 +684,7 @@ class GPUStackerApp:
         ttk.Button(bar, text="Compare…", command=self._open_compare).pack(side="left")
         ttk.Button(bar, text="Tilt…", command=self._open_tilt).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="Mosaic…", command=self._open_mosaic).pack(side="left", padx=(6, 0))
+        ttk.Button(bar, text="Multi-system…", command=self._open_distributed).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="Help", command=self._open_help).pack(side="left", padx=6)
         self.status_var = tk.StringVar(value="Idle")
         ttk.Label(bar, textvariable=self.status_var).pack(side="right")
@@ -581,17 +699,14 @@ class GPUStackerApp:
     # ------------------------------------------------------------------ light list
 
     def _refresh_reference_choices(self) -> None:
-        selected_path = self.reference_path_var.get()
+        if not self._reference_choices_dirty:
+            return
+        selected_path = self._preview_candidate_path
         metrics = None
         if self._analysis_cache is not None:
-            try:
-                settings = self._settings()
-                if self._analysis_signature(settings) == self._analysis_cache_signature:
-                    metrics = rank_reference_infos(list(self._analysis_cache.values()))
-                else:
-                    self._invalidate_analysis_cache()
-            except (ValueError, tk.TclError):
-                pass
+            metrics = self._reference_metrics
+            if metrics is None:
+                metrics = rank_reference_infos(list(self._analysis_cache.values()))
         output_text = self.output_var.get() if hasattr(self, "output_var") else ""
         if metrics is None and output_text:
             metrics = rank_reference_frames(self.lights, Path(output_text).with_suffix(".frames.csv"))
@@ -621,35 +736,39 @@ class GPUStackerApp:
                 label = prefix + label
             choices[label] = path
 
+        if self._preview_candidate_path is not None and not any(path.resolve() == self._preview_candidate_path.resolve() for path in choices.values()):
+            self._preview_candidate_path = None
         self._reference_choices = choices
         self.reference_combo.configure(values=(_AUTO_REFERENCE, *choices))
         selected_label = next(
             (
                 label
                 for label, path in choices.items()
-                if selected_path and path.resolve() == Path(selected_path).resolve()
+                if selected_path and path.resolve() == selected_path.resolve()
             ),
             _AUTO_REFERENCE,
         )
-        if selected_label == _AUTO_REFERENCE:
-            self.reference_path_var.set("")
         self.reference_display_var.set(selected_label)
         self._update_reference_stats()
+        self._reference_choices_dirty = False
 
     def _select_reference(self, _event=None) -> None:
-        path = self._reference_choices.get(self.reference_display_var.get())
-        self.reference_path_var.set(str(path) if path is not None else "")
+        self._preview_candidate_path = self._reference_choices.get(self.reference_display_var.get())
         self._update_reference_stats()
 
     def _update_reference_stats(self) -> None:
+        selected_reference = self.reference_path_var.get()
+        self.reference_choice_status_var.set(f"Run reference: {Path(selected_reference).name if selected_reference else 'automatic'}")
         if not self._reference_metrics:
             self.reference_stats_var.set("No ranking stats yet. Click Analyze & rank.")
             return
-        path = self.reference_path_var.get()
+        path = self._preview_candidate_path
+        if path is None:
+            path = reference_preview_path(_AUTO_REFERENCE, self._reference_choices, self._reference_metrics)
         if not path:
-            self.reference_stats_var.set("Choose a frame to see its stats; lower FWHM is sharper.")
+            self.reference_stats_var.set("No eligible ranked frame to preview.")
             return
-        metric = self._reference_metrics.get(Path(path).name)
+        metric = self._reference_metrics.get(path.name)
         if metric is None:
             self.reference_stats_var.set("No statistics available for this frame.")
             return
@@ -669,6 +788,70 @@ class GPUStackerApp:
         if metric["bright_star_rate"] is not None:
             parts.append(f"signal/s {metric['bright_star_rate']:.3g}")
         self.reference_stats_var.set("  |  ".join(parts) if parts else "No statistics available for this frame.")
+
+    def _use_reference_candidate(self) -> None:
+        path = reference_preview_path(self.reference_display_var.get(), self._reference_choices, self._reference_metrics)
+        if path is None:
+            messagebox.showinfo(APP_NAME, "Analyze & rank before choosing the automatic reference.")
+            return
+        self.reference_path_var.set(str(path))
+        self._update_reference_stats()
+
+    def _preview_reference(self) -> None:
+        if self._ranking or self._previewing:
+            return
+        path = reference_preview_path(self.reference_display_var.get(), self._reference_choices, self._reference_metrics)
+        if path is None:
+            messagebox.showinfo(APP_NAME, "Analyze & rank before previewing the automatic reference.")
+            return
+        try:
+            settings = self._settings()
+            pipeline = StackingPipeline(settings, lambda _: None)
+        except (ValueError, tk.TclError) as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+        self._previewing = True
+        self._cancel_requested = False
+        self.run_btn.configure(state="disabled")
+        self.rank_reference_button.configure(state="disabled")
+        self.preview_reference_button.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
+        self.pipeline = pipeline
+        self.status_var.set(f"Preparing preview: {path.name}")
+        self.worker = threading.Thread(target=self._preview_worker, args=(path, pipeline), daemon=True)
+        self.worker.start()
+
+    def _preview_worker(self, path: Path, pipeline: StackingPipeline) -> None:
+        try:
+            tensor, meta = pipeline._load_calibrated(path)
+            if self._cancel_requested:
+                self.events.put(("reference_preview_cancelled", None))
+                return
+            pixels = reference_preview_rgb(tensor.detach().cpu().numpy())
+            self.events.put(("reference_preview", (path, pixels, meta)))
+        except Exception as exc:
+            self.events.put(("reference_preview_error", f"{type(exc).__name__}: {exc}"))
+
+    def _show_reference_preview(self, path: Path, pixels: np.ndarray, meta) -> None:
+        if self._preview_window is not None and self._preview_window.winfo_exists():
+            self._preview_window.destroy()
+        window = tk.Toplevel(self.root)
+        window.title(f"{APP_NAME} — Reference preview: {path.name}")
+        window.transient(self.root)
+        configure_dark_theme(window)
+        height, width = pixels.shape[:2]
+        self._preview_photo = tk.PhotoImage(master=window, width=width, height=height)
+        for y0 in range(0, height, 16):
+            rows = []
+            for row in pixels[y0 : y0 + 16]:
+                colors = " ".join(f"#{red:02x}{green:02x}{blue:02x}" for red, green, blue in row)
+                rows.append("{" + colors + "}")
+            self._preview_photo.put(" ".join(rows), to=(0, y0))
+        ttk.Label(window, image=self._preview_photo).pack(padx=8, pady=8)
+        exposure = f"{meta.exposure:g}s" if meta.exposure is not None else "exposure unknown"
+        ttk.Label(window, text=f"{path.name}  |  {meta.shape[1]}x{meta.shape[0]}  |  {meta.channels} source channel(s)  |  {exposure}").pack(padx=8, pady=(0, 8))
+        window.geometry(f"{width + 32}x{height + 72}")
+        self._preview_window = window
 
     def _refresh_list(self) -> None:
         self.listbox.delete(0, "end")
@@ -693,7 +876,7 @@ class GPUStackerApp:
 
     def _preview_groups(self) -> None:
         if not self.lights:
-            messagebox.showinfo("GPUStacker", "Add some light frames first")
+            messagebox.showinfo(APP_NAME, "Add some light frames first")
             return
         groups = group_frames(list(self.lights), self._group_keys(), self._append_log)
         self._append_log(f"Groups by {', '.join(self._group_keys())}:")
@@ -725,6 +908,13 @@ class GPUStackerApp:
         self._analysis_cache = None
         self._analysis_cache_signature = None
         self._reference_metrics = None
+        self._reference_choices_dirty = True
+
+    def _reference_analysis_settings_changed(self, *_args) -> None:
+        self._invalidate_analysis_cache()
+
+    def _reference_output_changed(self, *_args) -> None:
+        self._reference_choices_dirty = True
 
     def _analysis_signature(self, settings: PipelineSettings) -> str:
         def fingerprint(path: Path | None) -> tuple | None:
@@ -753,7 +943,7 @@ class GPUStackerApp:
         try:
             settings = self._settings()
         except (ValueError, tk.TclError) as exc:
-            messagebox.showerror("GPUStacker", str(exc))
+            messagebox.showerror(APP_NAME, str(exc))
             return
         self.rank_reference_button.configure(state="disabled")
         self.run_btn.configure(state="disabled")
@@ -794,10 +984,18 @@ class GPUStackerApp:
     # ------------------------------------------------------------------ run
 
     def _settings(self) -> PipelineSettings:
-        if not self.lights:
+        registered_dir = Path(self.registered_dir_var.get()) if self.registered_dir_var.get().strip() else None
+        distributed_enabled = bool(self.distributed_enabled_var.get())
+        if not self.lights and registered_dir is None:
             raise ValueError("Add at least two light frames")
         if not self.output_var.get():
             raise ValueError("Choose an output path")
+        if distributed_enabled and self.batch_var.get():
+            raise ValueError("Experimental multi-system stacking is not available in batch mode")
+        if distributed_enabled and len(set(self.weightings_var.get().split(","))) > 1:
+            raise ValueError("Experimental multi-system stacking supports one weighting method per run")
+        if registered_dir is not None and (self.resume_var.get() or self.drizzle_var.get() != "off"):
+            raise ValueError("Registered-store stacking does not support resume or drizzle")
         opt = lambda v: Path(v) if v.strip() else None  # noqa: E731
         mf = None
         if self.mf_enable.get():
@@ -814,8 +1012,9 @@ class GPUStackerApp:
             )
         weightings = [mode for mode in self.weightings_var.get().split(",") if mode in WEIGHTING_CHOICES] or ["psfsw"]
         settings = PipelineSettings(
-            lights=list(self.lights),
+            lights=[] if registered_dir is not None else list(self.lights),
             output=Path(self.output_var.get()),
+            registered_dir=registered_dir,
             reference=opt(self.reference_path_var.get()),
             bias=opt(self.bias_var.get()),
             dark=opt(self.dark_var.get()),
@@ -852,6 +1051,12 @@ class GPUStackerApp:
             mfdeconv_frames=int(self.mf_frames.get()),
             mfdeconv_blend=float(self.mf_blend.get()),
             keep_registered=bool(self.keep_var.get()),
+            distributed_enabled=distributed_enabled,
+            distributed_host=self.distributed_host_var.get().strip(),
+            distributed_port=int(self.distributed_port_var.get()),
+            distributed_token=self.distributed_token_var.get(),
+            distributed_rows_per_task=int(self.distributed_rows_var.get()),
+            resume=bool(self.resume_var.get()),
             device="cpu" if self.cpu_var.get() else "auto",
             workers=int(self.workers_var.get()),
         )
@@ -877,7 +1082,7 @@ class GPUStackerApp:
 
     def _choose_weightings(self) -> None:
         popup = tk.Toplevel(self.root)
-        popup.title("Select weighting methods")
+        popup.title(f"{APP_NAME} — Select weighting methods")
         popup.transient(self.root)
         configure_dark_theme(popup)
         ttk.Label(popup, text="Hold Ctrl and click to add or remove methods").pack(anchor="w", padx=10, pady=(10, 4))
@@ -906,7 +1111,7 @@ class GPUStackerApp:
 
     def _confirm_stack(self, outputs: list[Path], notes: list[str] | None = None, disk_estimate: DiskSpaceEstimate | None = None) -> bool:
         dialog = tk.Toplevel(self.root)
-        dialog.title("Confirm Stack outputs")
+        dialog.title(f"{APP_NAME} — Confirm stack outputs")
         dialog.transient(self.root)
         dialog.geometry("760x500")
         dialog.minsize(540, 320)
@@ -917,20 +1122,26 @@ class GPUStackerApp:
         if disk_estimate is None:
             ttk.Label(frame, text="Disk-space estimate unavailable; verify free space on the output drive.", foreground="#d6ad62", wraplength=720, justify="left").pack(anchor="w", pady=(0, 8))
         else:
-            space_color = "#d6ad62" if disk_estimate.recommended_bytes > disk_estimate.free_bytes else DARK_TEXT
+            volume_lines = [
+                f"{volume}: {format_bytes(required)} required; {format_bytes(free)} free"
+                for volume, required, free in disk_estimate.volume_usage
+            ] or [f"{disk_estimate.volume}: {format_bytes(disk_estimate.expected_bytes)} required; {format_bytes(disk_estimate.free_bytes)} free"]
+            short = any(required > free for _, required, free in disk_estimate.volume_usage)
+            low_headroom = any(int(required * 1.1) > free for _, required, free in disk_estimate.volume_usage)
+            space_color = "#d6ad62" if low_headroom else DARK_TEXT
             space_line = (
                 f"Estimated peak disk use: {format_bytes(disk_estimate.expected_bytes)} "
-                f"(working files {format_bytes(disk_estimate.working_bytes)} + outputs {format_bytes(disk_estimate.output_bytes)}). "
-                f"Free on {disk_estimate.volume}: {format_bytes(disk_estimate.free_bytes)}."
+                f"(working files {format_bytes(disk_estimate.working_bytes)} + outputs {format_bytes(disk_estimate.output_bytes)})."
             )
-            if disk_estimate.expected_bytes > disk_estimate.free_bytes:
-                space_line += f" WARNING: short by about {format_bytes(disk_estimate.expected_bytes - disk_estimate.free_bytes)}."
-            elif disk_estimate.recommended_bytes > disk_estimate.free_bytes:
-                space_line += " WARNING: less than 10% headroom remains."
-            ttk.Label(frame, text=space_line, foreground=space_color, wraplength=720, justify="left").pack(anchor="w", pady=(0, 4))
+            if short:
+                space_line += " WARNING: at least one volume is short."
+            elif low_headroom:
+                space_line += " WARNING: less than 10% headroom remains on at least one volume."
+            ttk.Label(frame, text=space_line, foreground=space_color, wraplength=720, justify="left").pack(anchor="w", pady=(0, 2))
+            ttk.Label(frame, text="\n".join(volume_lines), foreground=space_color, wraplength=720, justify="left").pack(anchor="w", pady=(0, 4))
             ttk.Label(
                 frame,
-                text="Estimate assumes the first input's dimensions and all selected frames; filters may reduce scratch use. Registered files are removed after stacking unless Keep registered is enabled.",
+                text="Estimate uses the largest frame grid and channel layout in each group; filters may reduce scratch use. Registered files are removed after stacking unless Keep registered is enabled.",
                 foreground="#9aa3b2",
                 wraplength=720,
                 justify="left",
@@ -969,11 +1180,15 @@ class GPUStackerApp:
         try:
             settings = self._settings()
         except (ValueError, tk.TclError) as exc:
-            messagebox.showerror("GPUStacker", str(exc))
+            messagebox.showerror(APP_NAME, str(exc))
             return
         batch_groups: list[FrameGroup] | None = None
         batch_output_dir: Path | None = None
+        group_inputs: list[tuple[str, list[Path], list[Path]]] | None = None
         notes: list[str] = []
+        if settings.registered_dir is not None and self.batch_var.get():
+            messagebox.showerror(APP_NAME, "Batch grouping is not available when stacking a registered store.")
+            return
         if self.batch_var.get():
             group_messages: list[str] = []
             batch_groups = group_frames(list(settings.lights), self._group_keys(), group_messages.append)
@@ -982,23 +1197,29 @@ class GPUStackerApp:
             notes.extend(group_messages)
             skipped = [group for group in batch_groups if len(group.lights) < 2]
             notes.extend(f"Skipped {group.key.slug}: fewer than 2 frames" for group in skipped)
-            planned = [
-                path
-                for group in batch_groups
-                if len(group.lights) >= 2
-                for path in planned_output_files(batch_output_dir / f"{group.key.slug}.fit", settings)
-            ]
+            group_inputs = []
+            planned = []
+            for group in batch_groups:
+                if len(group.lights) < 2:
+                    continue
+                group_outputs = planned_output_files(batch_output_dir / f"{group.key.slug}.fit", settings)
+                planned.extend(group_outputs)
+                group_inputs.append((group.key.label, group.lights, group_outputs))
         else:
             planned = planned_output_files(settings.output, settings)
         if not planned:
-            messagebox.showerror("GPUStacker", "No stack outputs are planned. Check the selected frames and batch groups.")
+            messagebox.showerror(APP_NAME, "No stack outputs are planned. Check the selected frames and batch groups.")
             return
-        scratch_frames = None
-        if batch_groups is not None:
-            scratch_frames = max((len(group.lights) for group in batch_groups if len(group.lights) >= 2), default=0)
         storage_dir = batch_output_dir if batch_output_dir is not None else settings.output.parent
         try:
-            disk_estimate = estimate_stack_disk_space(settings, planned, storage_dir, scratch_frames or None)
+            if settings.registered_dir is not None:
+                raise ValueError("Registered-store scratch usage is not calibrated")
+            disk_estimate = estimate_stack_disk_space(settings, planned, storage_dir, group_inputs=group_inputs)
+            if group_inputs is not None:
+                notes.extend(
+                    f"{label}: peak working {format_bytes(working)}, outputs {format_bytes(output)}"
+                    for label, working, output in disk_estimate.group_details
+                )
         except Exception:
             disk_estimate = None
         if not self._confirm_stack(planned, notes, disk_estimate):
@@ -1039,13 +1260,51 @@ class GPUStackerApp:
             else:
                 self.pipeline = StackingPipeline(settings, status, progress)
                 result = self.pipeline.run()
-                lines = [integration_summary(result, len(settings.lights)), f"Master: {result.output.name}"]
+                lines = [integration_summary(result, len(result.frames) if settings.registered_dir is not None else len(settings.lights)), f"Master: {result.output.name}"]
                 for label, path in (("Drizzle", result.drizzle_output), ("MFDeconv", result.mfdeconv_output)):
                     if path is not None:
                         lines.append(f"{label}: {path.name}")
                 self.events.put(("done", (f"Finished in {result.seconds:.1f}s -> {result.output}", result.output.parent, lines)))
+        except RuntimeError as exc:
+            if str(exc) == "Cancelled":
+                self.events.put(("cancelled", None))
+            else:
+                self.events.put(("error", f"{type(exc).__name__}: {exc}"))
         except Exception as exc:  # surface everything in the GUI log
             self.events.put(("error", f"{type(exc).__name__}: {exc}"))
+
+    def _choose_registered_store(self) -> None:
+        chosen = filedialog.askdirectory(title="Choose retained registered store")
+        if chosen:
+            self.registered_dir_var.set(chosen)
+
+    def _cleanup_registered_store(self) -> None:
+        if self._run_active:
+            messagebox.showerror(APP_NAME, "Wait for the active task to finish before cleaning up a registered store.")
+            return
+        value = self.registered_dir_var.get().strip()
+        if not value:
+            messagebox.showerror(APP_NAME, "Choose a registered store first.")
+            return
+        directory = Path(value)
+        try:
+            artifacts = registered_store_cleanup_plan(directory)
+            total_bytes = sum(path.stat().st_size for path in artifacts)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror(APP_NAME, f"Cannot validate registered store: {exc}")
+            return
+        if not messagebox.askyesno(
+            "Clean up registered store",
+            f"Permanently delete {len(artifacts)} validated store file(s) ({format_bytes(total_bytes)}) from:\n{directory}\n\nFiles not listed by the store index will be preserved.",
+        ):
+            return
+        try:
+            count, removed_bytes = cleanup_registered_store(directory)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror(APP_NAME, f"Store cleanup was incomplete: {exc}")
+            return
+        self.registered_dir_var.set("")
+        messagebox.showinfo(APP_NAME, f"Removed {count} registered-store file(s), {format_bytes(removed_bytes)}.")
 
     def _open_compare(self) -> None:
         from .compare_gui import CompareWindow
@@ -1073,12 +1332,25 @@ class GPUStackerApp:
                 tiles = [p for p in sorted(folder.glob("*.fit")) if is_gpustacker_output(p) and not any(p.stem.endswith(s) for s in ("_coverage", "_rejection", "_drizzle", "_drizzle_weight", "_mfdeconv"))]
         MosaicWindow(tk.Toplevel(self.root), tiles or None)
 
+    def _open_distributed(self) -> None:
+        from .distributed_gui import DistributedWindow
+
+        store = Path(self.registered_dir_var.get()) if self.registered_dir_var.get() else None
+        if store is None and self.distributed_enabled_var.get() and self.output_var.get():
+            store = Path(self.output_var.get()).parent / "_gpustacker_work"
+            try:
+                store.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                messagebox.showerror(APP_NAME, f"Could not prepare the shared worker store: {exc}", parent=self.root)
+                return
+        DistributedWindow(tk.Toplevel(self.root), store)
+
     def _open_help(self) -> None:
         HelpWindow(tk.Toplevel(self.root))
 
     def _show_finished(self, folder: Path, lines: list[str], elapsed: float) -> None:
         win = tk.Toplevel(self.root)
-        win.title("GPUStacker — finished")
+        win.title(f"{APP_NAME} — Finished")
         win.configure(bg=DARK_BG)
         win.transient(self.root)
         win.resizable(False, False)
@@ -1097,7 +1369,7 @@ class GPUStackerApp:
             try:
                 open_in_file_manager(folder)
             except OSError as exc:
-                messagebox.showerror("GPUStacker", f"Could not open {folder}: {exc}", parent=win)
+                messagebox.showerror(APP_NAME, f"Could not open {folder}: {exc}", parent=win)
 
         ttk.Button(buttons, text="Open output folder", style="Primary.TButton", command=open_folder).pack(side="left")
         ttk.Button(buttons, text="Close", command=win.destroy).pack(side="left", padx=(6, 0))
@@ -1129,12 +1401,14 @@ class GPUStackerApp:
                     self._append_log(f"Total wall time: {format_duration(elapsed)}")
                     self.status_var.set("Done")
                     self._set_running(False)
+                    self._reference_choices_dirty = True
                     self._show_finished(Path(folder), lines, elapsed)
                 elif kind == "ranked":
                     infos, signature = payload
                     self._analysis_cache = {str(info.path.resolve()): info for info in infos}
                     self._analysis_cache_signature = signature
                     self._reference_metrics = rank_reference_infos(infos)
+                    self._reference_choices_dirty = True
                     self._ranking = False
                     self._set_running(False)
                     self._refresh_reference_choices()
@@ -1147,18 +1421,40 @@ class GPUStackerApp:
                     else:
                         self._append_log(payload)
                         self.status_var.set("Ranking failed")
+                elif kind == "reference_preview":
+                    path, pixels, meta = payload
+                    self._previewing = False
+                    self._set_running(False)
+                    self.status_var.set("Reference preview ready")
+                    self._show_reference_preview(path, pixels, meta)
+                elif kind == "reference_preview_error":
+                    self._previewing = False
+                    self._set_running(False)
+                    self._append_log(payload)
+                    self.status_var.set("Reference preview failed")
+                elif kind == "reference_preview_cancelled":
+                    self._previewing = False
+                    self._set_running(False)
+                    self.status_var.set("Preview cancelled")
                 elif kind == "error":
                     self._append_log(payload)
                     self.status_var.set("Failed")
+                    self._set_running(False)
+                elif kind == "cancelled":
+                    self._append_log("Stacking cancelled")
+                    self.status_var.set("Cancelled")
                     self._set_running(False)
         except queue.Empty:
             pass
         self.root.after(100, self._poll)
 
     def _set_running(self, running: bool) -> None:
-        active = running or self._ranking
+        self._run_active = running
+        active = running or self._ranking or self._previewing
         self.run_btn.configure(state="disabled" if active else "normal")
         self.rank_reference_button.configure(state="disabled" if active else "normal")
+        self.preview_reference_button.configure(state="disabled" if active else "normal")
+        self.cleanup_registered_button.configure(state="disabled" if active else "normal")
         self.cancel_btn.configure(state="normal" if active else "disabled")
         if running:
             self.progress["value"] = 0
@@ -1180,7 +1476,7 @@ class HelpWindow:
     """Section list on the left, scrollable documentation on the right."""
 
     def __init__(self, win: tk.Toplevel) -> None:
-        win.title("GPUStacker — Help")
+        win.title(f"{APP_NAME} — Help")
         win.geometry("980x700")
         win.minsize(700, 480)
         win.configure(bg=DARK_BG)

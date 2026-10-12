@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -11,6 +13,7 @@ import numpy as np
 from . import __version__
 from .batch import DEFAULT_GROUP_KEYS, describe_groups, group_frames, run_batch
 from .cosmetic import CosmeticSettings
+from .distributed import WorkerProbeError, benchmark_store_read, create_worker_server, probe_worker
 from .drizzle import DrizzleSettings
 from .io import discover_frames, is_gpustacker_output
 from .mfdeconv import MFDECONV_PRESETS, MFDeconvSettings
@@ -57,8 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"gpustacker {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    st = sub.add_parser("stack", help="Calibrate, register and stack light frames")
-    st.add_argument("lights", nargs="+", help="Light files, folders, or globs")
+    st = sub.add_parser("stack", help="Calibrate, register and stack light frames or stack a retained registered store")
+    st.add_argument("lights", nargs="*", help="Light files, folders, or globs")
+    st.add_argument("--registered-dir", type=Path, help="Stack a validated retained GPUStacker registered-frame store")
     st.add_argument("-o", "--output", required=True, type=Path, help="Output FITS path (a directory when --group-by is used)")
     st.add_argument("--group-by", help="Comma-separated FITS keywords; one master per group, e.g. OBJECT,FILTER (also NIGHT, FOLDER, SIZE)")
     st.add_argument("--name-template", help="Output name per group, e.g. '{OBJECT}_{FILTER}' (default: all key values joined)")
@@ -107,10 +111,31 @@ def build_parser() -> argparse.ArgumentParser:
     fl.add_argument("--filter-background", type=float, default=2.0, help="Exclude frames with sky above this multiple of the median")
     fl.add_argument("--filter-fwhm", type=float, default=1.4, help="Exclude frames with FWHM above this multiple of the median")
     st.add_argument("--keep-registered", action="store_true", help="Keep registered .npy frames in the work dir")
+    st.add_argument("--resume", action="store_true", help="Save a registered-stage checkpoint and resume it on a matching rerun after failure")
     st.add_argument("--work-dir", type=Path)
     st.add_argument("--cpu", action="store_true", help="Force CPU backend")
     st.add_argument("--vram-fraction", type=float, default=0.75)
     st.add_argument("--workers", type=int, default=0, help="CPU worker processes for star detection (0 = cores-1)")
+
+    sb = sub.add_parser("store-benchmark", help="Validate and measure bounded reads from a registered store or network share")
+    sb.add_argument("registered_dir", type=Path, help="Registered store directory (use its UNC path on a remote worker)")
+    sb.add_argument("--rows", type=int, default=8, help="Rows read from every frame (default 8)")
+    sb.add_argument("--start-row", type=int, help="First row to read (default: center band)")
+
+    wa = sub.add_parser("worker-agent", help="Run an authenticated, read-only worker capability probe service")
+    wa.add_argument("--shared-store", type=Path, required=True, help="Registered store visible to this worker, preferably via UNC path")
+    wa.add_argument("--bind", default="127.0.0.1", help="Listen address; use 0.0.0.0 only on a trusted LAN with firewall rules")
+    wa.add_argument("--port", type=int, default=47861)
+    wa.add_argument("--rows", type=int, default=8)
+    wa.add_argument("--token-env", default="GPUSTACKER_WORKER_TOKEN", help="Environment variable containing the shared probe token")
+
+    wp = sub.add_parser("worker-probe", help="Authenticate to a worker and check version/backend/shared-store access")
+    wp.add_argument("host", help="Worker hostname or IP address")
+    wp.add_argument("--shared-store", type=Path, required=True, help="Coordinator path to the same registered store")
+    wp.add_argument("--port", type=int, default=47861)
+    wp.add_argument("--timeout", type=float, default=5.0)
+    wp.add_argument("--require-cuda", action="store_true", help="Fail if the worker has no available CUDA device")
+    wp.add_argument("--token-env", default="GPUSTACKER_WORKER_TOKEN", help="Environment variable containing the shared probe token")
 
     mf = st.add_argument_group("ImageMM multi-frame deconvolution")
     mf.add_argument("--mfdeconv", action="store_true", help="Also produce an ImageMM deconvolved image")
@@ -145,7 +170,7 @@ def build_parser() -> argparse.ArgumentParser:
     ms = sub.add_parser("mosaic", help="Gradient-correct, register (by WCS) and seamlessly blend plate-solved master tiles into one mosaic")
     ms.add_argument("tiles", nargs="*", help="Master tile files (FITS/XISF with WCS, or plate-solvable by ASTAP); omit to open the GUI")
     ms.add_argument("-o", "--output", type=Path, help="Output mosaic FITS path")
-    ms.add_argument("--gradient", type=int, default=2, help="Per-tile sky gradient polynomial degree, 0 = off (default 2)")
+    ms.add_argument("--gradient", choices=["auto", "0", "1", "2", "3"], default="2", help="Per-tile sky gradient degree: auto or 0-3 (default 2)")
     ms.add_argument("--gradient-block", type=int, default=64, help="Block size in px for the sky samples (default 64)")
     ms.add_argument("--scale", type=float, default=0.0, help="Output pixel scale in arcsec/px (default: finest tile)")
     ms.add_argument("--orientation", choices=list(ORIENTATIONS), default="first", help="first = keep tile 1's rotation (default), north = north up")
@@ -179,8 +204,12 @@ def _mf_values(args: argparse.Namespace) -> dict[str, float | int]:
 
 def settings_from_args(args: argparse.Namespace) -> PipelineSettings:
     lights = _collect_lights(args.lights)
-    if not lights:
+    if not lights and args.registered_dir is None:
         raise SystemExit("No light frames found")
+    if lights and args.registered_dir is not None:
+        raise SystemExit("Use either light frames or --registered-dir, not both")
+    if args.registered_dir is not None and (args.group_by or args.list_groups):
+        raise SystemExit("Batch grouping is not supported with --registered-dir")
     mf = None
     mfv = _mf_values(args)
     if args.mfdeconv:
@@ -239,9 +268,11 @@ def settings_from_args(args: argparse.Namespace) -> PipelineSettings:
         mfdeconv_frames=int(mfv["frames"]),
         mfdeconv_blend=args.mf_blend,
         keep_registered=args.keep_registered,
+        resume=args.resume,
         device="cpu" if args.cpu else "auto",
         vram_fraction=args.vram_fraction,
         workers=args.workers,
+        registered_dir=args.registered_dir,
     )
 
 
@@ -266,6 +297,53 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:
             write_report(results[0] if len(results) == 1 else results, args.json)
         return 0
+
+    if args.command == "store-benchmark":
+        try:
+            result = benchmark_store_read(args.registered_dir, args.rows, args.start_row)
+        except (OSError, ValueError) as exc:
+            print(f"Store benchmark failed: {exc}", file=sys.stderr)
+            return 2
+        channels, height, width = result.shape
+        print(f"Frames: {result.frame_count}; shape: {channels}x{height}x{width}")
+        print(f"Read: {result.rows} rows from each frame at row {result.start_row} ({result.bytes_read / (1024 ** 3):.2f} GiB)")
+        print(f"Index validation: {result.validation_seconds:.2f}s; band read: {result.read_seconds:.2f}s; {result.mib_per_second:.1f} MiB/s")
+        print(f"Checksum: {result.checksum:.6g}")
+        return 0
+
+    if args.command == "worker-agent":
+        token = os.environ.get(args.token_env, "")
+        if not token:
+            print(f"Set {args.token_env} in the environment before starting the worker agent", file=sys.stderr)
+            return 2
+        try:
+            server = create_worker_server(args.bind, args.port, args.shared_store, token, args.rows)
+        except (OSError, ValueError) as exc:
+            print(f"Could not start worker probe service: {exc}", file=sys.stderr)
+            return 2
+        host, port = server.server_address[:2]
+        print(f"Worker probe listening on {host}:{port}; no stack tasks are accepted", flush=True)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("Worker probe stopping", flush=True)
+        finally:
+            server.server_close()
+        return 0
+
+    if args.command == "worker-probe":
+        token = os.environ.get(args.token_env, "")
+        if not token:
+            print(f"Set {args.token_env} in the environment before probing", file=sys.stderr)
+            return 2
+        try:
+            capabilities = probe_worker(args.host, args.port, token, args.timeout, args.shared_store, args.require_cuda)
+        except WorkerProbeError as exc:
+            print(f"Worker probe failed: {exc}", file=sys.stderr)
+            return 2
+        compatible = capabilities["gpustacker_version"] == __version__
+        print(json.dumps({"compatible": compatible, "capabilities": capabilities}, indent=2))
+        return 0 if compatible else 3
 
     if args.command == "tilt":
         lights = _collect_lights(args.lights) if args.lights else []
@@ -303,7 +381,7 @@ def main(argv: list[str] | None = None) -> int:
         mosaic_settings = MosaicSettings(
             tiles=tiles,
             output=args.output,
-            gradient_degree=args.gradient,
+            gradient_degree=args.gradient if args.gradient == "auto" else int(args.gradient),
             gradient_block=args.gradient_block,
             pixel_scale=args.scale,
             orientation=args.orientation,

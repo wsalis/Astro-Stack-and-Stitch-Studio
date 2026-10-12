@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import re
+import tempfile
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from .backend import Backend, rows_per_band
+from .checkpoint import write_json_atomic
 
 RejectionMethod = Literal["none", "median", "sigma", "winsorized", "percentile", "gesd"]
 ProgressCallback = Callable[[float, str], None]
@@ -87,6 +91,92 @@ class FrameStore:
     def memmaps(self) -> list[np.memmap]:
         return [np.load(p, mmap_mode="r") for p in self.paths]
 
+    @classmethod
+    def load_index(cls, directory: Path, allow_missing: bool = False) -> "FrameStore":
+        """Restore a registered store, validating that every frame belongs to it and matches its shape."""
+
+        try:
+            index = json.loads((directory / "index.json").read_text(encoding="utf-8"))
+            shape = tuple(int(v) for v in index["shape"])
+            frames = index["frames"]
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Cannot read registered-frame index in {directory}: {exc}") from exc
+        if len(shape) != 3 or any(v < 1 for v in shape) or not isinstance(frames, list) or not frames:
+            raise ValueError("Registered-frame index has an invalid shape or no frames")
+        root = directory.resolve()
+        store = cls(directory, shape)
+        for frame_index, entry in enumerate(frames):
+            try:
+                stored_path = Path(entry["path"])
+                is_registered_array = stored_path.name.startswith("reg_") and stored_path.name.endswith(".npy") and stored_path.name[4:-4].isdigit()
+                if stored_path.is_absolute():
+                    try:
+                        path = stored_path.resolve(strict=not allow_missing)
+                    except FileNotFoundError:
+                        if not is_registered_array:
+                            raise
+                        path = (directory / stored_path.name).resolve(strict=not allow_missing)
+                else:
+                    path = (directory / stored_path).resolve(strict=not allow_missing)
+                if not path.is_relative_to(root):
+                    if not stored_path.is_absolute() or not is_registered_array:
+                        raise ValueError(f"Registered frame is outside its store: {path}")
+                    path = (directory / stored_path.name).resolve(strict=not allow_missing)
+                    if not path.is_relative_to(root):
+                        raise ValueError(f"Registered frame is outside its store: {path}")
+                if path.exists():
+                    array = np.load(path, mmap_mode="r", allow_pickle=False)
+                    valid_shape = array.shape == shape and array.dtype == np.float32
+                    del array
+                    if not valid_shape:
+                        raise ValueError(f"Registered frame has invalid shape or dtype: {path}")
+                offset_value = entry["offset"]
+                scale_value = entry["scale"]
+                offset = float(offset_value) if np.isscalar(offset_value) else np.asarray(offset_value, dtype=np.float32)
+                scale = float(scale_value) if np.isscalar(scale_value) else np.asarray(scale_value, dtype=np.float32)
+                weight_map_value = entry.get("weight_map")
+                weight_map = None
+                if weight_map_value is not None:
+                    weight_path = (directory / str(weight_map_value)).resolve(strict=not allow_missing)
+                    if not weight_path.is_relative_to(root):
+                        raise ValueError(f"Weight map is outside its store: {weight_path}")
+                    if weight_path.exists():
+                        weight_map = np.load(weight_path, allow_pickle=False)
+                        if weight_map.ndim != 2 or weight_map.dtype != np.float32 or not np.isfinite(weight_map).all():
+                            raise ValueError(f"Registered weight map has invalid shape or dtype: {weight_path}")
+                scale_map_value = entry.get("scale_map")
+                offset_map_value = entry.get("offset_map")
+                if (scale_map_value is None) != (offset_map_value is None):
+                    raise ValueError("Registered local-normalisation maps are incomplete")
+                scale_map = offset_map = None
+                if scale_map_value is not None:
+                    scale_map_path = (directory / str(scale_map_value)).resolve(strict=not allow_missing)
+                    offset_map_path = (directory / str(offset_map_value)).resolve(strict=not allow_missing)
+                    if not scale_map_path.is_relative_to(root) or not offset_map_path.is_relative_to(root):
+                        raise ValueError("Registered local-normalisation map is outside its store")
+                    if scale_map_path.exists() and offset_map_path.exists():
+                        scale_map = np.load(scale_map_path, allow_pickle=False)
+                        offset_map = np.load(offset_map_path, allow_pickle=False)
+                        valid_maps = (
+                            scale_map.ndim == 3
+                            and offset_map.shape == scale_map.shape
+                            and scale_map.shape[0] == shape[0]
+                            and scale_map.dtype == np.float32
+                            and offset_map.dtype == np.float32
+                            and np.isfinite(scale_map).all()
+                            and np.isfinite(offset_map).all()
+                        )
+                        if not valid_maps:
+                            raise ValueError("Registered local-normalisation maps have invalid shape or dtype")
+                    elif not allow_missing:
+                        raise ValueError("Registered local-normalisation maps are missing")
+                store.paths.append(path)
+                store.names.append(str(entry["name"]))
+                store.norms.append(FrameNorm(offset=offset, scale=scale, weight=float(entry["weight"]), scale_map=scale_map, offset_map=offset_map, weight_map=weight_map))
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid registered-frame entry in {directory}: {exc}") from exc
+        return store
+
     def drop(self, index: int) -> None:
         """Remove a registered frame (e.g. failed a post-registration filter)."""
 
@@ -99,15 +189,54 @@ class FrameStore:
             pass
 
     def save_index(self) -> Path:
-        index = {
-            "shape": list(self.shape),
-            "frames": [
-                {"name": n, "path": str(p), "offset": np.asarray(f.offset, dtype=float).tolist(), "scale": np.asarray(f.scale, dtype=float).tolist(), "weight": f.weight}
-                for n, p, f in zip(self.names, self.paths, self.norms)
-            ],
-        }
+        self.directory.mkdir(parents=True, exist_ok=True)
+        frames = []
+        for i, (name, path, norm) in enumerate(zip(self.names, self.paths, self.norms)):
+            weight_map_path = None
+            if norm.weight_map is not None:
+                weight_map_path = self.directory / f"weight_{i:04d}.npy"
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile("wb", dir=self.directory, prefix=f"{weight_map_path.name}.", suffix=".tmp", delete=False) as stream:
+                        temporary = Path(stream.name)
+                        np.save(stream, np.ascontiguousarray(norm.weight_map, dtype=np.float32), allow_pickle=False)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, weight_map_path)
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+            scale_map_path = offset_map_path = None
+            if norm.scale_map is not None or norm.offset_map is not None:
+                if norm.scale_map is None or norm.offset_map is None:
+                    raise ValueError(f"Incomplete local-normalisation maps for {name}")
+                scale_map_path = self.directory / f"scale_{i:04d}.npy"
+                offset_map_path = self.directory / f"offset_{i:04d}.npy"
+                for map_file_path, array in ((scale_map_path, norm.scale_map), (offset_map_path, norm.offset_map)):
+                    temporary = None
+                    try:
+                        with tempfile.NamedTemporaryFile("wb", dir=self.directory, prefix=f"{map_file_path.name}.", suffix=".tmp", delete=False) as stream:
+                            temporary = Path(stream.name)
+                            np.save(stream, np.ascontiguousarray(array, dtype=np.float32), allow_pickle=False)
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                        os.replace(temporary, map_file_path)
+                    finally:
+                        if temporary is not None:
+                            temporary.unlink(missing_ok=True)
+            frames.append({
+                "name": name,
+                "path": path.name,
+                "offset": np.asarray(norm.offset, dtype=float).tolist(),
+                "scale": np.asarray(norm.scale, dtype=float).tolist(),
+                "weight": norm.weight,
+                "weight_map": None if weight_map_path is None else weight_map_path.name,
+                "scale_map": None if scale_map_path is None else scale_map_path.name,
+                "offset_map": None if offset_map_path is None else offset_map_path.name,
+            })
+        index = {"shape": list(self.shape), "frames": frames}
         out = self.directory / "index.json"
-        out.write_text(json.dumps(index, indent=2), encoding="utf-8")
+        write_json_atomic(out, index)
         return out
 
     def cleanup(self) -> None:
@@ -116,6 +245,116 @@ class FrameStore:
                 p.unlink()
             except OSError:
                 pass
+
+
+def registered_store_cleanup_plan(directory: Path) -> list[Path]:
+    """Return owned artifacts only after validating the retained-store manifest and index."""
+
+    root = directory.resolve(strict=True)
+    cleanup_marker = root / "cleanup_pending.json"
+    if cleanup_marker.is_symlink():
+        raise ValueError(f"Registered-store cleanup marker is a symlink: {cleanup_marker}")
+    if cleanup_marker.exists():
+        try:
+            marker = json.loads(cleanup_marker.read_text(encoding="utf-8"))
+            if not isinstance(marker, dict):
+                raise ValueError("Invalid registered-store cleanup marker")
+            names = marker["files"]
+            if marker.get("schema") != 1 or not isinstance(names, list):
+                raise ValueError("Invalid registered-store cleanup marker")
+            if any(
+                not isinstance(name, str)
+                or name not in ("index.json", "registered_store.json")
+                and re.fullmatch(r"(?:reg|rej|weight|scale|offset)_\d{4}\.npy", name) is None
+                for name in names
+            ):
+                raise ValueError("Cleanup marker contains an unowned filename")
+        except (OSError, KeyError, TypeError, AttributeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot validate cleanup marker in {root}: {exc}") from exc
+        validated = []
+        for path in [*(root / name for name in names), cleanup_marker]:
+            if path.is_symlink():
+                raise ValueError(f"Registered-store artifact is a symlink: {path}")
+            if not path.exists():
+                continue
+            resolved = path.resolve(strict=True)
+            if not resolved.is_relative_to(root) or not resolved.is_file():
+                raise ValueError(f"Registered-store artifact is not a regular file inside its store: {path}")
+            validated.append(resolved)
+        return validated
+
+    manifest_path = root / "registered_store.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or manifest.get("schema") != 1 or manifest.get("stage") != "registered_before_stack":
+            raise ValueError("Unsupported or incomplete registered-store manifest")
+        store = FrameStore.load_index(root, allow_missing=True)
+        if manifest.get("index") != "index.json" or manifest.get("shape") != list(store.shape) or manifest.get("frame_count") != len(store):
+            raise ValueError("Registered-store manifest does not match its index")
+        index = json.loads((root / "index.json").read_text(encoding="utf-8"))
+        frames = index["frames"]
+        if len(frames) != len(store):
+            raise ValueError("Registered-store index has inconsistent frame metadata")
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot validate registered store in {root}: {exc}") from exc
+
+    owned = {root / "index.json", manifest_path, *store.paths}
+    for path in store.paths:
+        mask_path = path.with_name(path.name.replace("reg_", "rej_", 1))
+        if mask_path.exists():
+            mask = np.load(mask_path, mmap_mode="r", allow_pickle=False)
+            valid_mask = mask.shape == store.shape[1:] and mask.dtype == np.uint8
+            del mask
+            if not valid_mask:
+                raise ValueError(f"Registered rejection mask has invalid shape or dtype: {mask_path}")
+            owned.add(mask_path)
+    for entry in frames:
+        for key in ("weight_map", "scale_map", "offset_map"):
+            value = entry.get(key)
+            if value is not None:
+                owned.add(root / str(value))
+    validated = []
+    for path in owned:
+        if path.is_symlink():
+            raise ValueError(f"Registered-store artifact is a symlink: {path}")
+        if not path.exists():
+            continue
+        resolved = path.resolve(strict=True)
+        if not resolved.is_relative_to(root) or not resolved.is_file():
+            raise ValueError(f"Registered-store artifact is not a regular file inside its store: {path}")
+        validated.append(resolved)
+    return validated
+
+
+def cleanup_registered_store(directory: Path) -> tuple[int, int]:
+    """Delete only artifacts owned by a validated retained-store manifest."""
+
+    validated = registered_store_cleanup_plan(directory)
+    total_bytes = sum(path.stat().st_size for path in validated)
+    root = directory.resolve(strict=True)
+    cleanup_marker = root / "cleanup_pending.json"
+    if cleanup_marker.is_symlink():
+        raise ValueError(f"Registered-store cleanup marker is a symlink: {cleanup_marker}")
+    if not cleanup_marker.exists():
+        write_json_atomic(cleanup_marker, {"schema": 1, "files": [path.name for path in validated]})
+    errors = []
+    removed_bytes = 0
+    removed_count = 0
+    for path in (path for path in validated if path != cleanup_marker):
+        try:
+            size = path.stat().st_size
+            path.unlink()
+            removed_count += 1
+            removed_bytes += size
+        except OSError as exc:
+            errors.append(f"{path.name}: {exc}")
+    if errors:
+        raise OSError(f"Removed {removed_count} of {len(validated)} registered-store files ({removed_bytes} bytes); remaining: {'; '.join(errors)}")
+    try:
+        cleanup_marker.unlink()
+    except OSError as exc:
+        raise OSError(f"Removed {removed_count} registered-store files ({removed_bytes} bytes), but cleanup marker remains: {exc}") from exc
+    return removed_count, total_bytes
 
 
 @dataclass
@@ -151,6 +390,17 @@ class StackResult:
     @property
     def rejection_fraction(self) -> float:
         return (self.rejected_low + self.rejected_high) / max(1, self.total_samples)
+
+
+@dataclass
+class StackBandResult:
+    image: np.ndarray
+    rejected_low: int
+    rejected_high: int
+    total_samples: int
+    coverage: np.ndarray
+    rejection: np.ndarray
+    rejection_masks: np.ndarray | None = None
 
 
 def _nanstd(x: torch.Tensor, mean: torch.Tensor, dim: int = 0) -> torch.Tensor:
@@ -372,7 +622,140 @@ def _apply_norm_maps(x: torch.Tensor, norms: list[FrameNorm], r0: int, r1: int, 
     return x
 
 
-def stack_store(store: FrameStore, backend: Backend, settings: StackSettings, progress_cb: ProgressCallback = _noop_progress, label: str = "Stacking", reject_masks: bool = False) -> StackResult:
+def _combine_stack_band(
+    x: torch.Tensor,
+    store: FrameStore,
+    backend: Backend,
+    settings: StackSettings,
+    r0: int,
+    reject_masks: bool,
+    offsets: torch.Tensor,
+    scales: torch.Tensor,
+    weights: torch.Tensor | None,
+) -> StackBandResult:
+    n, channels, rows, width = x.shape
+    height = store.shape[1]
+    if any(norm.scale_map is not None for norm in store.norms):
+        x = _apply_norm_maps(x, store.norms, r0, r0 + rows, height)
+    elif settings.normalize:
+        x = (x - offsets) * scales + offsets[0]
+
+    band_weights = weights
+    if settings.use_weights and any(norm.weight_map is not None for norm in store.norms):
+        base_weights = weights if weights is not None else torch.ones(n, device=backend.device)
+        gy = torch.zeros(rows, device=backend.device) if height == 1 else 2.0 * torch.arange(r0, r0 + rows, device=backend.device) / (height - 1) - 1.0
+        gx = torch.zeros(width, device=backend.device) if width == 1 else torch.linspace(-1.0, 1.0, width, device=backend.device)
+        grid_y, grid_x = torch.meshgrid(gy, gx, indexing="ij")
+        sample_grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+        spatial = []
+        for norm in store.norms:
+            if norm.weight_map is None:
+                spatial.append(torch.ones((1, rows, width), device=backend.device))
+            else:
+                field = torch.as_tensor(norm.weight_map, dtype=torch.float32, device=backend.device)[None, None]
+                spatial.append(F.grid_sample(field, sample_grid, mode="bilinear", padding_mode="border", align_corners=True)[0])
+        band_weights = base_weights.view(n, 1, 1, 1) * torch.stack(spatial)
+
+    combined = combine_full(x, settings, band_weights)
+    image = combined.image.cpu().numpy()
+    coverage = combined.valid[:, 0].sum(dim=0).to(torch.int32).cpu().numpy().astype(np.uint16)
+    rejection_count = torch.zeros_like(combined.valid[0], dtype=torch.float32)
+    rejected_low = rejected_high = 0
+    if combined.rej_low is not None:
+        rejection_count += combined.rej_low.sum(dim=0).to(torch.float32)
+        rejected_low = int(combined.rej_low.sum())
+    if combined.rej_high is not None:
+        rejection_count += combined.rej_high.sum(dim=0).to(torch.float32)
+        rejected_high = int(combined.rej_high.sum())
+    present = combined.valid.sum(dim=0).to(torch.float32).clamp_min(1.0)
+    rejection = (rejection_count / present).mean(dim=0).cpu().numpy()
+    masks = None
+    if reject_masks:
+        rejected = torch.zeros_like(combined.valid, dtype=torch.bool)
+        if combined.rej_low is not None:
+            rejected |= combined.rej_low
+        if combined.rej_high is not None:
+            rejected |= combined.rej_high
+        masks = rejected.any(dim=1).to(torch.uint8).cpu().numpy()
+    return StackBandResult(image, rejected_low, rejected_high, n * channels * rows * width, coverage, rejection, masks)
+
+
+def read_store_band(maps: list[np.memmap], shape: tuple[int, int, int], row_start: int, row_stop: int) -> np.ndarray:
+    """Copy an absolute row range from every registered frame into one (N, C, rows, W) array."""
+
+    channels, _, width = shape
+    band = np.empty((len(maps), channels, row_stop - row_start, width), dtype=np.float32)
+    for index, frame in enumerate(maps):
+        band[index] = frame[:, row_start:row_stop, :]
+    return band
+
+
+def stack_store_band(
+    store: FrameStore,
+    backend: Backend,
+    settings: StackSettings,
+    row_start: int,
+    row_stop: int,
+    reject_masks: bool = False,
+    frame_maps: list[np.memmap] | None = None,
+    host_data: np.ndarray | None = None,
+) -> StackBandResult:
+    """Stack an absolute half-open row range with the same math as ``stack_store``."""
+
+    n = len(store)
+    if n == 0:
+        raise ValueError("No frames to stack")
+    channels, height, width = store.shape
+    if row_start < 0 or row_stop <= row_start or row_stop > height:
+        raise ValueError("Stack band row range is outside the registered store")
+    overhead = 10.0 if settings.method == "gesd" else 6.0
+    if settings.large_scale:
+        overhead += 2.0
+    max_band = max(1, rows_per_band(n, width, channels, backend.budget_bytes, overhead=overhead))
+    maps: list[np.memmap] = []
+    if host_data is None:
+        maps = store.memmaps() if frame_maps is None else frame_maps
+        if len(maps) != n:
+            raise ValueError("Registered-frame map count does not match the store")
+    elif host_data.shape != (n, channels, row_stop - row_start, width) or host_data.dtype != np.float32:
+        raise ValueError("Pre-read stack band does not match the requested rows")
+    offsets = torch.from_numpy(np.stack([norm_vec(norm.offset, channels) for norm in store.norms])).to(backend.device).view(n, channels, 1, 1)
+    scales = torch.from_numpy(np.stack([norm_vec(norm.scale, channels) for norm in store.norms])).to(backend.device).view(n, channels, 1, 1)
+    weights = torch.tensor([norm.weight for norm in store.norms], device=backend.device) if settings.use_weights else None
+    row_count = row_stop - row_start
+    image = np.empty((channels, row_count, width), dtype=np.float32)
+    coverage = np.empty((row_count, width), dtype=np.uint16)
+    rejection = np.empty((row_count, width), dtype=np.float32)
+    masks = np.empty((n, row_count, width), dtype=np.uint8) if reject_masks else None
+    rejected_low = rejected_high = total_samples = 0
+    for absolute_start in range(row_start, row_stop, max_band):
+        absolute_stop = min(row_stop, absolute_start + max_band)
+        rows = absolute_stop - absolute_start
+        if host_data is None:
+            host = torch.empty((n, channels, rows, width), dtype=torch.float32, pin_memory=backend.is_cuda)
+            host_np = host.numpy()
+            for index, frame in enumerate(maps):
+                host_np[index] = frame[:, absolute_start:absolute_stop, :]
+        else:
+            offset = absolute_start - row_start
+            host = torch.from_numpy(np.ascontiguousarray(host_data[:, :, offset : offset + rows, :]))
+        tensor = host.to(backend.device, non_blocking=backend.is_cuda)
+        result = _combine_stack_band(tensor, store, backend, settings, absolute_start, reject_masks, offsets, scales, weights)
+        local_start = absolute_start - row_start
+        local_stop = local_start + rows
+        image[:, local_start:local_stop, :] = result.image
+        coverage[local_start:local_stop, :] = result.coverage
+        rejection[local_start:local_stop, :] = result.rejection
+        if masks is not None and result.rejection_masks is not None:
+            masks[:, local_start:local_stop, :] = result.rejection_masks
+        rejected_low += result.rejected_low
+        rejected_high += result.rejected_high
+        total_samples += result.total_samples
+    backend.empty_cache()
+    return StackBandResult(image, rejected_low, rejected_high, total_samples, coverage, rejection, masks)
+
+
+def stack_store(store: FrameStore, backend: Backend, settings: StackSettings, progress_cb: ProgressCallback = _noop_progress, label: str = "Stacking", reject_masks: bool = False, cancel_cb: Callable[[], None] | None = None) -> StackResult:
     """Stream the registered frames through the device in row bands and combine them.
 
     With ``reject_masks`` a (H, W) uint8 mask per frame (1 = rejected in any channel) is written next
@@ -388,7 +771,6 @@ def stack_store(store: FrameStore, backend: Backend, settings: StackSettings, pr
     if reject_masks:
         store.mask_paths = [p.with_name(p.name.replace("reg_", "rej_")) for p in store.paths]
         mask_maps = [np.lib.format.open_memmap(p, mode="w+", dtype=np.uint8, shape=(height, width)) for p in store.mask_paths]
-    local_norm = any(f.scale_map is not None for f in store.norms)
     overhead = 10.0 if settings.method == "gesd" else 6.0
     if settings.large_scale:
         overhead += 2.0
@@ -418,6 +800,8 @@ def stack_store(store: FrameStore, backend: Backend, settings: StackSettings, pr
     pending_stage: Future | None = None
     try:
         for bi in range(bands):
+            if cancel_cb is not None:
+                cancel_cb()
             buffer_index = bi % len(host_buffers)
             r0 = bi * band
             r1 = min(height, r0 + band)
@@ -433,46 +817,15 @@ def stack_store(store: FrameStore, backend: Backend, settings: StackSettings, pr
                 next_r0 = (bi + 1) * band
                 next_r1 = min(height, next_r0 + band)
                 pending_stage = prefetch.submit(stage_host_band, (bi + 1) % len(host_buffers), next_r0, next_r1)
-            if local_norm:
-                x = _apply_norm_maps(x, store.norms, r0, r1, height)
-            elif settings.normalize:
-                x = (x - offsets) * scales + ref_offset
-            band_weights = weights
-            if settings.use_weights and any(norm.weight_map is not None for norm in store.norms):
-                base_weights = weights if weights is not None else torch.ones(n, device=backend.device)
-                gy = torch.zeros(rows, device=backend.device) if height == 1 else 2.0 * torch.arange(r0, r1, device=backend.device) / (height - 1) - 1.0
-                gx = torch.zeros(width, device=backend.device) if width == 1 else torch.linspace(-1.0, 1.0, width, device=backend.device)
-                grid_y, grid_x = torch.meshgrid(gy, gx, indexing="ij")
-                sample_grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
-                spatial = []
-                for norm in store.norms:
-                    if norm.weight_map is None:
-                        spatial.append(torch.ones((1, rows, width), device=backend.device))
-                    else:
-                        field = torch.as_tensor(norm.weight_map, dtype=torch.float32, device=backend.device)[None, None]
-                        spatial.append(F.grid_sample(field, sample_grid, mode="bilinear", padding_mode="border", align_corners=True)[0])
-                band_weights = base_weights.view(n, 1, 1, 1) * torch.stack(spatial)
-            res = combine_full(x, settings, band_weights)
-            out[:, r0:r1, :] = res.image.cpu().numpy()
-            coverage[r0:r1, :] = res.valid[:, 0].sum(dim=0).to(torch.int32).cpu().numpy().astype(np.uint16)
-            rej_count = torch.zeros_like(res.valid[0], dtype=torch.float32)
-            if res.rej_low is not None:
-                rej_count += res.rej_low.sum(dim=0).to(torch.float32)
-                rej_low += int(res.rej_low.sum())
-            if res.rej_high is not None:
-                rej_count += res.rej_high.sum(dim=0).to(torch.float32)
-                rej_high += int(res.rej_high.sum())
-            present = res.valid.sum(dim=0).to(torch.float32).clamp_min(1.0)
-            rejection[r0:r1, :] = (rej_count / present).mean(dim=0).cpu().numpy()
-            if mask_maps:
-                rej_any = torch.zeros_like(res.valid, dtype=torch.bool)
-                if res.rej_low is not None:
-                    rej_any |= res.rej_low
-                if res.rej_high is not None:
-                    rej_any |= res.rej_high
-                rej_frame = rej_any.any(dim=1).to(torch.uint8).cpu().numpy()  # (N, rows, W)
+            band_result = _combine_stack_band(x, store, backend, settings, r0, reject_masks, offsets, scales, weights)
+            out[:, r0:r1, :] = band_result.image
+            coverage[r0:r1, :] = band_result.coverage
+            rejection[r0:r1, :] = band_result.rejection
+            rej_low += band_result.rejected_low
+            rej_high += band_result.rejected_high
+            if mask_maps and band_result.rejection_masks is not None:
                 for i, mm in enumerate(mask_maps):
-                    mm[r0:r1, :] = rej_frame[i]
+                    mm[r0:r1, :] = band_result.rejection_masks[i]
             progress_cb((bi + 1) / bands, f"{label} band {bi + 1}/{bands}")
     finally:
         if prefetch is not None:

@@ -1,7 +1,9 @@
-# GPUStacker
+# Astro Stack and Stitch Studio
 
-GPU-accelerated deep-sky stacker in Python (PyTorch backend) with an optional
-**ImageMM multi-frame PSF-aware deconvolution** output. Dark tkinter GUI and a CLI.
+GPU-accelerated deep-sky stacking and mosaic application. The Python package and command-line
+entry points remain named `GPUStacker` (`gpustacker`). It includes a dark tkinter GUI and CLI.
+**ImageMM multi-frame PSF-aware deconvolution** is an experimental optional output; it never
+changes the regular master.
 
 Pipeline: load FITS/XISF -> master calibration -> cosmetic hot/cold repair -> debayer (CFA) ->
 star detection (multi-process) -> frame filters (star count, sky level, FWHM) -> similarity
@@ -10,6 +12,12 @@ Lanczos-3 GPU warp -> aperture photometry on a shared star set (transparency) ->
 PSF-signal weighting -> row-banded GPU stacking with rejection -> second pass with local
 normalisation -> optional autocrop to the full-depth region -> coverage/rejection maps,
 per-frame CSV, JSON report -> optional ImageMM deconvolution of the best frames.
+
+The GUI also supports ranked reference-frame review and preview, per-volume disk-space preflight,
+resuming matching interrupted runs at saved stage boundaries, and assembling plate-solved master
+tiles into a mosaic. Retained registered-frame stores can be stacked without repeating calibration
+or registration. Experimental multi-system stacking can offload stack bands to a trusted-LAN worker;
+see its limitations and security notes below.
 
 ## Install
 
@@ -45,6 +53,149 @@ Key options: `--method {winsorized,gesd,sigma,percentile,median,none}`, `--sigma
 `--debayer {auto,on,off}` / `--bayer RGGB`, `--reference`, `--keep-registered`, `--cpu`,
 `--vram-fraction`, `--workers`.
 
+### Reference review and storage preflight
+
+In the GUI, **Analyze & rank** lists reference candidates. **Preview** displays a candidate without
+changing the run reference; use **Use as reference** to explicitly select it. The automatic top-ranked
+candidate is previewed by default.
+
+Before a GUI stack starts, output confirmation estimates scratch and output storage on each relevant
+volume. Batch runs show group estimates. Treat estimates as planning guidance: actual peak use depends
+on the data and options, and representative runs are still needed to calibrate them.
+
+### Resume interrupted runs
+
+Enable **Resume after failure** in the GUI or pass `--resume` on the CLI. A matching rerun validates
+its inputs and settings, then reuses completed checkpoints after registration, global stacking,
+local-normalization fitting (when enabled), or primary-master writing. Resume is stage-boundary based;
+it does not restart from the middle of an active stack band. Keep the work directory until recovery
+is complete.
+
+```powershell
+py -3 run_gpustacker.py stack "G:\Target\Lights" -o "G:\Target\stack.fit" --resume
+```
+
+### Mosaic finished panels
+
+Mosaic assembles two or more plate-solved FITS/XISF masters into a shared WCS canvas, refines
+registration from overlap stars, optionally matches gains/backgrounds across overlaps, then blends
+the tiles. Open it from the GUI or run:
+
+```powershell
+py -3 run_gpustacker.py mosaic "G:\Target\panel-1.fit" "G:\Target\panel-2.fit" -o "G:\Target\mosaic.fit" --gradient auto
+```
+
+`--gradient` accepts `auto`, `0`, `1`, `2`, or `3` (default `2`). Auto chooses a per-tile polynomial
+degree from 0 through 3 using a conservative fit-selection heuristic and records each choice in the
+report and FITS header. It cannot reliably distinguish an instrumental gradient from real extended
+nebula emission; compare with `--gradient 0` when broad structure or color changes. The GUI also
+offers **feather** and **seam** blending, photometric matching, an optional residual plane, and a
+coverage map. See `py -3 run_gpustacker.py mosaic --help` for all options.
+
+To stack an existing registered-frame store, first retain it with **Keep registered frames** enabled,
+then run:
+
+```powershell
+py -3 run_gpustacker.py stack -o resumed-master.fit --registered-dir "D:\Astro\_gpustacker_work"
+```
+
+With `--resume`, GPUStacker checkpoints after registration, after the global first pass and
+local-normalization fitting when enabled, and after writing the primary master. If interrupted while
+writing optional products, a matching rerun can reuse the completed master and continue those products.
+
+Registered-store stacking reuses the stored normalization, spatial weight maps, frame weights, and
+frame metadata. Stack rejection, local normalization, and MFDeconv are supported; registration,
+frame filtering, alternate weighting modes, drizzle, and resume are not supported in this mode. The
+source store is left untouched unless you explicitly use the GUI's confirmed **Clean up…** action.
+Cleanup validates the store ownership list and can be retried after a partial deletion.
+
+To preflight a registered store from a remote Windows worker, use its UNC path rather than a drive
+letter:
+
+```powershell
+py -3 run_gpustacker.py store-benchmark "\\HOST\Share\_gpustacker_work" --rows 8
+```
+
+The bounded probe validates the index and reads the selected rows from every registered frame. Run it
+from each worker; it measures shared-store access, not GPU utilization or full-stack wall time.
+
+### Experimental multi-system stacking
+
+The GUI can dispatch registered-frame row bands to an authenticated worker. The desktop continues to
+analyze, register, fit local-normalization maps, and write final products; both computers can contribute
+to each stack pass. This is experimental and remains opt-in. Use the same GPUStacker version and a
+registered-store folder reachable from both computers, preferably through a UNC path. Generate a random
+token of at least 32 bytes and use the same value on both computers:
+
+```powershell
+$env:GPUSTACKER_WORKER_TOKEN = "<same random token on both hosts>"
+
+# On the worker, start Multi-system setup, select the shared registered-store folder,
+# choose a trusted-LAN bind, enable experimental stack-band execution, then start service.
+# The command-line worker-agent remains capability-only.
+py -3 run_gpustacker.py worker-agent --shared-store "\\HOST\Share\_gpustacker_work"
+
+# To allow a coordinator on the LAN to connect, bind explicitly and restrict
+# inbound firewall access to the coordinator. The protocol does not encrypt traffic.
+py -3 run_gpustacker.py worker-agent --shared-store "\\HOST\Share\_gpustacker_work" --bind 0.0.0.0
+
+# On the coordinator, check the worker and shared-store path in Multi-system setup.
+py -3 run_gpustacker.py worker-probe WORKER-HOST --shared-store "\\HOST\Share\_gpustacker_work" --require-cuda
+```
+
+In the main stacking window, enable **Use remote worker for stack bands**, then enter the worker host,
+port, and token. For a fresh run, the shared store is created as `_gpustacker_work` beside the output;
+the worker service must point at that same folder before the stack begins. For an existing registered
+store, select that folder in both windows. Each band is assigned dynamically to the desktop or worker.
+The worker is kept two tasks ahead: it reads the next band from the shared store while its GPU computes
+the current one, so expect worker RAM use of roughly two bands' worth of frame rows.
+If the worker hits CUDA out-of-memory, it retries the assigned range as smaller sub-bands down to one
+row (except with large-scale trail rejection). If the worker rejects a task, disconnects, or returns an
+invalid artifact, that band is recomputed on the desktop. A remote task response can wait up to six
+hours before local fallback; connection establishment still times out after five seconds.
+
+The experimental run control currently excludes batch mode, resume, and multiple weighting variants.
+The retained-store workflow's existing limitations still apply. The worker's execution opt-in is off
+by default; its GUI capability report indicates whether it is enabled. The CLI `worker-agent` remains
+probe-only.
+
+The coordinator verifies the HMAC response, protocol and exact GPUStacker version, store manifest/index
+fingerprint, a deterministic sample of up to 32 frame reads, and optional CUDA availability. The worker
+checks the complete file listing and temporary write access; it does not read every frame's array header.
+Use this only on a trusted, firewall-restricted network; HMAC
+authenticates the peer but does not provide confidentiality or protect an exposed endpoint from denial
+of service. `--bind 0.0.0.0` should not be used on an untrusted network.
+
+The **Multi-system…** GUI saves its local host, path, port, bind, and probe preferences in
+`~/.gpustacker/distributed_settings.json` on each computer. **Remember token securely** is enabled by
+default on Windows; the token is stored encrypted for that Windows user with DPAPI, not as readable
+text. Uncheck it to require entering the token again next time. The coordinator's store-check response
+timeout is adjustable from 1 to 120 minutes (10 minutes by default); the initial network connection
+still times out quickly if the worker is unreachable.
+
+The main stacking screen has its own **Remember token securely** option under Experimental multi-system
+stacking. It is enabled by default on Windows and saves the shared token in the GUI settings file only as
+DPAPI-protected data. Uncheck it to remove the saved token on the next settings save.
+
+The worker protocol uses HMAC authentication but does not encrypt traffic. Bind only on a trusted,
+firewall-restricted network. Before relying on distributed runs, measure representative shared-SSD
+throughput, GPU utilization, end-to-end wall time, and single-versus-multi-worker output tolerances.
+Worker loss, storage disconnect, and coordinator restart recovery are not yet certified; keep the original
+registered inputs until the run completes and inspect the output before deleting them.
+
+For a reproducible many-file short-exposure workload, run:
+
+```powershell
+py -3 benchmarks/short_exposure_benchmark.py --frames 300 --device auto --directory "D:\Astro\Benchmarks" --json "D:\Astro\Benchmarks\run.json"
+```
+
+The harness synthesizes short FITS exposures on the selected volume and records software/hardware,
+storage location, settings, wall time, frames per second, the preflight estimate, and sampled peak
+run-directory growth. Sampling can miss very brief peaks, so use representative long runs when
+calibrating the estimate. For image-quality comparison on representative big-rig data, use the
+existing compare command against an immutable reference master; do not treat the synthetic stress
+workload as an image-quality benchmark.
+
 Outputs next to the stack: `<name>_coverage.fit` (frames per pixel), `<name>_rejection.fit`
 (rejected fraction per pixel), `<name>.frames.csv` (per-frame stats, weights, transparency,
 alignment, exclusions), `<name>.report.json`, and `<name>_mfdeconv.fit` when enabled.
@@ -56,9 +207,11 @@ Compare also reports 4x4 regional FWHM and matched-star SNR where each cell has 
 The log reports meridian-flip detection, excluded frames with reasons, weight range,
 autocrop trim per side, stack background noise and effective frame count (`NEFF`).
 
-ImageMM knobs: `--mf-iters`, `--mf-kappa` (step clip), `--mf-relax` (damping),
-`--mf-huber` (negative = factor of residual RMS), `--mf-color {perchannel,luma}`,
-`--mf-psf-size` (0 = auto-k), `--mf-no-star-mask`, `--mf-no-variance`, `--mf-tile`,
+Experimental ImageMM options: `--mf-preset {gentle,normal,strong}` (explicit `--mf-*` flags override
+the preset), `--mf-frames`, `--mf-blend` (0 = unchanged master, 1 = full deconvolution), `--mf-iters`,
+`--mf-kappa` (step clip), `--mf-relax` (damping), `--mf-huber` (negative = factor of residual RMS),
+`--mf-color {lrgb,luma,perchannel}` (`lrgb` is the default), `--mf-psf-size` (0 = auto-k),
+`--mf-no-star-mask`, `--mf-no-variance`, `--mf-tile`, `--mf-dering`, `--mf-stop-tol`, and
 `--mf-save-psfs DIR`.
 
 ## How the GPU is used

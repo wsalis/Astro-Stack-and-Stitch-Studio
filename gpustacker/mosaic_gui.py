@@ -10,6 +10,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from . import APP_NAME
 from .astro_dark_theme import DARK_BG, DARK_BORDER, DARK_FIELD, DARK_TEXT, configure_dark_theme
 from .io import discover_frames
 from .mosaic import BLEND_MODES, INTERPOLATIONS, ORIENTATIONS, MosaicBuilder, MosaicCancelled, MosaicResult, MosaicSettings
@@ -34,7 +35,7 @@ class MosaicWindow:
         self.worker: threading.Thread | None = None
         self._started = 0.0
         self._cancelled = False
-        root.title("GPUStacker — mosaic")
+        root.title(f"{APP_NAME} — Mosaic")
         if isinstance(root, (tk.Tk, tk.Toplevel)):
             root.geometry("1120x760")
             root.minsize(900, 600)
@@ -122,8 +123,8 @@ class MosaicWindow:
         ttk.Button(box, text="Browse…", command=self._browse_output).grid(row=0, column=5, sticky="e")
 
         ttk.Label(box, text="Gradient degree").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        self.gradient_var = tk.IntVar(value=2)
-        ttk.Combobox(box, textvariable=self.gradient_var, values=[0, 1, 2, 3], width=5, state="readonly").grid(row=1, column=1, sticky="w", padx=4, pady=(8, 0))
+        self.gradient_var = tk.StringVar(value="2")
+        ttk.Combobox(box, textvariable=self.gradient_var, values=["auto", "0", "1", "2", "3"], width=6, state="readonly").grid(row=1, column=1, sticky="w", padx=4, pady=(8, 0))
         ttk.Label(box, text="Sky block px").grid(row=1, column=2, sticky="e", pady=(8, 0))
         self.block_var = tk.IntVar(value=64)
         ttk.Spinbox(box, from_=16, to=512, increment=16, textvariable=self.block_var, width=6).grid(row=1, column=3, sticky="w", padx=4, pady=(8, 0))
@@ -251,7 +252,7 @@ class MosaicWindow:
         return MosaicSettings(
             tiles=list(self.tiles),
             output=Path(out),
-            gradient_degree=int(self.gradient_var.get()),
+            gradient_degree=self.gradient_var.get() if self.gradient_var.get() == "auto" else int(self.gradient_var.get()),
             gradient_block=int(self.block_var.get()),
             pixel_scale=float(self.scale_var.get()),
             orientation=self.orientation_var.get(),
@@ -339,7 +340,7 @@ class MosaicWindow:
         self.status_var.set("Done")
         self._set_running(False)
         win = tk.Toplevel(self.root)
-        win.title("GPUStacker — mosaic finished")
+        win.title(f"{APP_NAME} — Mosaic finished")
         win.configure(bg=DARK_BG)
         win.transient(self.root)
         win.resizable(False, False)

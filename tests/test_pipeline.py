@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import csv
+import os
+import queue
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -9,15 +11,20 @@ import numpy as np
 import pytest
 
 import gpustacker.compare as compare_module
-from gpustacker.gui import planned_output_files, rank_reference_frames
-from gpustacker.cli import build_parser, main
+import gpustacker.distributed as distributed_module
+import gpustacker.gui as gui_module
+from gpustacker.gui import planned_output_files, rank_reference_frames, reference_preview_path, reference_preview_rgb
+from gpustacker.cli import build_parser, main, settings_from_args
+from gpustacker.checkpoint import CheckpointError, fingerprint_inputs
+from gpustacker.detection import Stars
 from gpustacker.drizzle import DrizzleSettings
-from gpustacker.io import load_frame
+from gpustacker.io import load_frame, load_meta
 from gpustacker.mfdeconv import MFDeconvSettings
 from gpustacker.normalization import LocalNormSettings
 from gpustacker.pipeline import FrameInfo, PipelineSettings, StackingPipeline, blend_mfdeconv, select_mfdeconv_indices
 from gpustacker.quality import FilterSettings
-from gpustacker.stacking import StackSettings
+from gpustacker.registration import Alignment
+from gpustacker.stacking import FrameStore, StackResult, StackSettings
 
 
 def test_mfdeconv_selects_sharpest_eligible_frames_with_weight_tiebreak():
@@ -46,6 +53,85 @@ def test_mfdeconv_blend_endpoints_and_fraction():
         PipelineSettings(lights=[], output=Path("unused.fit"), mfdeconv_blend=1.2)
 
 
+def test_distributed_pipeline_preflights_worker_and_routes_stack(monkeypatch, tmp_path):
+    settings = PipelineSettings(
+        lights=[],
+        output=tmp_path / "stack.fit",
+        distributed_enabled=True,
+        distributed_host="worker-host",
+        distributed_token="pipeline-worker-token-with-at-least-32-bytes",
+    )
+    pipeline = StackingPipeline(settings)
+    store = FrameStore(tmp_path / "registered", (1, 4, 5))
+    store.add("frame.fit", np.ones(store.shape, dtype=np.float32))
+    calls = {}
+    expected = StackResult(np.zeros(store.shape, dtype=np.float32), 0, 0, 20, 1)
+
+    def fake_probe(host, port, token, **kwargs):
+        calls["probe"] = (host, port, token, kwargs)
+        return {"stack_task_execution_enabled": True}
+
+    def fake_distributed(store_arg, backend, stack_settings, host, port, token, **kwargs):
+        calls["stack"] = (store_arg, host, port, token, kwargs)
+        return expected
+
+    monkeypatch.setattr(distributed_module, "probe_worker", fake_probe)
+    monkeypatch.setattr(distributed_module, "stack_store_distributed", fake_distributed)
+
+    actual = pipeline._stack_store(store, "Stacking", "global", lambda *_: None, False)
+
+    assert actual is expected
+    assert calls["probe"][0:3] == ("worker-host", 47861, settings.distributed_token)
+    assert calls["probe"][3]["expected_store"] == store.directory
+    assert calls["stack"][1:4] == ("worker-host", 47861, settings.distributed_token)
+    assert calls["stack"][4]["pass_name"] == "global"
+
+
+def test_distributed_pipeline_settings_require_worker_credentials(tmp_path):
+    with pytest.raises(ValueError, match="valid distributed worker host"):
+        PipelineSettings(lights=[], output=tmp_path / "stack.fit", distributed_enabled=True)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows DPAPI is required")
+def test_main_gui_remembers_shared_token_only_as_protected_data(monkeypatch, tmp_path):
+    class Variable:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    monkeypatch.setattr(gui_module, "SETTINGS_PATH", tmp_path / "gui_settings.json")
+    monkeypatch.setattr(gui_module, "_protect_token", lambda token: f"encrypted:{token[::-1]}")
+    monkeypatch.setattr(gui_module, "_unprotect_token", lambda value: value.removeprefix("encrypted:")[::-1])
+    token = "main-screen-shared-token-with-at-least-32-bytes"
+    remember = Variable(True)
+    first = gui_module.GPUStackerApp.__new__(gui_module.GPUStackerApp)
+    first.distributed_token_var = Variable(token)
+    first.distributed_remember_token_var = remember
+    first._setting_vars = lambda: {"distributed_remember_token_var": remember}
+    first._append_log = lambda _message: None
+
+    first._save_settings()
+
+    saved = gui_module.SETTINGS_PATH.read_text(encoding="utf-8")
+    assert token not in saved
+    assert json.loads(saved)["protected_distributed_token"] == f"encrypted:{token[::-1]}"
+
+    second = gui_module.GPUStackerApp.__new__(gui_module.GPUStackerApp)
+    second.distributed_token_var = Variable("")
+    second.distributed_remember_token_var = Variable(False)
+    second._setting_vars = lambda: {"distributed_remember_token_var": second.distributed_remember_token_var}
+    second._append_log = lambda _message: None
+    second._load_settings()
+
+    assert second.distributed_remember_token_var.get() is True
+    assert second.distributed_token_var.get() == token
+
+
 def test_reference_ranking_uses_scale_and_matching_report(tmp_path):
     short = tmp_path / "short.fit"
     long = tmp_path / "long.fit"
@@ -61,6 +147,166 @@ def test_reference_ranking_uses_scale_and_matching_report(tmp_path):
     assert metrics[long.name]["rank"] == 1
     assert metrics[short.name]["rank"] == 2
     assert rank_reference_frames([short], metrics_path) is None
+
+
+def test_reference_preview_defaults_to_top_rank_without_changing_run_reference(tmp_path):
+    best = tmp_path / "best.fit"
+    other = tmp_path / "other.fit"
+    choices = {best.name: best, other.name: other}
+    metrics = {best.name: {"rank": 1}, other.name: {"rank": 2}}
+    selected_reference = ""
+
+    preview = reference_preview_path("Automatic (sharpest eligible frame)", choices, metrics)
+
+    assert preview == best
+    assert selected_reference == ""
+
+
+def test_reference_dropdown_reopen_skips_filesystem_and_ranking_work(monkeypatch):
+    from gpustacker import gui as gui_module
+
+    app = gui_module.GPUStackerApp.__new__(gui_module.GPUStackerApp)
+    app._reference_choices_dirty = False
+    monkeypatch.setattr(gui_module, "rank_reference_frames", lambda *_args: pytest.fail("CSV should not be re-read"))
+    monkeypatch.setattr(gui_module, "rank_reference_infos", lambda *_args: pytest.fail("frames should not be re-ranked"))
+
+    app._refresh_reference_choices()
+
+    assert app._reference_choices_dirty is False
+    app._invalidate_analysis_cache()
+    assert app._reference_choices_dirty is True
+
+
+@pytest.mark.parametrize("suffix", [".fit", ".xisf"])
+@pytest.mark.parametrize("corrupt", [False, True], ids=["missing", "corrupt"])
+def test_reference_preview_worker_reports_missing_and_corrupt_inputs(tmp_path, suffix, corrupt):
+    from gpustacker.gui import GPUStackerApp
+
+    path = tmp_path / f"preview{suffix}"
+    if corrupt:
+        path.write_bytes(b"not a valid astronomical image")
+    pipeline = StackingPipeline(PipelineSettings(
+        lights=[path],
+        output=tmp_path / "preview-output.fit",
+        device="cpu",
+        cosmetic="off",
+        debayer="off",
+    ))
+    app = GPUStackerApp.__new__(GPUStackerApp)
+    app.events = queue.Queue()
+    app._cancel_requested = False
+
+    app._preview_worker(path, pipeline)
+
+    kind, message = app.events.get_nowait()
+    assert kind == "reference_preview_error"
+    assert message
+
+
+@pytest.mark.parametrize("method", ["vng", "bilinear"])
+def test_reference_preview_uses_selected_cfa_debayer_method(tmp_path, method):
+    from astropy.io import fits
+    from gpustacker.gui import GPUStackerApp
+
+    path = tmp_path / "cfa.fit"
+    header = fits.Header()
+    header["BAYERPAT"] = "RGGB"
+    fits.PrimaryHDU(data=np.arange(32 * 32, dtype=np.float32).reshape(32, 32), header=header).writeto(path)
+    pipeline = StackingPipeline(PipelineSettings(
+        lights=[path],
+        output=tmp_path / "cfa-output.fit",
+        device="cpu",
+        cosmetic="off",
+        debayer="on",
+        debayer_method=method,
+        bayer_pattern="RGGB",
+    ))
+    app = GPUStackerApp.__new__(GPUStackerApp)
+    app.events = queue.Queue()
+    app._cancel_requested = False
+
+    app._preview_worker(path, pipeline)
+
+    kind, payload = app.events.get_nowait()
+    assert kind == "reference_preview"
+    preview_path, pixels, meta = payload
+    assert preview_path == path
+    assert pixels.shape == (32, 32, 3)
+    assert meta.channels == 1
+
+
+def test_reference_dropdown_changes_preview_candidate_not_run_reference(tmp_path):
+    from gpustacker.gui import GPUStackerApp
+
+    class Value:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+    app = GPUStackerApp.__new__(GPUStackerApp)
+    app.reference_path_var = Value("chosen-for-run.fit")
+    app.reference_display_var = Value("preview.fit")
+    app._reference_choices = {"preview.fit": tmp_path / "preview.fit"}
+    app._preview_candidate_path = None
+    app._update_reference_stats = lambda: None
+
+    app._select_reference()
+
+    assert app._preview_candidate_path == tmp_path / "preview.fit"
+    assert app.reference_path_var.get() == "chosen-for-run.fit"
+
+
+def test_use_reference_candidate_explicitly_changes_run_reference(tmp_path):
+    from gpustacker.gui import GPUStackerApp
+
+    class Value:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    candidate = tmp_path / "candidate.fit"
+    app = GPUStackerApp.__new__(GPUStackerApp)
+    app.reference_display_var = Value(candidate.name)
+    app.reference_path_var = Value("")
+    app.reference_choice_status_var = Value("")
+    app.reference_stats_var = Value("")
+    app._reference_choices = {candidate.name: candidate}
+    app._reference_metrics = None
+
+    app._use_reference_candidate()
+
+    assert app.reference_path_var.get() == str(candidate)
+
+
+def test_pipeline_uses_explicitly_selected_reference(light_dir, tmp_path):
+    lights = sorted(light_dir.glob("*.fit"))[:2]
+    chosen = lights[1]
+    pipeline = StackingPipeline(PipelineSettings(lights=lights, output=tmp_path / "reference.fit", reference=chosen))
+    stars = Stars(*(np.empty(0, dtype=np.float32) for _ in range(6)), total_detected=20)
+    infos = [FrameInfo(index, path, load_meta(path), stars, 2.0, 1.0, 10.0) for index, path in enumerate(lights)]
+
+    assert pipeline.choose_reference(infos) == 1
+
+
+def test_reference_preview_ppm_is_bounded_and_handles_nonfinite_data():
+    image = np.zeros((3, 1600, 900), dtype=np.float32)
+    image[:, 10, 10] = np.nan
+    image[0, 20, 20] = 1.0
+
+    pixels = reference_preview_rgb(image)
+    height, width = pixels.shape[:2]
+
+    assert max(width, height) <= 760
+    assert abs(width / height - 900 / 1600) < 0.01
+    assert pixels.dtype == np.uint8
+    assert pixels.shape == (height, width, 3)
 
 
 def test_automatic_reference_compares_bright_star_signal_per_second():
@@ -102,9 +348,555 @@ def test_pipeline_reuses_preflight_analysis(light_dir, tmp_path, monkeypatch):
     assert any("Reusing analysis" in message for message in messages)
 
 
+def test_registered_checkpoint_round_trip_and_settings_validation(light_dir, tmp_path):
+    light = sorted(light_dir.glob("*.fit"))[0]
+    work_dir = tmp_path / "work"
+    settings = PipelineSettings(
+        lights=[light],
+        output=tmp_path / "master.fit",
+        work_dir=work_dir,
+        resume=True,
+        weighting="psfsw",
+    )
+    pipeline = StackingPipeline(settings)
+    store = FrameStore(work_dir, (1, 4, 5))
+    registered = np.arange(20, dtype=np.float32).reshape(1, 4, 5)
+    store.add(light.name, registered)
+    alignment = Alignment.identity()
+    stars = Stars(*(np.empty(0, dtype=np.float32) for _ in range(6)), total_detected=37)
+    info = FrameInfo(
+        0, light, load_meta(light), stars, 2.25, 1.5, 40.0,
+        alignment=alignment, weight=1.2, transparency=0.95, phot_stars=12,
+        store_index=0, bright_star_rate=5.5,
+    )
+    tilt = {"verdict": "test field"}
+
+    pipeline._save_registered_checkpoint(work_dir, store, [info], 0, tilt, fingerprint_inputs([light]))
+    restored_store, restored_infos, reference_index, restored_tilt, stage, global_image, master_result = pipeline._restore_registered_checkpoint(work_dir, [light])
+
+    np.testing.assert_array_equal(np.load(restored_store.paths[0]), registered)
+    assert restored_infos[0].stars.total_detected == 37
+    assert restored_infos[0].alignment is not None
+    assert restored_infos[0].bright_star_rate == 5.5
+    assert reference_index == 0
+    assert restored_tilt == tilt
+    assert stage == "registered_before_stack"
+    assert global_image is None
+    assert master_result is None
+
+    settings.weighting = "noise"
+    with pytest.raises(CheckpointError, match="settings do not match"):
+        pipeline._restore_registered_checkpoint(work_dir, [light])
+
+
+@pytest.mark.parametrize("keep_registered", [False, True])
+def test_pipeline_resumes_registered_checkpoint_without_reregistering(light_dir, tmp_path, monkeypatch, keep_registered):
+    light = sorted(light_dir.glob("*.fit"))[0]
+    work_dir = tmp_path / "work"
+    settings = PipelineSettings(
+        lights=[light],
+        output=tmp_path / "resumed.fit",
+        work_dir=work_dir,
+        resume=True,
+        device="cpu",
+        cosmetic="off",
+        local_norm=LocalNormSettings(enabled=False),
+        filters=FilterSettings(enabled=False),
+        save_maps=False,
+        plate_solve=False,
+    )
+    pipeline = StackingPipeline(settings)
+    store = FrameStore(work_dir, (1, 4, 5))
+    store.add(light.name, np.full((1, 4, 5), 42.0, dtype=np.float32))
+    stars = Stars(*(np.empty(0, dtype=np.float32) for _ in range(6)), total_detected=20)
+    info = FrameInfo(0, light, load_meta(light), stars, 2.0, 1.0, 10.0, alignment=Alignment.identity(), store_index=0)
+    pipeline._save_registered_checkpoint(work_dir, store, [info], 0, {}, fingerprint_inputs([light]))
+    settings.keep_registered = keep_registered
+    messages = []
+    pipeline.status = messages.append
+    monkeypatch.setattr(pipeline, "analyse", lambda: pytest.fail("resume must not repeat analysis"))
+    monkeypatch.setattr(pipeline, "register", lambda *args: pytest.fail("resume must not repeat registration"))
+
+    result = pipeline.run()
+
+    assert result.output.exists()
+    assert any("Resuming from registered_before_stack" in message for message in messages)
+    if keep_registered:
+        manifest = json.loads((work_dir / "registered_store.json").read_text(encoding="utf-8"))
+        assert manifest["frame_count"] == 1
+        assert manifest["frames"][0]["path"] == str(light.resolve())
+        assert (work_dir / "index.json").exists()
+    else:
+        assert not work_dir.exists()
+
+
+def test_pipeline_resumes_after_global_stack_without_repeating_first_pass(light_dir, tmp_path, monkeypatch):
+    import gpustacker.pipeline as pipeline_module
+
+    lights = sorted(light_dir.glob("*.fit"))[:3]
+    work_dir = tmp_path / "global-checkpoint"
+    settings = PipelineSettings(
+        lights=lights,
+        output=tmp_path / "global-resumed.fit",
+        work_dir=work_dir,
+        resume=True,
+        device="cpu",
+        cosmetic="off",
+        local_norm=LocalNormSettings(enabled=True, block=8),
+        filters=FilterSettings(enabled=False),
+        save_maps=False,
+        plate_solve=False,
+    )
+    pipeline = StackingPipeline(settings)
+    store = FrameStore(work_dir, (1, 4, 5))
+    infos = []
+    for index, light in enumerate(lights):
+        store.add(light.name, np.full((1, 4, 5), 40.0 + index, dtype=np.float32))
+        stars = Stars(*(np.empty(0, dtype=np.float32) for _ in range(6)), total_detected=20)
+        infos.append(FrameInfo(index, light, load_meta(light), stars, 2.0, 1.0, 10.0, alignment=Alignment.identity(), store_index=index))
+    fingerprints = fingerprint_inputs(lights)
+    pipeline._save_registered_checkpoint(work_dir, store, infos, 0, {}, fingerprints)
+    expected_global = np.full((1, 4, 5), 41.0, dtype=np.float32)
+    pipeline._save_global_stack_checkpoint(work_dir, store, infos, 0, {}, fingerprints, expected_global)
+
+    def fit_local_norm(active_store, *_args):
+        for norm in active_store.norms:
+            norm.scale_map = np.ones((1, 2, 2), dtype=np.float32)
+            norm.offset_map = np.zeros((1, 2, 2), dtype=np.float32)
+
+    pipeline._fit_local_norm = fit_local_norm
+    original_stack_store = pipeline_module.stack_store
+    stack_calls = []
+
+    def count_stack(*args, **kwargs):
+        stack_calls.append(kwargs.get("label"))
+        return original_stack_store(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "stack_store", count_stack)
+    messages = []
+    pipeline.status = messages.append
+
+    result = pipeline.run()
+
+    assert result.output.is_file()
+    assert stack_calls == ["Stacking (local norm)"]
+    assert any("Resuming after global stacking" in message for message in messages)
+
+
+def test_pipeline_resumes_after_local_norm_without_refitting(light_dir, tmp_path, monkeypatch):
+    import gpustacker.pipeline as pipeline_module
+
+    lights = sorted(light_dir.glob("*.fit"))[:3]
+    work_dir = tmp_path / "local-norm-checkpoint"
+    pipeline = StackingPipeline(PipelineSettings(
+        lights=lights,
+        output=tmp_path / "local-norm-resumed.fit",
+        work_dir=work_dir,
+        resume=True,
+        device="cpu",
+        cosmetic="off",
+        local_norm=LocalNormSettings(enabled=True, block=8),
+        filters=FilterSettings(enabled=False),
+        save_maps=False,
+        plate_solve=False,
+    ))
+    store = FrameStore(work_dir, (1, 4, 5))
+    infos = []
+    for index, light in enumerate(lights):
+        store.add(light.name, np.full((1, 4, 5), 40.0 + index, dtype=np.float32))
+        stars = Stars(*(np.empty(0, dtype=np.float32) for _ in range(6)), total_detected=20)
+        infos.append(FrameInfo(index, light, load_meta(light), stars, 2.0, 1.0, 10.0, alignment=Alignment.identity(), store_index=index))
+    fingerprints = fingerprint_inputs(lights)
+    global_image = np.full((1, 4, 5), 41.0, dtype=np.float32)
+    pipeline._save_registered_checkpoint(work_dir, store, infos, 0, {}, fingerprints)
+    pipeline._save_global_stack_checkpoint(work_dir, store, infos, 0, {}, fingerprints, global_image)
+    for norm in store.norms:
+        norm.scale_map = np.ones((1, 2, 2), dtype=np.float32)
+        norm.offset_map = np.zeros((1, 2, 2), dtype=np.float32)
+    pipeline._save_local_norm_checkpoint(work_dir, store, infos, 0, {}, fingerprints, global_image)
+    pipeline._fit_local_norm = lambda *_args: (_ for _ in ()).throw(AssertionError("maps should not be refit"))
+    stack_calls = []
+    original_stack_store = pipeline_module.stack_store
+
+    def count_stack(*args, **kwargs):
+        stack_calls.append(kwargs.get("label"))
+        return original_stack_store(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "stack_store", count_stack)
+
+    result = pipeline.run()
+
+    assert result.output.is_file()
+    assert stack_calls == ["Stacking (local norm)"]
+
+
+def test_pipeline_resumes_after_master_without_restacking(light_dir, tmp_path, monkeypatch):
+    import gpustacker.pipeline as pipeline_module
+
+    light = sorted(light_dir.glob("*.fit"))[0]
+    work_dir = tmp_path / "master-checkpoint"
+    settings = PipelineSettings(
+        lights=[light],
+        output=tmp_path / "master-resumed.fit",
+        work_dir=work_dir,
+        resume=True,
+        device="cpu",
+        cosmetic="off",
+        local_norm=LocalNormSettings(enabled=False),
+        filters=FilterSettings(enabled=False),
+        save_maps=False,
+        plate_solve=False,
+        autocrop=0.5,
+        stack=StackSettings(method="none", normalize=False),
+    )
+    pipeline = StackingPipeline(settings)
+    store = FrameStore(work_dir, (1, 4, 5))
+    store.add(light.name, np.ones((1, 4, 5), dtype=np.float32))
+    stars = Stars(*(np.empty(0, dtype=np.float32) for _ in range(6)), total_detected=20)
+    info = FrameInfo(0, light, load_meta(light), stars, 2.0, 1.0, 10.0, alignment=Alignment.identity(), store_index=0)
+    fingerprints = fingerprint_inputs([light])
+    pipeline._save_registered_checkpoint(work_dir, store, [info], 0, {}, fingerprints)
+    expected = np.full((1, 2, 3), 55.0, dtype=np.float32)
+    stack = StackResult(
+        image=expected,
+        rejected_low=1,
+        rejected_high=2,
+        total_samples=20,
+        bands=1,
+        coverage=np.ones((2, 3), dtype=np.uint16),
+        rejection=np.full((2, 3), 0.15, dtype=np.float32),
+        crop_box=(1, 3, 1, 4),
+    )
+    pipeline._save_master_checkpoint(work_dir, store, [info], 0, {}, fingerprints, stack)
+    monkeypatch.setattr(pipeline_module, "stack_store", lambda *_args, **_kwargs: pytest.fail("master checkpoint should skip stacking"))
+    messages = []
+    pipeline.status = messages.append
+
+    result = pipeline.run()
+
+    actual, _ = load_frame(result.output)
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(result.stack.coverage, stack.coverage)
+    np.testing.assert_array_equal(result.stack.rejection, stack.rejection)
+    assert result.stack.rejected_low == 1
+    assert result.stack.rejected_high == 2
+    assert any("Resuming after master stacking" in message for message in messages)
+
+
+def test_cancelled_stack_preserves_checkpoint_for_resume(light_dir, tmp_path, monkeypatch):
+    import gpustacker.pipeline as pipeline_module
+
+    light = sorted(light_dir.glob("*.fit"))[0]
+    work_dir = tmp_path / "cancel-resume"
+    settings = PipelineSettings(
+        lights=[light],
+        output=tmp_path / "cancel-resume.fit",
+        work_dir=work_dir,
+        resume=True,
+        device="cpu",
+        cosmetic="off",
+        local_norm=LocalNormSettings(enabled=False),
+        filters=FilterSettings(enabled=False),
+        save_maps=False,
+        plate_solve=False,
+        stack=StackSettings(method="none", normalize=False),
+    )
+    first_pipeline = StackingPipeline(settings)
+    meta = load_meta(light)
+    shape = (meta.channels, *meta.shape)
+    store = FrameStore(work_dir, shape)
+    store.add(light.name, np.full(shape, 42.0, dtype=np.float32))
+    stars = Stars(*(np.empty(0, dtype=np.float32) for _ in range(6)), total_detected=20)
+    info = FrameInfo(0, light, meta, stars, 2.0, 1.0, 10.0, alignment=Alignment.identity(), store_index=0)
+    first_pipeline._save_registered_checkpoint(work_dir, store, [info], 0, {}, fingerprint_inputs([light]))
+
+    def cancel_at_stack(*_args, **kwargs):
+        first_pipeline.cancel()
+        kwargs["cancel_cb"]()
+
+    monkeypatch.setattr(pipeline_module, "stack_store", cancel_at_stack)
+    with pytest.raises(RuntimeError, match="Cancelled"):
+        first_pipeline.run()
+    assert (work_dir / "checkpoint.json").is_file()
+    assert (work_dir / "reg_0000.npy").is_file()
+
+    monkeypatch.undo()
+    resumed = StackingPipeline(settings).run()
+
+    actual, _ = load_frame(resumed.output)
+    np.testing.assert_array_equal(actual, np.full(shape, 42.0, dtype=np.float32))
+    assert not work_dir.exists()
+
+
+@pytest.mark.parametrize("corruption", ["truncated_metadata", "missing_map"])
+def test_master_checkpoint_rejects_corrupt_or_missing_payload(light_dir, tmp_path, corruption):
+    light = sorted(light_dir.glob("*.fit"))[0]
+    work_dir = tmp_path / "corrupt-master-checkpoint"
+    pipeline = StackingPipeline(PipelineSettings(
+        lights=[light],
+        output=tmp_path / "corrupt-master.fit",
+        work_dir=work_dir,
+        resume=True,
+        device="cpu",
+        cosmetic="off",
+        local_norm=LocalNormSettings(enabled=False),
+        plate_solve=False,
+    ))
+    store = FrameStore(work_dir, (1, 4, 5))
+    store.add(light.name, np.ones((1, 4, 5), dtype=np.float32))
+    stars = Stars(*(np.empty(0, dtype=np.float32) for _ in range(6)), total_detected=20)
+    info = FrameInfo(0, light, load_meta(light), stars, 2.0, 1.0, 10.0, alignment=Alignment.identity(), store_index=0)
+    fingerprints = fingerprint_inputs([light])
+    pipeline._save_registered_checkpoint(work_dir, store, [info], 0, {}, fingerprints)
+    stack = StackResult(
+        image=np.ones((1, 4, 5), dtype=np.float32),
+        rejected_low=0,
+        rejected_high=0,
+        total_samples=20,
+        bands=1,
+        coverage=np.ones((4, 5), dtype=np.uint16),
+        rejection=np.zeros((4, 5), dtype=np.float32),
+    )
+    pipeline._save_master_checkpoint(work_dir, store, [info], 0, {}, fingerprints, stack)
+    if corruption == "truncated_metadata":
+        (work_dir / "stack_result.json").write_text('{"crop_box":', encoding="utf-8")
+    else:
+        (work_dir / "master_rejection.npy").unlink()
+
+    with pytest.raises(CheckpointError, match="Registered checkpoint is incomplete or corrupt"):
+        pipeline._restore_registered_checkpoint(work_dir, [light])
+
+
+def test_report_and_csv_counts_reconcile_with_excluded_frames(light_dir, tmp_path):
+    lights = sorted(light_dir.glob("*.fit"))[:4]
+    pipeline = StackingPipeline(PipelineSettings(lights=lights, output=tmp_path / "counts.fit", device="cpu"))
+    meta = load_meta(lights[0])
+    stars = Stars(*(np.empty(0, dtype=np.float32) for _ in range(6)), total_detected=12)
+    infos = [
+        FrameInfo(0, lights[0], meta, stars, 2.0, 1.0, 20.0, alignment=Alignment.identity(), weight=1.0, transparency=1.0, phot_stars=9, store_index=0, bright_star_rate=4.0),
+        FrameInfo(1, lights[1], load_meta(lights[1]), stars, 2.5, 1.2, 22.0, rejected_reason="filter: quality", bright_star_rate=3.0),
+        FrameInfo(2, lights[2], load_meta(lights[2]), stars, 2.8, 1.3, 24.0, rejected_reason="alignment failed: synthetic fixture"),
+        FrameInfo(3, lights[3], load_meta(lights[3]), stars, 3.0, 1.4, 26.0, rejected_reason="only 4 stars"),
+    ]
+    channels = meta.channels
+    stack = StackResult(
+        image=np.zeros((channels, 2, 3), dtype=np.float32),
+        rejected_low=1,
+        rejected_high=2,
+        total_samples=channels * 6,
+        bands=1,
+        coverage=np.ones((2, 3), dtype=np.uint16),
+        rejection=np.zeros((2, 3), dtype=np.float32),
+    )
+
+    csv_path = pipeline._write_csv(infos)
+    report_path = pipeline._write_report(infos, 0, stack, None, {}, 1.0, 1.0)
+    rows = list(csv.DictReader(csv_path.open(newline="", encoding="utf-8")))
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    counts = report["frame_counts"]
+
+    assert counts == {"input": 4, "eligible": 1, "stacked": 1, "excluded": 3}
+    assert report["stack"]["frames"] == counts["stacked"]
+    assert sum(row["stacked"] == "True" for row in rows) == counts["stacked"]
+    assert [row["excluded"] for row in rows] == [frame["excluded"] or "" for frame in report["frames"]]
+    assert [frame["reason"] for frame in report["excluded"]["frames"]] == [
+        "filter: quality", "alignment failed: synthetic fixture", "only 4 stars",
+    ]
+    assert all(int(row["report_schema_version"]) == report["schema_version"] == 2 for row in rows)
+    assert report["metric_definitions"]["rejected_low_high"].endswith("not per-frame counts.")
+
+
+def test_pipeline_records_map_failure_and_retains_master(light_dir, tmp_path, monkeypatch):
+    import gpustacker.pipeline as pipeline_module
+
+    lights = sorted(light_dir.glob("*.fit"))[:2]
+    output = tmp_path / "map-failure.fit"
+    settings = PipelineSettings(
+        lights=lights,
+        output=output,
+        device="cpu",
+        cosmetic="off",
+        local_norm=LocalNormSettings(enabled=False),
+        filters=FilterSettings(enabled=False),
+        save_maps=True,
+        plate_solve=False,
+        stack=StackSettings(method="none", normalize=False),
+    )
+    original_save_fits = pipeline_module.save_fits
+
+    def fail_coverage(path, *args, **kwargs):
+        if Path(path).stem.endswith("_coverage"):
+            raise OSError("simulated coverage write failure")
+        return original_save_fits(path, *args, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "save_fits", fail_coverage)
+
+    result = StackingPipeline(settings).run()
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+
+    assert output.is_file()
+    assert (tmp_path / "map-failure_rejection.fit").is_file()
+    assert report["products"]["master"]["status"] == "complete"
+    assert report["products"]["coverage_map"]["status"] == "failed"
+    assert report["products"]["rejection_map"]["status"] == "complete"
+
+
+def test_pipeline_records_alternate_weighting_failure_and_retains_master(light_dir, tmp_path, monkeypatch):
+    import gpustacker.pipeline as pipeline_module
+
+    lights = sorted(light_dir.glob("*.fit"))[:2]
+    output = tmp_path / "variant-failure.fit"
+    settings = PipelineSettings(
+        lights=lights,
+        output=output,
+        device="cpu",
+        cosmetic="off",
+        local_norm=LocalNormSettings(enabled=False),
+        filters=FilterSettings(enabled=False),
+        save_maps=False,
+        plate_solve=False,
+        weightings=["psfsw", "noise"],
+        stack=StackSettings(method="none", normalize=False),
+    )
+    original_stack_store = pipeline_module.stack_store
+
+    def fail_noise_variant(*args, **kwargs):
+        if kwargs.get("label") == "Stacking noise":
+            raise OSError("simulated variant stack failure")
+        return original_stack_store(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "stack_store", fail_noise_variant)
+
+    result = StackingPipeline(settings).run()
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+
+    assert result.output.is_file()
+    assert result.weighting_outputs == {"psfsw": result.output}
+    assert report["products"]["weighting_noise"]["status"] == "failed"
+    assert "simulated variant stack failure" in report["products"]["weighting_noise"]["error"]
+
+
+def test_pipeline_stacks_from_retained_registered_store(light_dir, tmp_path, monkeypatch):
+    light = sorted(light_dir.glob("*.fit"))[0]
+    work_dir = tmp_path / "registered"
+    meta = load_meta(light)
+    shape = (meta.channels, *meta.shape)
+    registered = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) + 100.0
+    producer = StackingPipeline(PipelineSettings(lights=[light], output=tmp_path / "source.fit"))
+    store = FrameStore(work_dir, shape)
+    store.add(light.name, registered)
+    store.norms[0].weight_map = np.ones((4, 4), dtype=np.float32)
+    stars = Stars(*(np.empty(0, dtype=np.float32) for _ in range(6)), total_detected=37)
+    info = FrameInfo(0, light, meta, stars, 2.0, 1.0, 10.0, alignment=Alignment.identity(), weight=1.0, store_index=0)
+    producer._save_registered_store_manifest(work_dir, store, [info], 0, {})
+
+    def unexpected_source_read(*_args, **_kwargs):
+        pytest.fail("registered-store stacking must use manifest metadata, not reopen the originals")
+
+    monkeypatch.setattr("gpustacker.pipeline.load_meta", unexpected_source_read)
+    settings = PipelineSettings(
+        lights=[],
+        output=tmp_path / "from_registered.fit",
+        registered_dir=work_dir,
+        device="cpu",
+        local_norm=LocalNormSettings(enabled=False),
+        filters=FilterSettings(enabled=False),
+        save_maps=False,
+        plate_solve=False,
+        stack=StackSettings(method="none", normalize=False),
+        mfdeconv=MFDeconvSettings(iterations=1),
+    )
+    pipeline = StackingPipeline(settings)
+    monkeypatch.setattr(pipeline, "analyse", lambda: pytest.fail("registered-store stacking must not analyze"))
+    monkeypatch.setattr(pipeline, "register", lambda *args: pytest.fail("registered-store stacking must not register"))
+    mf_output = tmp_path / "from_registered_mfdeconv.fit"
+    monkeypatch.setattr(pipeline, "_run_mfdeconv", lambda *_args: (mf_output, None))
+
+    result = pipeline.run()
+
+    assert result.output.exists()
+    assert result.mfdeconv_output == mf_output
+    assert result.frames[0].stars.total_detected == 37
+    np.testing.assert_allclose(result.stack.image, registered)
+    assert (work_dir / "index.json").exists()
+    assert (work_dir / "reg_0000.npy").exists()
+
+
+def test_retained_registered_store_matches_ordinary_stack(light_dir, tmp_path):
+    lights = sorted(light_dir.glob("*.fit"))[:2]
+    work_dir = tmp_path / "retained-equivalence"
+    ordinary_settings = PipelineSettings(
+        lights=lights,
+        output=tmp_path / "ordinary.fit",
+        work_dir=work_dir,
+        keep_registered=True,
+        device="cpu",
+        cosmetic="off",
+        local_norm=LocalNormSettings(enabled=False),
+        filters=FilterSettings(enabled=False),
+        save_maps=False,
+        plate_solve=False,
+        stack=StackSettings(method="none", normalize=False),
+    )
+    ordinary = StackingPipeline(ordinary_settings).run()
+    retained = StackingPipeline(PipelineSettings(
+        lights=[],
+        output=tmp_path / "retained.fit",
+        registered_dir=work_dir,
+        device="cpu",
+        cosmetic="off",
+        local_norm=LocalNormSettings(enabled=False),
+        filters=FilterSettings(enabled=False),
+        save_maps=False,
+        plate_solve=False,
+        stack=StackSettings(method="none", normalize=False),
+    )).run()
+
+    np.testing.assert_allclose(retained.stack.image, ordinary.stack.image, rtol=0, atol=0)
+
+
+def test_pipeline_rejects_inconsistent_registered_store_without_mutation(light_dir, tmp_path):
+    light = sorted(light_dir.glob("*.fit"))[0]
+    work_dir = tmp_path / "registered"
+    meta = load_meta(light)
+    shape = (meta.channels, *meta.shape)
+    store = FrameStore(work_dir, shape)
+    store.add(light.name, np.ones(shape, dtype=np.float32))
+    stars = Stars(*(np.empty(0, dtype=np.float32) for _ in range(6)), total_detected=10)
+    info = FrameInfo(0, light, meta, stars, 2.0, 1.0, 10.0, alignment=Alignment.identity(), store_index=0)
+    StackingPipeline(PipelineSettings(lights=[light], output=tmp_path / "source.fit"))._save_registered_store_manifest(work_dir, store, [info], 0, {})
+    payload_path = store.paths[0]
+    original_payload = payload_path.read_bytes()
+    manifest_path = work_dir / "registered_store.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["frame_count"] = 2
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    settings = PipelineSettings(lights=[], output=tmp_path / "rejected.fit", registered_dir=work_dir, device="cpu")
+    with pytest.raises(CheckpointError, match="does not match its index"):
+        StackingPipeline(settings).run()
+
+    assert payload_path.read_bytes() == original_payload
+    assert not settings.output.exists()
+
+
 def test_mfdeconv_blend_cli_option():
     args = build_parser().parse_args(["stack", "light.fit", "-o", "out.fit", "--mf-blend", "0.25"])
     assert args.mf_blend == 0.25
+
+
+def test_resume_cli_option(light_dir, tmp_path):
+    light = sorted(light_dir.glob("*.fit"))[0]
+    args = build_parser().parse_args(["stack", str(light), "-o", str(tmp_path / "out.fit"), "--resume"])
+    assert settings_from_args(args).resume
+
+
+def test_registered_store_cli_option(tmp_path):
+    store_dir = tmp_path / "registered"
+    args = build_parser().parse_args(["stack", "-o", str(tmp_path / "out.fit"), "--registered-dir", str(store_dir)])
+
+    assert settings_from_args(args).registered_dir == store_dir
+    assert settings_from_args(args).lights == []
 
 
 def test_drizzle_kernel_and_min_weight_cli_options():
@@ -286,6 +1078,14 @@ def test_pipeline_end_to_end(light_dir, tmp_path, backend, scene):
     report = json.loads(result.report_path.read_text())
     assert len(report["frames"]) == 6 and report["mfdeconv"]["iterations"] >= 1
     assert report["settings"]["weighting"] == "psfsw" and report["stack"]["effective_frames"] > 3
+    assert report["schema_version"] == 2
+    assert set(report["filter_baselines"]) == {"prefilters", "transparency"}
+    assert report["filter_baselines"]["prefilters"]["candidate_frames"] == 6
+    counts = report["frame_counts"]
+    assert counts == {"input": 6, "eligible": 6, "stacked": 6, "excluded": 0}
+    assert report["stack"]["frames"] == counts["stacked"]
+    assert report["per_frame_rejection_attribution"]["available"] is False
+    assert sum(bool(frame["stacked"]) for frame in report["frames"]) == counts["stacked"]
     assert all(f["transparency"] is not None for f in report["frames"] if f["excluded"] is None)
     assert result.csv_path.exists() and result.csv_path.read_text().count("\n") == 7
     assert (out.parent / "stack_coverage.fit").exists() and (out.parent / "stack_rejection.fit").exists()
@@ -316,6 +1116,60 @@ def test_pipeline_selected_weightings_write_only_selected_masters(light_dir, tmp
         assert meta.header["WEIGHTMD"] == mode
     report = json.loads(result.report_path.read_text())
     assert set(report["weighting_outputs"]) == {"psfsw", "noise", "psfsw+field"}
+
+
+def test_optional_drizzle_failure_keeps_master_and_records_failure(light_dir, tmp_path, monkeypatch):
+    lights = sorted(light_dir.glob("*.fit"))
+    output = tmp_path / "drizzle-failure.fit"
+    settings = PipelineSettings(lights=lights, output=output, device="cpu", drizzle=DrizzleSettings(enabled=True))
+
+    def fail_drizzle(*_args, **_kwargs):
+        raise OSError("simulated drizzle failure")
+
+    monkeypatch.setattr(StackingPipeline, "_run_drizzle", fail_drizzle)
+    result = StackingPipeline(settings, lambda _: None).run()
+
+    assert output.is_file()
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+    assert report["products"]["master"]["status"] == "complete"
+    assert report["products"]["drizzle"]["status"] == "failed"
+    assert report["products"]["drizzle"]["error"] == "OSError: simulated drizzle failure"
+    assert "Rerun" in report["products"]["drizzle"]["retry"]
+
+
+def test_drizzle_weight_failure_keeps_and_reports_drizzle_image(light_dir, tmp_path, monkeypatch):
+    import gpustacker.pipeline as pipeline_module
+
+    lights = sorted(light_dir.glob("*.fit"))[:2]
+    output = tmp_path / "drizzle-weight-failure.fit"
+    settings = PipelineSettings(
+        lights=lights,
+        output=output,
+        device="cpu",
+        cosmetic="off",
+        local_norm=LocalNormSettings(enabled=False),
+        filters=FilterSettings(enabled=False),
+        save_maps=False,
+        plate_solve=False,
+        drizzle=DrizzleSettings(enabled=True),
+        stack=StackSettings(method="none", normalize=False),
+    )
+    original_save_fits = pipeline_module.save_fits
+
+    def fail_weight_map(path, *args, **kwargs):
+        if Path(path).stem.endswith("_drizzle_weight"):
+            raise OSError("simulated drizzle-weight write failure")
+        return original_save_fits(path, *args, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "save_fits", fail_weight_map)
+
+    result = StackingPipeline(settings).run()
+    report = json.loads(result.report_path.read_text(encoding="utf-8"))
+    drizzle_path = output.with_name("drizzle-weight-failure_drizzle.fit")
+
+    assert drizzle_path.is_file()
+    assert report["products"]["drizzle"]["status"] == "complete"
+    assert report["products"]["drizzle_weight"]["status"] == "failed"
 
 
 @pytest.mark.parametrize(("refit", "expected_fits"), [(False, 1), (True, 2)])

@@ -5,7 +5,7 @@ from __future__ import annotations
 HELP_SECTIONS: list[tuple[str, str]] = [
     (
         "Overview",
-        """GPUStacker turns a folder of light frames into a calibrated, registered, rejection-stacked master.
+        """Astro Stack and Stitch Studio turns a folder of light frames into a calibrated, registered, rejection-stacked master.
 Everything heavy runs on the GPU as PyTorch tensors (CPU fallback is automatic).
 
 Pipeline, in order:
@@ -384,14 +384,18 @@ Processing overview:
      per-tile linear residual plane.
   5. Blend the matched tiles and optionally crop uncovered canvas borders.
 
-Gradient degree  (default 2; choices 0, 1, 2, 3)
+Gradient degree  (default 2; choices auto, 0, 1, 2, 3)
+  auto  Test degrees 0 through 3 independently for each tile. Select the simplest model with
+        strong robust-fit evidence over no correction; the report records each selected degree.
   0  Disable per-tile polynomial gradient removal.
   1  Fit a planar background (constant plus x and y slopes).
   2  Add quadratic curvature terms; this is the default.
   3  Add cubic terms for more spatially complex smooth backgrounds.
   Higher degree can remove a more complex gradient, but can also subtract broad, real nebula
-  structure if it is mistaken for sky. The fit is per channel. The log reports the model's
-  peak-to-peak amplitude for each tile. This setting is separate from Residual plane per tile.
+  structure if it is mistaken for sky. Auto is a conservative model-selection heuristic, not a
+  way to distinguish instrumental gradients from real diffuse emission. The fit is per channel;
+  the log reports the model's peak-to-peak amplitude and the report records per-tile degrees.
+  This setting is separate from Residual plane per tile.
 
 Sky block px  (default 64)
   Size of the square blocks whose medians are used to estimate the sky model. Smaller blocks give

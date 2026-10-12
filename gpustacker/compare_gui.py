@@ -8,6 +8,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from . import APP_NAME
 from .astro_dark_theme import DARK_BORDER, DARK_FIELD, DARK_TEXT, configure_dark_theme
 from .compare import CompareResult, compare_many, write_report
 
@@ -62,7 +63,7 @@ class CompareWindow:
         self.result: CompareResult | None = None
         self.results: list[CompareResult] = []
         self.candidate_paths: list[Path] = []
-        root.title("GPUStacker — compare masters")
+        root.title(f"{APP_NAME} — Compare masters")
         if isinstance(root, (tk.Tk, tk.Toplevel)):
             root.geometry("1120x620")
             root.minsize(900, 480)
@@ -117,7 +118,7 @@ class CompareWindow:
         outer.columnconfigure(1, weight=1)
         outer.rowconfigure(3, weight=1)
 
-        candidates = ttk.LabelFrame(outer, text="GPUStacker masters", padding=6)
+        candidates = ttk.LabelFrame(outer, text="Stack masters", padding=6)
         candidates.grid(row=0, column=0, columnspan=4, sticky="ew")
         candidates.columnconfigure(0, weight=1)
         self.candidate_list = tk.Listbox(candidates, selectmode=tk.EXTENDED, height=3, exportselection=False, bg=DARK_FIELD, fg=DARK_TEXT, relief="flat", highlightthickness=1, highlightbackground=DARK_BORDER, font=("Consolas", 9))

@@ -67,7 +67,7 @@ class MosaicCancelled(Exception):
 class MosaicSettings:
     tiles: list[Path]
     output: Path
-    gradient_degree: int = 2  # polynomial sky model removed per tile; 0 = off
+    gradient_degree: int | str = 2  # polynomial degree per tile; "auto" selects 0..3 conservatively
     gradient_block: int = 64  # px, block size for the sky samples
     pixel_scale: float = 0.0  # output arcsec/px; 0 = finest tile
     orientation: str = "first"  # "first" keeps the first tile's rotation, "north" = north up
@@ -93,6 +93,7 @@ class Tile:
     header: dict[str, Any]
     wcs: Any  # astropy.wcs.WCS
     scale: float  # arcsec / px
+    gradient_degree: int = 0  # selected polynomial degree; 0 = no correction
     gradient_pp: np.ndarray | None = None  # (C,) peak-to-peak of the removed gradient
     bbox: tuple[int, int, int, int] | None = None  # x0, y0, x1, y1 on the canvas (exclusive)
     warped: np.ndarray | None = None  # (C, h, w) inside bbox, NaN where invalid
@@ -139,6 +140,7 @@ class MosaicFinding:
 class MosaicAnalysis:
     overlaps: list[dict[str, Any]] = field(default_factory=list)
     findings: list[MosaicFinding] = field(default_factory=list)
+    tile_gradients: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -295,6 +297,54 @@ def fit_gradient(image: np.ndarray, degree: int, block: int) -> np.ndarray:
     return model
 
 
+def choose_gradient_degree(image: np.ndarray, block: int, max_degree: int = 3) -> int:
+    """Choose the simplest polynomial degree with strong robust-BIC evidence over no correction."""
+
+    c, h, w = image.shape
+    med, _ = block_medians(image, block)
+    bh, bw = med.shape[1:]
+    by, bx = np.mgrid[0:bh, 0:bw]
+    cx = (bx + 0.5) * block / w * 2 - 1
+    cy = (by + 0.5) * block / h * 2 - 1
+    scores = np.zeros(max_degree + 1, dtype=np.float64)
+    counts = np.zeros(c, dtype=np.int64)
+    for ch in range(c):
+        values = med[ch].ravel()
+        valid = np.isfinite(values)
+        values = values[valid]
+        if values.size < 12:
+            continue
+        counts[ch] = values.size
+        baseline = values - np.median(values)
+        sigma0 = 1.4826 * np.median(np.abs(baseline - np.median(baseline)))
+        scores[0] += values.size * np.log(max(sigma0**2, 1e-12))
+        x = cx.ravel()[valid]
+        y = cy.ravel()[valid]
+        for degree in range(1, max_degree + 1):
+            terms = _poly_terms(x, y, degree)
+            keep = np.ones(values.size, dtype=bool)
+            coef = np.zeros(terms.shape[1])
+            for _ in range(12):
+                if keep.sum() < 3 * terms.shape[1]:
+                    break
+                coef, *_ = np.linalg.lstsq(terms[keep], values[keep], rcond=None)
+                residual = values - terms @ coef
+                sigma = 1.4826 * np.median(np.abs(residual[keep] - np.median(residual[keep]))) + 1e-9
+                new_keep = (residual < sigma) & (residual > -3.0 * sigma)
+                if new_keep.sum() < 3 * terms.shape[1] or np.array_equal(new_keep, keep):
+                    break
+                keep = new_keep
+            residual = values - terms @ coef
+            sigma = 1.4826 * np.median(np.abs(residual - np.median(residual)))
+            parameter_count = terms.shape[1] - 1  # the constant level is preserved by correction
+            scores[degree] += values.size * np.log(max(sigma**2, 1e-12)) + parameter_count * np.log(values.size)
+
+    if not counts.any():
+        return 0
+    best = int(np.argmin(scores))
+    return best if best > 0 and scores[0] - scores[best] >= 6.0 else 0
+
+
 def correct_gradient(image: np.ndarray, degree: int, block: int) -> tuple[np.ndarray, np.ndarray]:
     """Return (image with the gradient removed, per-channel peak-to-peak of the removed model).
     The model's median level is kept so the sky stays at its original ADU."""
@@ -381,6 +431,8 @@ class MosaicBuilder:
             raise ValueError(f"interpolation must be one of {INTERPOLATIONS}")
         if settings.blend_mode not in BLEND_MODES:
             raise ValueError(f"blend_mode must be one of {BLEND_MODES}")
+        if settings.gradient_degree != "auto" and settings.gradient_degree not in (0, 1, 2, 3):
+            raise ValueError("gradient_degree must be 'auto' or an integer from 0 to 3")
         if len(settings.tiles) < 2:
             raise ValueError("A mosaic needs at least two tiles")
         self.settings = settings
@@ -430,6 +482,14 @@ class MosaicBuilder:
                 c = t.image.shape[0]
                 t.gain, t.offset, t.plane = np.ones(c), np.zeros(c), np.zeros((c, 2))
         analysis = self.analyze_overlaps(tiles, overlaps)
+        analysis.tile_gradients = [
+            {
+                "tile": t.name,
+                "selected_degree": t.gradient_degree,
+                "removed_peak_to_peak": t.gradient_pp.tolist() if t.gradient_pp is not None else [],
+            }
+            for t in tiles
+        ]
         self.progress(0.75, "Blending")
         image, coverage = self.blend(tiles)
         self._check()
@@ -550,16 +610,21 @@ class MosaicBuilder:
 
     def remove_gradients(self, tiles: list[Tile]) -> None:
         s = self.settings
-        if s.gradient_degree <= 0:
-            self.status("Gradient correction: off")
-            return
         for i, t in enumerate(tiles):
             self._check()
+            degree = choose_gradient_degree(t.image, s.gradient_block) if s.gradient_degree == "auto" else int(s.gradient_degree)
+            t.gradient_degree = degree
+            if degree == 0:
+                t.gradient_pp = np.zeros(t.image.shape[0], dtype=np.float32)
+                label = "auto selected off" if s.gradient_degree == "auto" else "off"
+                self.status(f"Gradient correction {t.path.name}: {label}")
+                continue
             self.progress(0.15 + 0.1 * i / len(tiles), f"Gradient model {t.path.name}")
-            t.image, t.gradient_pp = correct_gradient(t.image, s.gradient_degree, s.gradient_block)
+            t.image, t.gradient_pp = correct_gradient(t.image, degree, s.gradient_block)
             sky = float(np.nanmedian(t.image[0, ::8, ::8]))
             pp = ", ".join(_fmt(v) for v in t.gradient_pp)
-            self.status(f"Gradient removed from {t.path.name}: degree {s.gradient_degree}, peak-to-peak [{pp}] ({100 * float(t.gradient_pp.max()) / max(sky, 1e-12):.1f}% of sky)")
+            mode = f"auto -> {degree}" if s.gradient_degree == "auto" else f"degree {degree}"
+            self.status(f"Gradient removed from {t.path.name}: {mode}, peak-to-peak [{pp}] ({100 * float(t.gradient_pp.max()) / max(sky, 1e-12):.1f}% of sky)")
 
     # ------------------------------------------------------------------ canvas
 
@@ -1171,6 +1236,7 @@ class MosaicBuilder:
                 "seam_width_px": self.settings.seam_width,
                 "blend_mode": self.settings.blend_mode,
             },
+            "tile_gradients": analysis.tile_gradients,
             "findings": [
                 {"severity": f.severity, "code": f.code, "message": f.message, "suggestion": f.suggestion}
                 for f in analysis.findings
@@ -1191,7 +1257,7 @@ class MosaicBuilder:
             ("GPUSTACK", "mosaic", "GPUStacker mosaic"),
             ("MOSTILES", len(tiles), "Number of mosaic tiles"),
             ("MOSSCALE", round(self.out_scale, 5), "Output pixel scale [arcsec/px]"),
-            ("MOSGRAD", s.gradient_degree, "Per-tile gradient polynomial degree (0 = off)"),
+            ("MOSGRAD", s.gradient_degree, "Requested per-tile gradient degree"),
             ("MOSFEATH", s.feather, "Background feather width [px]"),
             ("MOSSEAM", s.seam_width, "Detail seam width [px]"),
             ("MOSPHOT", bool(s.photometric), "Photometric matching in overlaps"),
@@ -1207,6 +1273,7 @@ class MosaicBuilder:
             ])
         for k, t in enumerate(tiles):
             items.append((f"MOSTIL{k:02d}", t.path.name[:68], ""))
+            items.append((f"MOSD{k:02d}", t.gradient_degree, f"Tile {k} selected gradient degree"))
             items.append((f"MOSGN{k:03d}", round(float(np.mean(t.gain)), 5), f"Tile {k} mean gain"))
         xpix = first.header.get("XPIXSZ")
         try:

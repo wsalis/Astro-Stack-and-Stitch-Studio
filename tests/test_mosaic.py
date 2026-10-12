@@ -9,7 +9,7 @@ import pytest
 from astropy.io import fits
 from astropy.wcs import WCS
 
-from gpustacker.mosaic import MosaicBuilder, MosaicSettings, _gaussian_blur, correct_gradient, wcs_from_header
+from gpustacker.mosaic import MosaicBuilder, MosaicSettings, _gaussian_blur, choose_gradient_degree, correct_gradient, wcs_from_header
 
 SCALE = 2.0 / 3600.0  # deg / px
 
@@ -81,6 +81,20 @@ def test_correct_gradient_flattens_plane():
     assert abs(float(np.median(out[0])) - float(np.median(img[0]))) < 5.0
 
 
+def test_auto_gradient_leaves_flat_background_alone():
+    rng = np.random.default_rng(19)
+    img = (200.0 + rng.normal(0.0, 2.0, (1, 320, 400))).astype(np.float32)
+    assert choose_gradient_degree(img, block=32) == 0
+
+
+def test_auto_gradient_selects_linear_model_and_protects_bright_patch():
+    rng = np.random.default_rng(21)
+    yy, xx = np.mgrid[0:320, 0:400].astype(np.float32)
+    img = (200.0 + 0.12 * xx - 0.08 * yy + rng.normal(0.0, 2.0, (320, 400))).astype(np.float32)[None]
+    img[0, 100:150, 180:240] += 300.0
+    assert choose_gradient_degree(img, block=32) == 1
+
+
 def test_wcs_from_header_rejects_missing():
     assert wcs_from_header({"OBJECT": "x"}, (10, 10)) is None
     h = {k: v for k, v in sky_wcs((5.0, 5.0)).to_header().items()}
@@ -118,6 +132,8 @@ def test_mosaic_two_tiles_seamless(two_tiles, backend, tmp_path):
     cov = fits.getdata(result.coverage_output)
     hdr = fits.getheader(out)
     assert hdr["MOSTILES"] == 2 and hdr["CTYPE1"].startswith("RA---TAN")
+    assert hdr["MOSGRAD"] == 1 and hdr["MOSD00"] == 1
+    assert result.analysis.tile_gradients[0]["selected_degree"] == 1
     assert result.pixel_scale == pytest.approx(2.0, rel=1e-3)
 
     # canvas pixel of sky pixel (0, 0): integer offset since scale/rotation match the sky grid

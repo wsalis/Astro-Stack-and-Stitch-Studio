@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -228,5 +230,16 @@ def save_fits(path: Path | str, data: np.ndarray, header_items: Iterable[tuple[s
     header["SOFTWARE"] = ("GPUStacker", "gpustacker.io")
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    fits.PrimaryHDU(data=arr, header=header).writeto(out, overwrite=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=out.parent, prefix=f"{out.stem}.", suffix=out.suffix, delete=False) as stream:
+            temporary = Path(stream.name)
+        fits.PrimaryHDU(data=arr, header=header).writeto(temporary, overwrite=True)
+        with temporary.open("r+b") as stream:
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, out)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return out

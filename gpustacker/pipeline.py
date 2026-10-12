@@ -20,21 +20,23 @@ import torch
 from . import __version__
 from .backend import Backend, StatusCallback, select_backend, to_numpy, to_tensor
 from .calibration import Masters, calibrate, load_masters
+from .checkpoint import CheckpointError, fingerprint_inputs, load_manifest, write_json_atomic, write_manifest, write_npy_atomic
 from .cosmetic import CosmeticSettings, CosmeticStats, cosmetic_correct
 from .debayer import debayer
 from .detection import Stars, analyse_frame, fwhm_grid, fwhm_grid_with_counts
 from .diagnostics import apply_box, crop_box_for, effective_frames, stack_noise, write_frames_csv
 from .drizzle import DrizzleAccumulator, DrizzleSettings, drizzle_frame, new_accumulator
-from .io import FrameMeta, load_frame, save_fits
+from .io import FrameMeta, load_frame, load_meta, save_fits
 from .mfdeconv import MFDeconvResult, MFDeconvSettings, run_mfdeconv
 from .normalization import LocalNormSettings, fit_norm_maps, reference_block_stats
 from .platesolve import find_astap, solve_fits
-from .quality import FilterSettings, StarSet, aperture_flux, compute_weights, field_weight_factors, sample_field_grid, select_photometry_stars, transparency
+from .quality import WEIGHTING_CHOICES, FilterSettings, StarSet, aperture_flux, compute_weights, field_weight_factors, sample_field_grid, select_photometry_stars, transparency
 from .registration import Alignment, Interpolation, estimate_alignment, refine_alignment, source_coords_at, warp_to_reference
 from .stacking import FrameNorm, FrameStore, StackResult, StackSettings, estimate_norm, norm_vec, stack_store
 
 ProgressCallback = Callable[[float, str], None]
 Weighting = Literal["psfsw", "psfsw+fwhm", "psfsw+field", "noise", "fwhm", "both", "none"]
+REPORT_SCHEMA_VERSION = 2
 
 
 def weighting_output_path(output: Path, mode: Weighting) -> Path:
@@ -100,13 +102,30 @@ class PipelineSettings:
     mfdeconv_frames: int = 12
     mfdeconv_blend: float = 0.3
     keep_registered: bool = False
+    resume: bool = False
     device: Literal["auto", "cpu"] = "auto"
     vram_fraction: float = 0.75
     workers: int = 0  # CPU worker processes for star detection; 0 = all cores but one
+    registered_dir: Path | None = None
+    distributed_enabled: bool = False
+    distributed_host: str = ""
+    distributed_port: int = 47861
+    distributed_token: str = field(default="", repr=False)
+    distributed_rows_per_task: int = 64
+    distributed_vram_fraction: float = 0.75
 
     def __post_init__(self) -> None:
         if not np.isfinite(self.mfdeconv_blend) or not 0.0 <= self.mfdeconv_blend <= 1.0:
             raise ValueError("MFDeconv blend must be between 0 and 1")
+        if self.distributed_enabled:
+            if not self.distributed_host.strip() or not 1 <= self.distributed_port <= 65535:
+                raise ValueError("A valid distributed worker host and port are required")
+            if len(self.distributed_token.encode("utf-8")) < 32:
+                raise ValueError("The distributed worker token must be at least 32 UTF-8 bytes")
+            if not 1 <= self.distributed_rows_per_task <= 4096:
+                raise ValueError("Distributed task band height must be between 1 and 4096 rows")
+            if not 0.1 <= self.distributed_vram_fraction <= 1.0:
+                raise ValueError("Distributed worker VRAM fraction must be between 0.1 and 1.0")
 
 
 @dataclass
@@ -127,6 +146,7 @@ class FrameInfo:
     rejected_reason: str | None = None
     store_index: int | None = None
     fwhm_count_grid: np.ndarray | None = None
+    bright_star_rate: float | None = None
 
     @property
     def flipped(self) -> bool | None:
@@ -208,6 +228,7 @@ class StackingPipeline:
         self.cosmetic_enabled = settings.cosmetic == "on" or (settings.cosmetic == "auto" and settings.dark is None)
         self.cosmetic_stats = CosmeticStats()
         self._cosmetic_frames = 0
+        self.filter_baselines: dict[str, dict] = {}
         self._cancel = False
         cores = os.cpu_count() or 2
         # beyond ~8 workers detection already outruns the GPU main thread, and large pools are flaky on Windows
@@ -329,9 +350,19 @@ class StackingPipeline:
         """Star-count, background and FWHM filters (relative to the session median)."""
 
         f = self.settings.filters
+        usable = [i for i in infos if i.rejected_reason is None]
+        star_counts = [i.stars.total_detected for i in usable if i.stars is not None]
+        background_values = [i.background for i in usable if np.isfinite(i.background)]
+        fwhm_values = [i.fwhm for i in usable if np.isfinite(i.fwhm)]
+        self.filter_baselines["prefilters"] = {
+            "enabled": f.enabled,
+            "candidate_frames": len(usable),
+            "median_stars": float(np.median(star_counts)) if star_counts else None,
+            "median_background": float(np.median(background_values)) if background_values else None,
+            "median_fwhm_px": float(np.median(fwhm_values)) if fwhm_values else None,
+        }
         if not f.enabled:
             return
-        usable = [i for i in infos if i.rejected_reason is None]
         if len(usable) < 3:
             return
         med_stars = float(np.median([i.stars.total_detected for i in usable]))
@@ -471,12 +502,19 @@ class StackingPipeline:
         # transparency was measured against the reference; re-express it against the session median so a
         # hazy reference frame cannot make every other frame look "too bright"
         vals = np.array([f.transparency for f in infos if f.rejected_reason is None and np.isfinite(f.transparency)])
+        normalization_median = float(np.median(vals)) if vals.size else None
         if vals.size >= 3:
-            med = float(np.median(vals))
+            med = normalization_median
             if med > 0:
                 for f in infos:
                     if np.isfinite(f.transparency):
                         f.transparency = f.transparency / med
+        self.filter_baselines["transparency"] = {
+            "enabled": self.settings.filters.enabled,
+            "threshold": self.settings.filters.transparency_min,
+            "candidate_frames": int(vals.size),
+            "normalization_median": normalization_median if vals.size >= 3 and normalization_median and normalization_median > 0 else None,
+        }
         if not self.settings.filters.enabled:
             return
         thr = self.settings.filters.transparency_min
@@ -577,6 +615,447 @@ class StackingPipeline:
             self.progress(progress_start + progress_span * (i + 1) / n, f"Local normalisation {i + 1}/{n}")
         self.backend.empty_cache()
 
+    def _resume_settings(self) -> dict:
+        s = self.settings
+        weightings = list(dict.fromkeys(s.weightings or [s.weighting]))
+        if s.weighting in weightings:
+            weightings.remove(s.weighting)
+        weightings.insert(0, s.weighting)
+        return {
+            "version": __version__,
+            "lights": [str(path.resolve()) for path in s.lights],
+            "output": str(s.output.resolve()),
+            "calibration": {name: str(getattr(s, name).resolve()) if getattr(s, name) else None for name in ("bias", "dark", "flat")},
+            "pedestal": s.pedestal,
+            "cosmetic": s.cosmetic,
+            "cosmetic_settings": asdict(s.cosmetic_settings),
+            "debayer": s.debayer,
+            "debayer_method": s.debayer_method,
+            "bayer_pattern": s.bayer_pattern,
+            "reference": str(s.reference.resolve()) if s.reference else None,
+            "detection_sigma": s.detection_sigma,
+            "min_stars": s.min_stars,
+            "weighting": s.weighting,
+            "weightings": weightings,
+            "filters": asdict(s.filters),
+            "interpolation": s.interpolation,
+            "refine_registration": s.refine_registration,
+            "local_norm": asdict(s.local_norm),
+            "refit_local_norm_per_weighting": s.refit_local_norm_per_weighting,
+            "stack": asdict(s.stack),
+            "autocrop": s.autocrop,
+            "save_maps": s.save_maps,
+            "plate_solve": s.plate_solve,
+            "astap_path": str(s.astap_path.resolve()) if s.astap_path else None,
+            "drizzle": asdict(s.drizzle),
+            "mfdeconv": asdict(s.mfdeconv) if s.mfdeconv is not None else None,
+            "mfdeconv_frames": s.mfdeconv_frames,
+            "mfdeconv_blend": s.mfdeconv_blend,
+        }
+
+    def _resume_input_paths(self) -> list[Path]:
+        paths = list(self.settings.lights)
+        paths.extend(path for path in (self.settings.bias, self.settings.dark, self.settings.flat) if path is not None)
+        return paths
+
+    @staticmethod
+    def _checkpoint_float(value: float) -> float | None:
+        return float(value) if np.isfinite(value) else None
+
+    @staticmethod
+    def _checkpoint_grid(grid: np.ndarray | None) -> list[list[float | None]] | None:
+        if grid is None:
+            return None
+        return [[float(value) if np.isfinite(value) else None for value in row] for row in grid]
+
+    def _serialize_frame_info(self, info: FrameInfo) -> dict:
+        alignment = info.alignment
+        alignment_data = None
+        if alignment is not None:
+            alignment_data = {
+                "matrix": alignment.matrix.tolist(),
+                "matched": alignment.matched,
+                "rotation_deg": alignment.rotation_deg,
+                "scale": alignment.scale,
+                "shift": list(alignment.shift),
+                "inverse_poly": None if alignment.inverse_poly is None else alignment.inverse_poly.tolist(),
+                "forward_poly": None if alignment.forward_poly is None else alignment.forward_poly.tolist(),
+                "refined_matches": alignment.refined_matches,
+                "residual_rms": self._checkpoint_float(alignment.residual_rms),
+            }
+        bright_star_rate = info.bright_star_rate
+        if bright_star_rate is None and info.meta.exposure and info.meta.exposure > 0:
+            bright_star_rate = _bright_star_flux(info) / info.meta.exposure
+        return {
+            "index": info.index,
+            "path": str(info.path.resolve()),
+            "meta": {
+                "shape": list(info.meta.shape),
+                "channels": info.meta.channels,
+                "exposure": info.meta.exposure,
+                "gain": info.meta.gain,
+                "read_noise": info.meta.read_noise,
+                "filter_name": info.meta.filter_name,
+                "bayer_pattern": info.meta.bayer_pattern,
+                "fwhm": info.meta.fwhm,
+                "date_obs": info.meta.date_obs,
+                "header": info.meta.header,
+            },
+            "stars": info.stars.total_detected,
+            "bright_star_rate": self._checkpoint_float(bright_star_rate) if bright_star_rate is not None else None,
+            "fwhm": self._checkpoint_float(info.fwhm),
+            "noise": self._checkpoint_float(info.noise),
+            "background": self._checkpoint_float(info.background),
+            "fwhm_grid": self._checkpoint_grid(info.fwhm_grid),
+            "fwhm_count_grid": None if info.fwhm_count_grid is None else info.fwhm_count_grid.tolist(),
+            "alignment": alignment_data,
+            "weight": self._checkpoint_float(info.weight),
+            "transparency": self._checkpoint_float(info.transparency),
+            "phot_stars": info.phot_stars,
+            "flux_scaled": info.flux_scaled,
+            "rejected_reason": info.rejected_reason,
+            "store_index": info.store_index,
+        }
+
+    def _save_registered_checkpoint(self, work_dir: Path, store: FrameStore, infos: list[FrameInfo], reference_index: int, tilt: dict, input_fingerprints: list[dict]) -> None:
+        if fingerprint_inputs(self._resume_input_paths()) != input_fingerprints:
+            raise CheckpointError("An input file changed during the run; registered checkpoint was not committed")
+        store.save_index()
+        write_json_atomic(work_dir / "resume_state.json", self._registered_state(infos, reference_index, tilt))
+        write_manifest(work_dir / "checkpoint.json", "registered_before_stack", self._resume_settings(), input_fingerprints, {
+            "index": "index.json",
+            "state": "resume_state.json",
+        })
+
+    def _save_global_stack_checkpoint(self, work_dir: Path, store: FrameStore, infos: list[FrameInfo], reference_index: int, tilt: dict, input_fingerprints: list[dict], image: np.ndarray) -> None:
+        if fingerprint_inputs(self._resume_input_paths()) != input_fingerprints:
+            raise CheckpointError("An input file changed during the run; global-stack checkpoint was not committed")
+        store.save_index()
+        write_json_atomic(work_dir / "resume_state.json", self._registered_state(infos, reference_index, tilt))
+        write_npy_atomic(work_dir / "global_stack.npy", image)
+        write_manifest(work_dir / "checkpoint.json", "global_stack_before_local_norm", self._resume_settings(), input_fingerprints, {
+            "index": "index.json",
+            "state": "resume_state.json",
+            "global_stack": "global_stack.npy",
+        })
+
+    def _save_local_norm_checkpoint(self, work_dir: Path, store: FrameStore, infos: list[FrameInfo], reference_index: int, tilt: dict, input_fingerprints: list[dict], image: np.ndarray) -> None:
+        if fingerprint_inputs(self._resume_input_paths()) != input_fingerprints:
+            raise CheckpointError("An input file changed during the run; local-normalization checkpoint was not committed")
+        if any(norm.scale_map is None or norm.offset_map is None for norm in store.norms):
+            raise CheckpointError("Local-normalization maps are incomplete; checkpoint was not committed")
+        store.save_index()
+        write_json_atomic(work_dir / "resume_state.json", self._registered_state(infos, reference_index, tilt))
+        write_npy_atomic(work_dir / "global_stack.npy", image)
+        write_manifest(work_dir / "checkpoint.json", "local_norm_before_final_stack", self._resume_settings(), input_fingerprints, {
+            "index": "index.json",
+            "state": "resume_state.json",
+            "global_stack": "global_stack.npy",
+        })
+
+    def _save_master_checkpoint(self, work_dir: Path, store: FrameStore, infos: list[FrameInfo], reference_index: int, tilt: dict, input_fingerprints: list[dict], result: StackResult) -> None:
+        if fingerprint_inputs(self._resume_input_paths()) != input_fingerprints:
+            raise CheckpointError("An input file changed during the run; master checkpoint was not committed")
+        if result.coverage is None or result.rejection is None:
+            raise CheckpointError("Stack maps are incomplete; master checkpoint was not committed")
+        store.save_index()
+        write_json_atomic(work_dir / "resume_state.json", self._registered_state(infos, reference_index, tilt))
+        write_npy_atomic(work_dir / "master_stack.npy", result.image)
+        write_npy_atomic(work_dir / "master_coverage.npy", result.coverage)
+        write_npy_atomic(work_dir / "master_rejection.npy", result.rejection)
+        write_json_atomic(work_dir / "stack_result.json", {
+            "rejected_low": result.rejected_low,
+            "rejected_high": result.rejected_high,
+            "total_samples": result.total_samples,
+            "bands": result.bands,
+            "crop_box": result.crop_box,
+        })
+        write_manifest(work_dir / "checkpoint.json", "master_before_optional_products", self._resume_settings(), input_fingerprints, {
+            "index": "index.json",
+            "state": "resume_state.json",
+            "master_stack": "master_stack.npy",
+            "coverage": "master_coverage.npy",
+            "rejection": "master_rejection.npy",
+            "stack_result": "stack_result.json",
+        })
+
+    def _registered_state(self, infos: list[FrameInfo], reference_index: int, tilt: dict) -> dict:
+        return {
+            "schema": 1,
+            "reference_index": reference_index,
+            "tilt": tilt,
+            "frames": [self._serialize_frame_info(info) for info in infos],
+            "cosmetic": {"hot": self.cosmetic_stats.hot, "cold": self.cosmetic_stats.cold, "frames_processed": self._cosmetic_frames},
+            "filter_baselines": self.filter_baselines,
+        }
+
+    def _save_registered_store_manifest(self, work_dir: Path, store: FrameStore, infos: list[FrameInfo], reference_index: int, tilt: dict) -> None:
+        store.save_index()
+        write_json_atomic(work_dir / "registered_store.json", {
+            "schema": 1,
+            "gpustacker": __version__,
+            "stage": "registered_before_stack",
+            "shape": list(store.shape),
+            "frame_count": len(store),
+            "reference_index": reference_index,
+            "weighting": self.settings.weighting,
+            "inputs": fingerprint_inputs(self.settings.lights),
+            "index": "index.json",
+            **self._registered_state(infos, reference_index, tilt),
+        })
+
+    def _restore_registered_state(self, work_dir: Path, state: dict, store: FrameStore, expected_paths: list[Path] | None = None) -> tuple[list[FrameInfo], int, dict]:
+        frames = state.get("frames")
+        expected_count = len(expected_paths) if expected_paths is not None else len(frames) if isinstance(frames, list) else 0
+        if state.get("schema") != 1 or not isinstance(frames, list) or not frames or len(frames) != expected_count:
+            raise CheckpointError("Registered store state is incomplete")
+        try:
+            reference_index = int(state["reference_index"])
+            if not 0 <= reference_index < expected_count:
+                raise CheckpointError("Registered store reference index is out of range")
+            infos = []
+            referenced_store_indices = set()
+            for index, item in enumerate(frames):
+                path = Path(item["path"]).resolve(strict=expected_paths is not None)
+                if index != int(item["index"]):
+                    raise CheckpointError("Registered store frame order is invalid")
+                if expected_paths is not None and path != expected_paths[index].resolve(strict=True):
+                    raise CheckpointError("Checkpoint frame order does not match the selected inputs")
+                meta_data = item.get("meta")
+                if meta_data is None:
+                    meta = load_meta(path)
+                else:
+                    meta = FrameMeta(
+                        path=path,
+                        shape=tuple(int(v) for v in meta_data["shape"]),
+                        channels=int(meta_data["channels"]),
+                        exposure=meta_data["exposure"],
+                        gain=meta_data["gain"],
+                        read_noise=meta_data["read_noise"],
+                        filter_name=meta_data["filter_name"],
+                        bayer_pattern=meta_data["bayer_pattern"],
+                        fwhm=meta_data["fwhm"],
+                        date_obs=meta_data["date_obs"],
+                        header=dict(meta_data["header"]),
+                    )
+                stars = Stars(
+                    np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32),
+                    np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32),
+                    np.empty(0, dtype=np.float32), np.empty(0, dtype=np.float32),
+                    total_detected=int(item["stars"]),
+                )
+                alignment_data = item["alignment"]
+                alignment = None if alignment_data is None else Alignment(
+                    matrix=np.asarray(alignment_data["matrix"], dtype=np.float64),
+                    matched=int(alignment_data["matched"]),
+                    rotation_deg=float(alignment_data["rotation_deg"]),
+                    scale=float(alignment_data["scale"]),
+                    shift=tuple(float(v) for v in alignment_data["shift"]),
+                    inverse_poly=None if alignment_data["inverse_poly"] is None else np.asarray(alignment_data["inverse_poly"], dtype=np.float64),
+                    forward_poly=None if alignment_data["forward_poly"] is None else np.asarray(alignment_data["forward_poly"], dtype=np.float64),
+                    refined_matches=int(alignment_data["refined_matches"]),
+                    residual_rms=float("nan") if alignment_data["residual_rms"] is None else float(alignment_data["residual_rms"]),
+                )
+                fwhm_grid = item["fwhm_grid"]
+                fwhm_grid = None if fwhm_grid is None else np.asarray([[np.nan if v is None else v for v in row] for row in fwhm_grid], dtype=np.float32)
+                counts = item["fwhm_count_grid"]
+                infos.append(FrameInfo(
+                    index=index,
+                    path=path,
+                    meta=meta,
+                    stars=stars,
+                    fwhm=float("nan") if item["fwhm"] is None else float(item["fwhm"]),
+                    noise=float("nan") if item["noise"] is None else float(item["noise"]),
+                    background=float("nan") if item["background"] is None else float(item["background"]),
+                    fwhm_grid=fwhm_grid,
+                    alignment=alignment,
+                    weight=1.0 if item["weight"] is None else float(item["weight"]),
+                    transparency=float("nan") if item["transparency"] is None else float(item["transparency"]),
+                    phot_stars=int(item["phot_stars"]),
+                    flux_scaled=bool(item["flux_scaled"]),
+                    rejected_reason=item["rejected_reason"],
+                    store_index=item["store_index"],
+                    fwhm_count_grid=None if counts is None else np.asarray(counts, dtype=np.int32),
+                    bright_star_rate=None if item["bright_star_rate"] is None else float(item["bright_star_rate"]),
+                ))
+            for info in infos:
+                if info.store_index is not None:
+                    if not 0 <= info.store_index < len(store) or store.names[info.store_index] != info.path.name:
+                        raise CheckpointError(f"Checkpoint has an invalid store index for {info.path.name}")
+                    if info.store_index in referenced_store_indices:
+                        raise CheckpointError("Checkpoint maps multiple inputs to one registered frame")
+                    referenced_store_indices.add(info.store_index)
+            if referenced_store_indices != set(range(len(store))):
+                raise CheckpointError("Registered frame metadata does not match its arrays")
+            cosmetic = state.get("cosmetic", {})
+            self.cosmetic_stats.hot = int(cosmetic.get("hot", 0))
+            self.cosmetic_stats.cold = int(cosmetic.get("cold", 0))
+            self._cosmetic_frames = int(cosmetic.get("frames_processed", 0))
+            self.filter_baselines = state.get("filter_baselines", {})
+            if not isinstance(self.filter_baselines, dict):
+                raise CheckpointError("Checkpoint filter baselines are invalid")
+            tilt = state.get("tilt", {})
+        except CheckpointError:
+            raise
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise CheckpointError(f"Registered store metadata is incomplete or corrupt: {exc}") from exc
+        return infos, reference_index, tilt
+
+    def _restore_registered_checkpoint(self, work_dir: Path, input_paths: list[Path]) -> tuple[FrameStore, list[FrameInfo], int, dict, str, np.ndarray | None, StackResult | None]:
+        manifest = load_manifest(work_dir / "checkpoint.json", self._resume_settings(), input_paths)
+        registered_payload = {"index": "index.json", "state": "resume_state.json"}
+        global_payload = {**registered_payload, "global_stack": "global_stack.npy"}
+        master_payload = {
+            "index": "index.json",
+            "state": "resume_state.json",
+            "master_stack": "master_stack.npy",
+            "coverage": "master_coverage.npy",
+            "rejection": "master_rejection.npy",
+            "stack_result": "stack_result.json",
+        }
+        if (manifest["stage"], manifest["payload"]) not in (
+            ("registered_before_stack", registered_payload),
+            ("global_stack_before_local_norm", global_payload),
+            ("local_norm_before_final_stack", global_payload),
+            ("master_before_optional_products", master_payload),
+        ):
+            raise CheckpointError(f"Unsupported checkpoint stage or artifacts: {manifest['stage']!r}")
+        try:
+            state_path = (work_dir / "resume_state.json").resolve(strict=True)
+            if not state_path.is_relative_to(work_dir.resolve()):
+                raise CheckpointError("Checkpoint state path escapes the work directory")
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            store = FrameStore.load_index(work_dir)
+            infos, reference_index, tilt = self._restore_registered_state(work_dir, state, store, self.settings.lights)
+            global_image = None
+            master_result = None
+            if manifest["stage"] in ("global_stack_before_local_norm", "local_norm_before_final_stack"):
+                if manifest["stage"] == "local_norm_before_final_stack" and any(norm.scale_map is None or norm.offset_map is None for norm in store.norms):
+                    raise CheckpointError("Local-normalization checkpoint is missing fitted maps")
+                image_path = (work_dir / "global_stack.npy").resolve(strict=True)
+                if not image_path.is_relative_to(work_dir.resolve()):
+                    raise CheckpointError("Global-stack checkpoint artifact escapes the work directory")
+                image_map = np.load(image_path, mmap_mode="r", allow_pickle=False)
+                if image_map.shape != store.shape or image_map.dtype != np.float32:
+                    raise CheckpointError("Global-stack checkpoint image has invalid shape or dtype")
+                global_image = np.array(image_map, dtype=np.float32, copy=True)
+            elif manifest["stage"] == "master_before_optional_products":
+                root = work_dir.resolve()
+                arrays = {}
+                for key, filename in (("image", "master_stack.npy"), ("coverage", "master_coverage.npy"), ("rejection", "master_rejection.npy")):
+                    artifact_path = (work_dir / filename).resolve(strict=True)
+                    if not artifact_path.is_relative_to(root):
+                        raise CheckpointError(f"Master checkpoint artifact escapes the work directory: {filename}")
+                    arrays[key] = np.load(artifact_path, mmap_mode="r", allow_pickle=False)
+                image_map = arrays["image"]
+                coverage_map = arrays["coverage"]
+                rejection_map = arrays["rejection"]
+                if image_map.ndim != 3 or image_map.shape[0] != store.shape[0] or image_map.dtype != np.float32:
+                    raise CheckpointError("Master checkpoint image has invalid shape or dtype")
+                if coverage_map.shape != image_map.shape[1:] or coverage_map.dtype != np.uint16:
+                    raise CheckpointError("Master checkpoint coverage has invalid shape or dtype")
+                if rejection_map.shape != image_map.shape[1:] or rejection_map.dtype != np.float32:
+                    raise CheckpointError("Master checkpoint rejection map has invalid shape or dtype")
+                metadata_path = (work_dir / "stack_result.json").resolve(strict=True)
+                if not metadata_path.is_relative_to(root):
+                    raise CheckpointError("Master checkpoint metadata escapes the work directory")
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if not isinstance(metadata, dict):
+                    raise CheckpointError("Master checkpoint metadata is invalid")
+                crop_box = metadata.get("crop_box")
+                if crop_box is not None:
+                    crop_box = tuple(int(value) for value in crop_box)
+                    if len(crop_box) != 4 or not (0 <= crop_box[0] < crop_box[1] <= store.shape[1] and 0 <= crop_box[2] < crop_box[3] <= store.shape[2]):
+                        raise CheckpointError("Master checkpoint crop box is invalid")
+                expected_shape = store.shape[1:] if crop_box is None else (crop_box[1] - crop_box[0], crop_box[3] - crop_box[2])
+                if image_map.shape[1:] != expected_shape:
+                    raise CheckpointError("Master checkpoint image dimensions do not match its crop metadata")
+                counts = (metadata["rejected_low"], metadata["rejected_high"], metadata["total_samples"], metadata["bands"])
+                if any(not isinstance(value, int) or isinstance(value, bool) for value in counts):
+                    raise CheckpointError("Master checkpoint counters are invalid")
+                if counts[0] < 0 or counts[1] < 0 or counts[2] <= 0 or counts[3] <= 0:
+                    raise CheckpointError("Master checkpoint counters are out of range")
+                master_result = StackResult(
+                    image=np.array(image_map, dtype=np.float32, copy=True),
+                    rejected_low=counts[0],
+                    rejected_high=counts[1],
+                    total_samples=counts[2],
+                    bands=counts[3],
+                    coverage=np.array(coverage_map, copy=True),
+                    rejection=np.array(rejection_map, dtype=np.float32, copy=True),
+                    crop_box=crop_box,
+                )
+        except CheckpointError:
+            raise
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise CheckpointError(f"Registered checkpoint is incomplete or corrupt: {exc}") from exc
+        return store, infos, reference_index, tilt, manifest["stage"], global_image, master_result
+
+    def _restore_registered_store(self, directory: Path) -> tuple[FrameStore, list[FrameInfo], int, dict, str]:
+        try:
+            manifest_path = (directory / "registered_store.json").resolve(strict=True)
+            if not manifest_path.is_relative_to(directory.resolve()):
+                raise CheckpointError("Registered-store manifest escapes its directory")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict) or manifest.get("schema") != 1 or manifest.get("stage") != "registered_before_stack":
+                raise CheckpointError("Unsupported or incomplete registered-store manifest")
+            if manifest.get("index") != "index.json" or not isinstance(manifest.get("inputs"), list):
+                raise CheckpointError("Registered-store manifest is missing required artifacts")
+            if len(manifest["inputs"]) != len(manifest.get("frames", [])):
+                raise CheckpointError("Registered-store input identities do not match its frame metadata")
+            store = FrameStore.load_index(directory)
+            if list(store.shape) != manifest.get("shape") or len(store) != manifest.get("frame_count"):
+                raise CheckpointError("Registered-store manifest does not match its index")
+            infos, reference_index, tilt = self._restore_registered_state(directory, manifest, store)
+            weighting = manifest.get("weighting")
+            if weighting not in WEIGHTING_CHOICES:
+                raise CheckpointError("Registered-store weighting metadata is invalid")
+        except CheckpointError:
+            raise
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise CheckpointError(f"Cannot load registered store {directory}: {exc}") from exc
+        return store, infos, reference_index, tilt, weighting
+
+    def _stack_store(
+        self,
+        store: FrameStore,
+        label: str,
+        pass_name: str,
+        progress_cb: ProgressCallback,
+        reject_masks: bool,
+        cancel_cb: Callable[[], None] | None = None,
+    ) -> StackResult:
+        settings = self.settings
+        if not settings.distributed_enabled:
+            return stack_store(store, self.backend, settings.stack, progress_cb, label=label, reject_masks=reject_masks, cancel_cb=cancel_cb)
+        from .distributed import WorkerProbeError, probe_worker, stack_store_distributed
+
+        if cancel_cb is not None:
+            cancel_cb()
+        capabilities = probe_worker(
+            settings.distributed_host,
+            settings.distributed_port,
+            settings.distributed_token,
+            expected_store=store.directory,
+            response_timeout=1200.0,
+        )
+        if not capabilities.get("stack_task_execution_enabled"):
+            raise WorkerProbeError("Worker capability probe succeeded, but stack-band execution is not enabled on that computer")
+        return stack_store_distributed(
+            store,
+            self.backend,
+            settings.stack,
+            settings.distributed_host,
+            settings.distributed_port,
+            settings.distributed_token,
+            pass_name=pass_name,
+            reject_masks=reject_masks,
+            vram_fraction=settings.distributed_vram_fraction,
+            rows_per_task=settings.distributed_rows_per_task,
+            progress_callback=progress_cb,
+            cancel_callback=cancel_cb,
+        )
+
     # ------------------------------------------------------------------ run
 
     def _flip_summary(self, infos: list[FrameInfo]) -> dict:
@@ -595,71 +1074,134 @@ class StackingPipeline:
     def run(self) -> PipelineResult:
         t0 = time.perf_counter()
         s = self.settings
-        if not s.lights:
+        from_registered_store = s.registered_dir is not None
+        if not s.lights and not from_registered_store:
             raise ValueError("No light frames given")
+        if from_registered_store and (s.resume or s.drizzle.enabled):
+            raise ValueError("Registered-store stacking does not support resume or drizzle")
+        if s.distributed_enabled and (s.resume or len(set(s.weightings or [s.weighting])) > 1):
+            raise ValueError("Experimental distributed stacking does not support resume or weighting variants")
         output_base = s.output
         selected_weightings = list(dict.fromkeys(s.weightings or [s.weighting]))
         if s.weighting in selected_weightings:
             selected_weightings.remove(s.weighting)
         selected_weightings.insert(0, s.weighting)
+        if from_registered_store and len(selected_weightings) > 1:
+            raise ValueError("Additional weighting variants cannot be recomputed from a registered store")
         s.weightings = selected_weightings
-        if len(selected_weightings) > 1:
+        if len(selected_weightings) > 1 and not from_registered_store:
             s.output = weighting_output_path(output_base, s.weighting)
-        work_dir = s.work_dir or (s.output.parent / "_gpustacker_work")
-        cache = s.analysis_cache
-        if cache is not None and all(str(path.resolve()) in cache for path in s.lights):
-            infos = []
-            for index, path in enumerate(s.lights):
-                cached = cache[str(path.resolve())]
-                rejected = f"only {cached.stars.total_detected} stars" if cached.stars.total_detected < s.min_stars else None
-                infos.append(replace(
-                    cached,
-                    index=index,
-                    alignment=None,
-                    weight=1.0,
-                    transparency=float("nan"),
-                    phot_stars=0,
-                    flux_scaled=False,
-                    rejected_reason=rejected,
-                    store_index=None,
-                ))
-            self.status(f"Reusing analysis for {len(infos)} frame(s)")
-            s.analysis_cache = None
-        else:
-            infos = self.analyse()
-        self.apply_prefilters(infos)
-        tilt = self.tilt_summary(infos)
-        ref_index = self.choose_reference(infos)
-        self.status(f"Reference frame: {infos[ref_index].path.name}")
-
-        probe, _ = self._load_calibrated(infos[ref_index].path)
-        shape = tuple(int(v) for v in probe.shape)
-        del probe
-        store = FrameStore(work_dir, shape)  # type: ignore[arg-type]
-        try:
-            self.register(infos, ref_index, store)
-            if len(store) == 0:
-                raise ValueError("No frames could be registered")
-            self.apply_transparency_filter(infos, store)
-            if len(store) == 0:
-                raise ValueError("All frames were excluded by the transparency filter")
-            self.compute_weights(infos, store)
+        work_dir = s.registered_dir if from_registered_store else (s.work_dir or (s.output.parent / "_gpustacker_work"))
+        input_paths = self._resume_input_paths()
+        fingerprints = fingerprint_inputs(input_paths) if s.resume else []
+        checkpoint_path = work_dir / "checkpoint.json"
+        resume_stage = ""
+        resumed_global_image = None
+        resumed_master_result = None
+        if not s.resume and not from_registered_store:
+            checkpoint_path.unlink(missing_ok=True)
+        resuming = s.resume and checkpoint_path.exists() and not from_registered_store
+        if from_registered_store:
+            store, infos, ref_index, tilt, registered_weighting = self._restore_registered_store(work_dir)
+            if s.weighting not in ("psfsw", registered_weighting):
+                raise CheckpointError(f"Registered store uses {registered_weighting!r} weighting; its weights cannot be recomputed")
+            s.weighting = registered_weighting  # type: ignore[assignment]
+            s.weightings = [registered_weighting]  # type: ignore[list-item]
             flips = self._flip_summary(infos)
-            store.save_index()
+            self.status(f"Stacking {len(store)} retained registered frames using saved weights")
+        elif resuming:
+            store, infos, ref_index, tilt, resume_stage, resumed_global_image, resumed_master_result = self._restore_registered_checkpoint(work_dir, input_paths)
+            flips = self._flip_summary(infos)
+            self.status(f"Resuming from {resume_stage} with {len(store)} registered frames")
+        else:
+            cache = s.analysis_cache
+            if cache is not None and all(str(path.resolve()) in cache for path in s.lights):
+                infos = []
+                for index, path in enumerate(s.lights):
+                    cached = cache[str(path.resolve())]
+                    rejected = f"only {cached.stars.total_detected} stars" if cached.stars.total_detected < s.min_stars else None
+                    infos.append(replace(
+                        cached,
+                        index=index,
+                        alignment=None,
+                        weight=1.0,
+                        transparency=float("nan"),
+                        phot_stars=0,
+                        flux_scaled=False,
+                        rejected_reason=rejected,
+                        store_index=None,
+                    ))
+                self.status(f"Reusing analysis for {len(infos)} frame(s)")
+                s.analysis_cache = None
+            else:
+                infos = self.analyse()
+            self.apply_prefilters(infos)
+            tilt = self.tilt_summary(infos)
+            ref_index = self.choose_reference(infos)
+            self.status(f"Reference frame: {infos[ref_index].path.name}")
+
+            probe, _ = self._load_calibrated(infos[ref_index].path)
+            shape = tuple(int(v) for v in probe.shape)
+            del probe
+            store = FrameStore(work_dir, shape)  # type: ignore[arg-type]
+        completed = False
+        try:
+            if not resuming and not from_registered_store:
+                self.register(infos, ref_index, store)
+                if len(store) == 0:
+                    raise ValueError("No frames could be registered")
+                self.apply_transparency_filter(infos, store)
+                if len(store) == 0:
+                    raise ValueError("All frames were excluded by the transparency filter")
+                self.compute_weights(infos, store)
+                flips = self._flip_summary(infos)
+                if s.resume:
+                    self._save_registered_checkpoint(work_dir, store, infos, ref_index, tilt, fingerprints)
+                else:
+                    store.save_index()
+            if (s.keep_registered or s.distributed_enabled) and not from_registered_store:
+                self._save_registered_store_manifest(work_dir, store, infos, ref_index, tilt)
 
             two_pass = s.local_norm.enabled and len(store) >= 3
             want_masks = s.drizzle.enabled or s.mfdeconv is not None
-            self.status(f"Stacking {len(store)} frames with {s.stack.method} rejection" + (" (pass 1 of 2, global normalisation)" if two_pass else ""))
-            span = 0.13 if two_pass else 0.3
-            result = stack_store(store, self.backend, s.stack, lambda f, m: self.progress(0.55 + span * f, m), label="Stacking", reject_masks=want_masks and not two_pass)
-            if two_pass:
-                self.status("Fitting local normalisation maps against the first-pass stack")
-                self._fit_local_norm(store, result.image)
-                self.status(f"Stacking pass 2 of 2 with local normalisation ({s.local_norm.block}px blocks)")
-                result = stack_store(store, self.backend, s.stack, lambda f, m: self.progress(0.75 + 0.1 * f, m), label="Stacking (local norm)", reject_masks=want_masks)
+            if resume_stage == "master_before_optional_products":
+                if resumed_master_result is None:
+                    raise CheckpointError("Master checkpoint result is missing")
+                result = resumed_master_result
+                self.status("Resuming after master stacking")
+            else:
+                if two_pass and resume_stage in ("global_stack_before_local_norm", "local_norm_before_final_stack"):
+                    if resumed_global_image is None:
+                        raise CheckpointError("Global-stack checkpoint image is missing")
+                    first_pass_image = resumed_global_image
+                    self.status("Resuming after local-normalisation fit" if resume_stage == "local_norm_before_final_stack" else "Resuming after global stacking")
+                else:
+                    self.status(f"Stacking {len(store)} frames with {s.stack.method} rejection" + (" (pass 1 of 2, global normalisation)" if two_pass else ""))
+                    span = 0.13 if two_pass else 0.3
+                    result = self._stack_store(store, "Stacking", "global", lambda f, m: self.progress(0.55 + span * f, m), reject_masks=want_masks and not two_pass, cancel_cb=self._check_cancel)
+                    first_pass_image = result.image
+                    if two_pass and s.resume:
+                        self._save_global_stack_checkpoint(work_dir, store, infos, ref_index, tilt, fingerprints, first_pass_image)
+                if two_pass:
+                    if resume_stage != "local_norm_before_final_stack":
+                        self.status("Fitting local normalisation maps against the first-pass stack")
+                        self._fit_local_norm(store, first_pass_image)
+                        if s.distributed_enabled:
+                            store.save_index()
+                        if s.resume:
+                            self._save_local_norm_checkpoint(work_dir, store, infos, ref_index, tilt, fingerprints, first_pass_image)
+                    self.status(f"Stacking pass 2 of 2 with local normalisation ({s.local_norm.block}px blocks)")
+                    result = self._stack_store(store, "Stacking (local norm)", "local", lambda f, m: self.progress(0.75 + 0.1 * f, m), reject_masks=want_masks, cancel_cb=self._check_cancel)
 
             crop_items: list[tuple] = []
-            if s.autocrop > 0 and result.coverage is not None:
+            if resume_stage == "master_before_optional_products" and result.crop_box is not None:
+                y0, y1, x0, x1 = result.crop_box
+                crop_items = [
+                    ("CROPX0", x0, "Autocrop left edge in registered frame"),
+                    ("CROPY0", y0, "Autocrop top edge"),
+                    ("CROPDPTH", float(s.autocrop), "Autocrop depth fraction"),
+                ]
+            elif resume_stage != "master_before_optional_products" and s.autocrop > 0 and result.coverage is not None:
                 box = crop_box_for(result.coverage, len(store), s.autocrop)
                 if box is None:
                     self.status("Autocrop: no region reaches the requested depth; output left uncropped")
@@ -692,16 +1234,35 @@ class StackingPipeline:
             ] + crop_items
             if exposures and exposures[0]:
                 header_items.append(("EXPTIME", float(sum(exposures)), "Total exposure [s]"))
+            product_statuses = {}
             save_fits(s.output, result.image, header_items, infos[ref_index].meta.header)
+            product_statuses["master"] = {"status": "complete", "path": str(s.output)}
+            if s.resume:
+                self._save_master_checkpoint(work_dir, store, infos, ref_index, tilt, fingerprints, result)
             gain = med_frame_noise / noise if noise > 0 and np.isfinite(med_frame_noise) else float("nan")
             self.status(f"Saved stack -> {s.output} (rejected {result.rejection_fraction * 100:.2f}%, noise {noise:.3g} ADU = {gain:.1f}x better than a single sub, N_eff {n_eff:.1f})")
             self._plate_solve(s.output)
             if s.save_maps and result.coverage is not None:
+                map_outputs = (
+                    ("coverage_map", s.output.with_name(s.output.stem + "_coverage" + s.output.suffix), result.coverage.astype(np.float32), ("MAPTYPE", "coverage", "Valid frames per pixel")),
+                    ("rejection_map", s.output.with_name(s.output.stem + "_rejection" + s.output.suffix), result.rejection, ("MAPTYPE", "rejection", "Rejected sample fraction per pixel")),
+                )
+                for product, map_path, array, header_item in map_outputs:
+                    try:
+                        save_fits(map_path, array, [header_item] + crop_items)
+                        product_statuses[product] = {"status": "complete", "path": str(map_path)}
+                        self.status(f"Saved {product.replace('_', ' ')} -> {map_path}")
+                    except Exception as exc:
+                        if self._cancel:
+                            raise
+                        product_statuses[product] = {
+                            "status": "failed",
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "retry": "Rerun to regenerate this map; the completed master is retained.",
+                        }
+                        self.status(f"{product.replace('_', ' ').capitalize()} failed; master retained: {exc}")
                 cov_path = s.output.with_name(s.output.stem + "_coverage" + s.output.suffix)
-                save_fits(cov_path, result.coverage.astype(np.float32), [("MAPTYPE", "coverage", "Valid frames per pixel")] + crop_items)
                 rej_path = s.output.with_name(s.output.stem + "_rejection" + s.output.suffix)
-                save_fits(rej_path, result.rejection, [("MAPTYPE", "rejection", "Rejected sample fraction per pixel")] + crop_items)
-                self.status(f"Saved maps -> {cov_path.name}, {rej_path.name}")
 
             weighting_outputs = {s.weighting: s.output}
             if len(selected_weightings) > 1:
@@ -709,57 +1270,71 @@ class StackingPipeline:
                 base_norms = copy.deepcopy(store.norms)
                 base_frame_weights = [f.weight for f in infos]
                 for variant_index, mode in enumerate(modes):
-                    self.compute_weights(infos, store, mode)
-                    interval_start = 0.90 + 0.09 * variant_index / max(1, len(modes))
-                    interval_span = 0.09 / max(1, len(modes))
-                    if two_pass:
-                        if s.refit_local_norm_per_weighting:
-                            for norm in store.norms:
-                                norm.scale_map = None
-                                norm.offset_map = None
-                            first = stack_store(
+                    try:
+                        self.compute_weights(infos, store, mode)
+                        interval_start = 0.90 + 0.09 * variant_index / max(1, len(modes))
+                        interval_span = 0.09 / max(1, len(modes))
+                        if two_pass:
+                            if s.refit_local_norm_per_weighting:
+                                for norm in store.norms:
+                                    norm.scale_map = None
+                                    norm.offset_map = None
+                                first = stack_store(
+                                    store,
+                                    self.backend,
+                                    s.stack,
+                                    lambda f, m, start=interval_start, span=interval_span: self.progress(start + span * 0.4 * f, f"{mode}: {m}"),
+                                    label=f"Stacking {mode} (pass 1)",
+                                    cancel_cb=self._check_cancel,
+                                )
+                                self.status(f"Fitting local normalisation for {mode}")
+                                self._fit_local_norm(store, first.image, interval_start + interval_span * 0.4, interval_span * 0.2)
+                            else:
+                                store.norms = copy.deepcopy(base_norms)
+                                self.status(f"Reusing primary local normalisation maps for {mode}")
+                            variant = stack_store(
                                 store,
                                 self.backend,
                                 s.stack,
-                                lambda f, m, start=interval_start, span=interval_span: self.progress(start + span * 0.4 * f, f"{mode}: {m}"),
-                                label=f"Stacking {mode} (pass 1)",
+                                lambda f, m, start=interval_start, span=interval_span: self.progress(start + span * f, f"{mode}: {m}"),
+                                label=f"Stacking {mode} ({'pass 2' if s.refit_local_norm_per_weighting else 'local norm'})",
+                                cancel_cb=self._check_cancel,
                             )
-                            self.status(f"Fitting local normalisation for {mode}")
-                            self._fit_local_norm(store, first.image, interval_start + interval_span * 0.4, interval_span * 0.2)
                         else:
-                            store.norms = copy.deepcopy(base_norms)
-                            self.status(f"Reusing primary local normalisation maps for {mode}")
-                        variant = stack_store(
-                            store,
-                            self.backend,
-                            s.stack,
-                            lambda f, m, start=interval_start, span=interval_span: self.progress(start + span * f, f"{mode}: {m}"),
-                            label=f"Stacking {mode} ({'pass 2' if s.refit_local_norm_per_weighting else 'local norm'})",
-                        )
-                    else:
-                        variant = stack_store(
-                            store,
-                            self.backend,
-                            s.stack,
-                            lambda f, m, start=interval_start, span=interval_span: self.progress(start + span * f, f"{mode}: {m}"),
-                            label=f"Stacking {mode}",
-                        )
-                    if result.crop_box is not None:
-                        variant.image = apply_box(variant.image, result.crop_box)
-                    variant_noise = stack_noise(variant.image)
-                    variant_weights = [f.weight for f in infos if f.rejected_reason is None and f.store_index is not None]
-                    variant_header = [item for item in header_items if item[0] not in ("NEFF", "REJFRAC", "WEIGHTMD", "BGNOISE")]
-                    variant_header.extend([
-                        ("NEFF", round(effective_frames(variant_weights), 2), "Effective frames (sum w)^2/sum w^2"),
-                        ("REJFRAC", round(variant.rejection_fraction, 6), "Rejected sample fraction"),
-                        ("WEIGHTMD", mode, "Frame weighting"),
-                        ("BGNOISE", round(variant_noise, 4), "Background noise of stack [ADU]"),
-                    ])
-                    variant_path = weighting_output_path(output_base, mode)
-                    save_fits(variant_path, variant.image, variant_header, infos[ref_index].meta.header)
-                    weighting_outputs[mode] = variant_path
-                    self.status(f"Saved {mode} master -> {variant_path}")
-                    self._plate_solve(variant_path)
+                            variant = stack_store(
+                                store,
+                                self.backend,
+                                s.stack,
+                                lambda f, m, start=interval_start, span=interval_span: self.progress(start + span * f, f"{mode}: {m}"),
+                                label=f"Stacking {mode}",
+                                cancel_cb=self._check_cancel,
+                            )
+                        if result.crop_box is not None:
+                            variant.image = apply_box(variant.image, result.crop_box)
+                        variant_noise = stack_noise(variant.image)
+                        variant_weights = [f.weight for f in infos if f.rejected_reason is None and f.store_index is not None]
+                        variant_header = [item for item in header_items if item[0] not in ("NEFF", "REJFRAC", "WEIGHTMD", "BGNOISE")]
+                        variant_header.extend([
+                            ("NEFF", round(effective_frames(variant_weights), 2), "Effective frames (sum w)^2/sum w^2"),
+                            ("REJFRAC", round(variant.rejection_fraction, 6), "Rejected sample fraction"),
+                            ("WEIGHTMD", mode, "Frame weighting"),
+                            ("BGNOISE", round(variant_noise, 4), "Background noise of stack [ADU]"),
+                        ])
+                        variant_path = weighting_output_path(output_base, mode)
+                        save_fits(variant_path, variant.image, variant_header, infos[ref_index].meta.header)
+                        weighting_outputs[mode] = variant_path
+                        product_statuses[f"weighting_{mode}"] = {"status": "complete", "path": str(variant_path)}
+                        self.status(f"Saved {mode} master -> {variant_path}")
+                        self._plate_solve(variant_path)
+                    except Exception as exc:
+                        if self._cancel:
+                            raise
+                        product_statuses[f"weighting_{mode}"] = {
+                            "status": "failed",
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "retry": "Rerun with this weighting mode to regenerate its master; completed products are retained.",
+                        }
+                        self.status(f"{mode} weighting failed; completed products retained: {exc}")
                 store.norms = base_norms
                 for info, weight in zip(infos, base_frame_weights):
                     info.weight = weight
@@ -768,15 +1343,45 @@ class StackingPipeline:
             mf_result = None
             drz_out = None
             if s.drizzle.enabled:
-                drz_out = self._run_drizzle(store, infos, header_items, result.crop_box)
+                try:
+                    drz_out, drizzle_weight_path, drizzle_weight_error = self._run_drizzle(store, infos, header_items, result.crop_box)
+                    product_statuses["drizzle"] = {"status": "complete", "path": str(drz_out)}
+                    if drizzle_weight_path is not None:
+                        product_statuses["drizzle_weight"] = {"status": "complete", "path": str(drizzle_weight_path)}
+                    else:
+                        product_statuses["drizzle_weight"] = {
+                            "status": "failed",
+                            "error": drizzle_weight_error or "Drizzle weight map was not written",
+                            "retry": "Rerun drizzle to regenerate its weight map; the drizzle image is retained.",
+                        }
+                except Exception as exc:
+                    if self._cancel:
+                        raise
+                    product_statuses["drizzle"] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}", "retry": "Rerun from the original light frames after resolving the error."}
+                    product_statuses["drizzle_weight"] = {"status": "not_run", "reason": "Drizzle image generation did not complete."}
+                    self.status(f"Drizzle failed; master retained: {exc}")
             if s.mfdeconv is not None:
-                mf_out, mf_result = self._run_mfdeconv(store, infos, s.mfdeconv, header_items, result.crop_box, result.image)
-            csv_path = self._write_csv(infos)
-            report = self._write_report(infos, ref_index, result, mf_result, flips, noise, n_eff, drz_out, tilt, weighting_outputs)
+                try:
+                    mf_out, mf_result = self._run_mfdeconv(store, infos, s.mfdeconv, header_items, result.crop_box, result.image)
+                    product_statuses["mfdeconv"] = {"status": "complete", "path": str(mf_out)}
+                except Exception as exc:
+                    if self._cancel:
+                        raise
+                    product_statuses["mfdeconv"] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}", "retry": "Rerun from the original light frames after resolving the error."}
+                    self.status(f"MFDeconv failed; master retained: {exc}")
+            csv_path = None
+            try:
+                csv_path = self._write_csv(infos)
+                product_statuses["frames_csv"] = {"status": "complete", "path": str(csv_path)}
+            except Exception as exc:
+                product_statuses["frames_csv"] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}", "retry": "Rerun the stack to regenerate frame diagnostics."}
+                self.status(f"Frame diagnostics CSV failed; master retained: {exc}")
+            report = self._write_report(infos, ref_index, result, mf_result, flips, noise, n_eff, drz_out, tilt, weighting_outputs, product_statuses)
             self.progress(1.0, "Done")
+            completed = True
             return PipelineResult(s.output, result, infos, ref_index, mf_out, mf_result, drz_out, report, csv_path, time.perf_counter() - t0, weighting_outputs)
         finally:
-            if not s.keep_registered:
+            if not from_registered_store and not s.keep_registered and (completed or not s.resume):
                 store.cleanup()
                 shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -833,7 +1438,7 @@ class StackingPipeline:
         self._plate_solve(out)
         return out, result
 
-    def _run_drizzle(self, store: FrameStore, infos: list[FrameInfo], header_items: list, crop_box) -> Path:
+    def _run_drizzle(self, store: FrameStore, infos: list[FrameInfo], header_items: list, crop_box) -> tuple[Path, Path | None, str | None]:
         s = self.settings
         d = s.drizzle
         channels, height, width = store.shape
@@ -880,10 +1485,17 @@ class StackingPipeline:
         out = s.output.with_name(s.output.stem + "_drizzle" + s.output.suffix)
         save_fits(out, image, items, infos[0].meta.header)
         wpath = s.output.with_name(s.output.stem + "_drizzle_weight" + s.output.suffix)
-        save_fits(wpath, weight, [("MAPTYPE", "drizzle_weight", "Accumulated drizzle weight"), ("DRIZSCL", d.scale, "")])
-        self.status(f"Saved drizzle -> {out} ({image.shape[2]}x{image.shape[1]} px); weight map -> {wpath.name}")
+        weight_error = None
+        try:
+            save_fits(wpath, weight, [("MAPTYPE", "drizzle_weight", "Accumulated drizzle weight"), ("DRIZSCL", d.scale, "")])
+        except Exception as exc:
+            if self._cancel:
+                raise
+            weight_error = f"{type(exc).__name__}: {exc}"
+            self.status(f"Drizzle weight map failed; drizzle image retained: {exc}")
+        self.status(f"Saved drizzle -> {out} ({image.shape[2]}x{image.shape[1]} px)")
         self._plate_solve(out)
-        return out
+        return out, None if weight_error else wpath, weight_error
 
     def _plate_solve(self, path: Path) -> None:
         s = self.settings
@@ -915,10 +1527,12 @@ class StackingPipeline:
                 {
                     "index": f.index,
                     "file": f.path.name,
+                    "report_schema_version": REPORT_SCHEMA_VERSION,
+                    "stacked": f.store_index is not None and f.rejected_reason is None,
                     "exposure_s": f.meta.exposure,
                     "focal_length_mm": _focal_length_mm(f.meta.header),
                     "stars": f.stars.total_detected,
-                    "bright_star_rate": _bright_star_flux(f) / f.meta.exposure if f.meta.exposure and f.meta.exposure > 0 else None,
+                    "bright_star_rate": f.bright_star_rate if f.bright_star_rate is not None else (_bright_star_flux(f) / f.meta.exposure if f.meta.exposure and f.meta.exposure > 0 else None),
                     "fwhm_px": None if not np.isfinite(f.fwhm) else round(f.fwhm, 3),
                     "fwhm_grid": None if f.fwhm_grid is None else " / ".join(" ".join("nan" if not np.isfinite(v) else f"{v:.2f}" for v in row) for row in f.fwhm_grid),
                     "fwhm_grid_counts": None if f.fwhm_count_grid is None else " / ".join(" ".join(str(int(v)) for v in row) for row in f.fwhm_count_grid),
@@ -944,10 +1558,13 @@ class StackingPipeline:
     def _write_csv(self, infos: list[FrameInfo]) -> Path:
         return write_frames_csv(self.settings.output.with_suffix(".frames.csv"), self._frame_rows(infos))
 
-    def _write_report(self, infos: list[FrameInfo], ref_index: int, stack: StackResult, mf: MFDeconvResult | None, flips: dict, noise: float, n_eff: float, drizzle_out: Path | None = None, tilt: dict | None = None, weighting_outputs: dict[str, Path] | None = None) -> Path:
+    def _write_report(self, infos: list[FrameInfo], ref_index: int, stack: StackResult, mf: MFDeconvResult | None, flips: dict, noise: float, n_eff: float, drizzle_out: Path | None = None, tilt: dict | None = None, weighting_outputs: dict[str, Path] | None = None, product_statuses: dict | None = None) -> Path:
         s = self.settings
         excluded = [f for f in infos if f.rejected_reason]
+        eligible = [f for f in infos if f.rejected_reason is None]
+        stacked = [f for f in eligible if f.store_index is not None]
         report = {
+            "schema_version": REPORT_SCHEMA_VERSION,
             "gpustacker": __version__,
             "backend": self.backend.describe(),
             "workers": {"detection_processes": self.cpu_workers, "loader_threads": self.io_workers},
@@ -964,11 +1581,12 @@ class StackingPipeline:
                 "stack": asdict(s.stack),
                 "drizzle": asdict(s.drizzle),
             },
+            "filter_baselines": self.filter_baselines,
             "drizzle_output": None if drizzle_out is None else str(drizzle_out),
             "weighting_outputs": {mode: str(path) for mode, path in (weighting_outputs or {}).items()},
             "stack": {
                 "method": s.stack.method,
-                "frames": len([f for f in infos if f.rejected_reason is None]),
+                "frames": len(stacked),
                 "effective_frames": n_eff,
                 "rejected_low": stack.rejected_low,
                 "rejected_high": stack.rejected_high,
@@ -978,6 +1596,24 @@ class StackingPipeline:
                 "crop_box": None if stack.crop_box is None else {"y0": stack.crop_box[0], "y1": stack.crop_box[1], "x0": stack.crop_box[2], "x1": stack.crop_box[3]},
                 "coverage": None if stack.coverage is None else {"min": int(stack.coverage.min()), "max": int(stack.coverage.max()), "full_depth_fraction": float((stack.coverage == stack.coverage.max()).mean())},
             },
+            "frame_counts": {
+                "input": len(infos),
+                "eligible": len(eligible),
+                "stacked": len(stacked),
+                "excluded": len(excluded),
+            },
+            "per_frame_rejection_attribution": {
+                "available": False,
+                "scope": "Per-pixel low/high sample rejection is reported in aggregate and maps; it is not attributed to individual frames.",
+            },
+            "metric_definitions": {
+                "eligible": "Input frame without a whole-frame exclusion reason.",
+                "stacked": "Eligible frame successfully registered and present in the registered store.",
+                "rejected_low_high": "Per-pixel channel samples rejected by the stack combiner; not per-frame counts.",
+                "rejection_fraction": "(rejected_low + rejected_high) / total registered channel-pixel samples.",
+                "effective_frames": "(sum of frame weights)^2 / sum of squared frame weights.",
+            },
+            "products": product_statuses or {"master": {"status": "complete", "path": str(s.output)}},
             "excluded": {"count": len(excluded), "frames": [{"file": f.path.name, "reason": f.rejected_reason} for f in excluded]},
             "meridian_flip": flips,
             "fwhm_map": tilt or None,
@@ -995,5 +1631,5 @@ class StackingPipeline:
             "frames": self._frame_rows(infos),
         }
         path = s.output.with_suffix(".report.json")
-        path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+        write_json_atomic(path, report)
         return path
