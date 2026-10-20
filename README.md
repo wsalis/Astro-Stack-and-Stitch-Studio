@@ -35,23 +35,25 @@ see its limitations and security notes below.
 
 ```powershell
 cd W:\GPUStacker
-py -3.13 -m pip install -r requirements.txt
+py -3 -m pip install -r requirements.txt
 ```
 
-The requirements pin PyTorch 2.14.1 with CUDA 13.0. A compatible NVIDIA driver is
-required for GPU use; CPU fallback is automatic when CUDA is unavailable.
+GPUStacker supports Python 3.10 and newer. On Windows, `py -3` selects the latest installed
+Python 3 interpreter. Use the latest Python release with a wheel available for the pinned
+PyTorch 2.14.1 + CUDA 13.0 build; PyTorch support can lag a new Python release. A compatible
+NVIDIA driver is required for GPU use; CPU fallback is automatic when CUDA is unavailable.
 
 ## Run
 
 ```powershell
 # GUI
-py -3.13 run_gpustacker.py gui
+py -3 run_gpustacker.py gui
 
 # CLI: folder, files, or globs
-py -3.13 run_gpustacker.py stack "G:\Target\Lights" -o "G:\Target\stack.fit" --dark master_dark.fit --flat master_flat.fit
-py -3.13 run_gpustacker.py stack "G:\Target\Lights" -o out.fit --mfdeconv --mf-frames 12 --mf-iters 30
-py -3.13 run_gpustacker.py stack --help
-py -3.13 run_gpustacker.py compare master.fit reference.xisf --also master_weight-noise.fit --also master_weight-psfsw-field.fit
+py -3 run_gpustacker.py stack "G:\Target\Lights" -o "G:\Target\stack.fit" --dark master_dark.fit --flat master_flat.fit
+py -3 run_gpustacker.py stack "G:\Target\Lights" -o out.fit --mfdeconv --mf-frames 12 --mf-iters 30
+py -3 run_gpustacker.py stack --help
+py -3 run_gpustacker.py compare master.fit reference.xisf --also master_weight-noise.fit --also master_weight-psfsw-field.fit
 ```
 
 Key options: `--method {winsorized,gesd,sigma,percentile,median,none}`, `--sigma-low/high`,
@@ -236,7 +238,7 @@ the preset), `--mf-frames`, `--mf-blend` (0 = unchanged master, 1 = full deconvo
 ## Tests
 
 ```powershell
-py -3.13 -m pytest -q
+py -3 -m pytest -q
 ```
 
 ## License
