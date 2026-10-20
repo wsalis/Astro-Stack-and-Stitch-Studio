@@ -186,9 +186,14 @@ workers
       --no-filters. When enabled, thresholds are multiples of the session median; 0 disables that individual
       filter. Excluded frames are listed in the log with the reason and in <name>.frames.csv.
 
+      Mixed exposures (e.g. Seestar 20 s / 30 s / 60 s subs in one folder) are handled: transparency is
+      corrected for exposure before filtering, star-count and sky medians are taken per exposure group,
+      and the reference is chosen from the group with the most integration time. Weights and flux
+      scaling still use the raw measured flux (flux_ratio column), so short subs count for less.
+
 transp <  (default 0.6)
-  Exclude frames whose transparency (star flux relative to the session median) is below this.
-  Catches cloud and heavy haze.
+  Exclude frames whose transparency (exposure-corrected star flux relative to the session median) is
+  below this. Catches cloud and heavy haze.
 stars <  (default 0.6)
   Exclude frames with fewer detected stars than this fraction of the median (clouds, dew,
   tracking loss).

@@ -99,6 +99,8 @@ def normalize_layout(data: np.ndarray) -> np.ndarray:
     if arr.shape[0] not in (1, 3):
         raise ValueError(f"Expected 1 or 3 channels, got shape {arr.shape}")
     out = np.ascontiguousarray(arr, dtype=np.float32)
+    if np.issubdtype(arr.dtype, np.integer):
+        return out  # integer sources cannot hold NaN/inf; nan_to_num costs ~35 ms per 8 MP frame
     return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
 

@@ -79,7 +79,7 @@ def to_numpy(tensor: torch.Tensor) -> np.ndarray:
 
 
 def rows_per_band(n_frames: int, width: int, channels: int, budget_bytes: int, overhead: float = 6.0) -> int:
-    """Rows of a frame stack that fit in the budget, allowing for intermediates."""
+    """Rows of a frame stack that fit in the budget, allowing for intermediates (at least 1, at most 4096)."""
 
     per_row = n_frames * width * channels * 4 * overhead
-    return int(max(16, min(4096, budget_bytes // max(1, per_row))))
+    return int(max(1, min(4096, budget_bytes // max(1, per_row))))

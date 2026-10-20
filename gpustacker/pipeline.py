@@ -10,7 +10,9 @@ import time
 import copy
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
+from multiprocessing import shared_memory
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Literal
 
@@ -28,7 +30,7 @@ from .diagnostics import apply_box, crop_box_for, effective_frames, stack_noise,
 from .drizzle import DrizzleAccumulator, DrizzleSettings, drizzle_frame, new_accumulator
 from .io import FrameMeta, load_frame, load_meta, save_fits
 from .mfdeconv import MFDeconvResult, MFDeconvSettings, run_mfdeconv
-from .normalization import LocalNormSettings, fit_norm_maps, reference_block_stats
+from .normalization import LocalNormSettings, block_stats, fit_norm_maps, reference_block_stats
 from .platesolve import find_astap, solve_fits
 from .quality import WEIGHTING_CHOICES, FilterSettings, StarSet, aperture_flux, compute_weights, field_weight_factors, sample_field_grid, select_photometry_stars, transparency
 from .registration import Alignment, Interpolation, estimate_alignment, refine_alignment, source_coords_at, warp_to_reference
@@ -49,6 +51,23 @@ def _noop_status(_: str) -> None:
 
 def _noop_progress(_: float, __: str) -> None:
     pass
+
+
+def format_seconds(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, sec = divmod(int(round(seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m {sec:02d}s" if hours else f"{minutes}m {sec:02d}s"
+
+
+def exposure_key(exposure: float | None) -> float | None:
+    """Exposure rounded so that header jitter (29.999 vs 30.0) lands in one group; None if unknown."""
+
+    if exposure is None or not np.isfinite(exposure) or exposure <= 0:
+        return None
+    return float(round(exposure, 2))
 
 
 def blend_mfdeconv(master: np.ndarray, deconvolved: np.ndarray, strength: float) -> np.ndarray:
@@ -140,7 +159,8 @@ class FrameInfo:
     fwhm_grid: np.ndarray | None = None  # (cells, cells) median FWHM per sensor region, pre-registration
     alignment: Alignment | None = None
     weight: float = 1.0
-    transparency: float = float("nan")
+    transparency: float = float("nan")  # exposure-corrected sky clarity relative to the session (filtering)
+    flux_ratio: float = float("nan")  # raw star flux ratio to the reference (flux scaling and weighting)
     phot_stars: int = 0
     flux_scaled: bool = False  # normalisation scale came from star photometry (else noise ratio)
     rejected_reason: str | None = None
@@ -218,6 +238,53 @@ def _luma_tensor(image: torch.Tensor) -> torch.Tensor:
     return 0.2126 * image[0] + 0.7152 * image[1] + 0.0722 * image[2]
 
 
+_shm_attached: dict[str, shared_memory.SharedMemory] = {}
+
+
+def _analyse_shm(name: str, offset: int, shape: tuple[int, int], thresh_sigma: float) -> tuple[Stars, float, float]:
+    """analyse_frame on a luma plane that lives in a shared-memory slot (no 33 MB pickle per frame)."""
+
+    shm = _shm_attached.get(name)
+    if shm is None:
+        try:
+            shm = shared_memory.SharedMemory(name=name, track=False)  # the creator owns the segment
+        except TypeError:  # Python < 3.13
+            shm = shared_memory.SharedMemory(name=name)
+        _shm_attached[name] = shm
+    plane = np.ndarray(shape, dtype=np.float32, buffer=shm.buf, offset=offset)
+    return analyse_frame(plane, thresh_sigma)
+
+
+class _LumaRing:
+    """Fixed number of float32 (H, W) slots in shared memory for handing luma planes to worker processes."""
+
+    def __init__(self, slots: int, shape: tuple[int, int]) -> None:
+        self.shape = shape
+        self.slot_bytes = int(shape[0]) * int(shape[1]) * 4
+        self.shm = shared_memory.SharedMemory(create=True, size=max(1, slots * self.slot_bytes))
+        self.name = self.shm.name
+        self.slots = slots
+
+    def view(self, slot: int) -> np.ndarray:
+        return np.ndarray(self.shape, dtype=np.float32, buffer=self.shm.buf, offset=slot * self.slot_bytes)
+
+    def close(self) -> None:
+        try:
+            self.shm.close()
+            self.shm.unlink()
+        except Exception:
+            pass
+
+
+def _solve_alignment(stars: Stars, ref_stars: Stars, refine: bool) -> Alignment:
+    """Star-pattern alignment of one frame to the reference (CPU only; runs on the worker pool)."""
+
+    align = estimate_alignment(stars, ref_stars)
+    if refine:
+        align = refine_alignment(align, stars, ref_stars)
+    return align
+
+
 class StackingPipeline:
     def __init__(self, settings: PipelineSettings, status_cb: StatusCallback = _noop_status, progress_cb: ProgressCallback = _noop_progress) -> None:
         self.settings = settings
@@ -229,6 +296,7 @@ class StackingPipeline:
         self.cosmetic_stats = CosmeticStats()
         self._cosmetic_frames = 0
         self.filter_baselines: dict[str, dict] = {}
+        self.timings: dict[str, float] = {}
         self._cancel = False
         cores = os.cpu_count() or 2
         # beyond ~8 workers detection already outruns the GPU main thread, and large pools are flaky on Windows
@@ -243,6 +311,31 @@ class StackingPipeline:
     def _check_cancel(self) -> None:
         if self._cancel:
             raise RuntimeError("Cancelled")
+
+    @contextmanager
+    def _stage(self, name: str) -> Iterator[None]:
+        """Accumulate wall time per pipeline stage and log it on exit."""
+
+        t = time.perf_counter()
+        try:
+            yield
+        finally:
+            dt = time.perf_counter() - t
+            self.timings[name] = self.timings.get(name, 0.0) + dt
+            self.status(f"[timing] {name}: {format_seconds(dt)}")
+
+    def _log_timings(self, total: float) -> None:
+        if not self.timings:
+            return
+        self.status("Stage timings:")
+        accounted = 0.0
+        for name, dt in self.timings.items():
+            accounted += dt
+            self.status(f"    {name:<28s} {format_seconds(dt):>12s}  {100.0 * dt / max(total, 1e-9):5.1f}%")
+        other = total - accounted
+        if other > 0.5:
+            self.status(f"    {'other':<28s} {format_seconds(other):>12s}  {100.0 * other / max(total, 1e-9):5.1f}%")
+        self.status(f"    {'total':<28s} {format_seconds(total):>12s}")
 
     def _detection_pool(self):
         if self.cpu_workers <= 1:
@@ -321,46 +414,88 @@ class StackingPipeline:
 
         with ThreadPoolExecutor(self.io_workers) as loader, self._detection_pool() as pool:
             pending: list[tuple[int, Path, FrameMeta, tuple[int, int], Future]] = []
-            for i, (path, data, meta) in enumerate(self._prefetch(paths, loader)):
-                self._check_cancel()
-                tensor = self._calibrate_data(data, meta, path)
-                lum = to_numpy(_luma_tensor(tensor))
-                shape = (int(lum.shape[0]), int(lum.shape[1]))
-                del tensor, data
-                executor = inline if state["broken"] else pool
-                try:
-                    fut = executor.submit(analyse_frame, lum, self.settings.detection_sigma)
-                except BrokenProcessPool:
-                    state["broken"] = True
-                    fut = inline.submit(analyse_frame, lum, self.settings.detection_sigma)
-                pending.append((i, path, meta, shape, fut))
-                if i == 0 and self.cosmetic_enabled:
-                    self.status(f"Cosmetic correction: {self.cosmetic_stats.hot} hot / {self.cosmetic_stats.cold} cold pixels fixed in first frame")
-                while len(pending) >= max_inflight:
-                    collect(pending.pop(0))
-            for item in pending:
-                self._check_cancel()
-                collect(item)
+            # luma planes go to the detection processes through a shared-memory ring: piping 33 MB per
+            # frame capped the pool at ~70 ms/frame and starved the main thread's GPU work
+            ring: _LumaRing | None = None
+            use_ring = isinstance(pool, ProcessPoolExecutor)
+            try:
+                for i, (path, data, meta) in enumerate(self._prefetch(paths, loader)):
+                    self._check_cancel()
+                    tensor = self._calibrate_data(data, meta, path)
+                    lum_t = _luma_tensor(tensor)
+                    shape = (int(lum_t.shape[0]), int(lum_t.shape[1]))
+                    executor = inline if state["broken"] else pool
+                    slot = -1
+                    if use_ring and not state["broken"]:
+                        if ring is None:
+                            ring = _LumaRing(max_inflight + 1, shape)
+                        if ring.shape == shape:
+                            slot = i % ring.slots
+                            torch.from_numpy(ring.view(slot)).copy_(lum_t)  # device -> shared memory directly
+                    if slot >= 0:
+                        args = (_analyse_shm, ring.name, slot * ring.slot_bytes, shape, self.settings.detection_sigma)
+                    else:
+                        args = (analyse_frame, to_numpy(lum_t), self.settings.detection_sigma)
+                    del tensor, lum_t, data
+                    try:
+                        fut = executor.submit(*args)
+                    except BrokenProcessPool:
+                        state["broken"] = True
+                        if slot >= 0:
+                            args = (analyse_frame, ring.view(slot).copy(), self.settings.detection_sigma)
+                        fut = inline.submit(*args)
+                    pending.append((i, path, meta, shape, fut))
+                    if i == 0 and self.cosmetic_enabled:
+                        self.status(f"Cosmetic correction: {self.cosmetic_stats.hot} hot / {self.cosmetic_stats.cold} cold pixels fixed in first frame")
+                    while len(pending) >= max_inflight:
+                        collect(pending.pop(0))
+                for item in pending:
+                    self._check_cancel()
+                    collect(item)
+            finally:
+                if ring is not None:
+                    if isinstance(pool, ProcessPoolExecutor):
+                        pool.shutdown(wait=True, cancel_futures=True)  # workers must detach before the ring goes
+                    ring.close()
         self.backend.empty_cache()
         return [info for info in infos if info is not None]
 
     # ------------------------------------------------------------------ filters / reference / weights
 
     def apply_prefilters(self, infos: list[FrameInfo]) -> None:
-        """Star-count, background and FWHM filters (relative to the session median)."""
+        """Star-count, background and FWHM filters (relative to the session median).
+
+        Star counts and sky level scale with exposure, so with mixed exposures their medians are taken per
+        exposure group (falling back to the session median for groups too small to have one). FWHM does not.
+        """
 
         f = self.settings.filters
         usable = [i for i in infos if i.rejected_reason is None]
         star_counts = [i.stars.total_detected for i in usable if i.stars is not None]
         background_values = [i.background for i in usable if np.isfinite(i.background)]
         fwhm_values = [i.fwhm for i in usable if np.isfinite(i.fwhm)]
+        groups: dict[float | None, list[FrameInfo]] = {}
+        for i in usable:
+            groups.setdefault(exposure_key(i.meta.exposure if i.meta is not None else None), []).append(i)
+        per_exposure: dict[float | None, dict[str, float]] = {}
+        if len(groups) > 1:
+            for key, members in groups.items():
+                if len(members) >= 3:
+                    per_exposure[key] = {
+                        "frames": len(members),
+                        "median_stars": float(np.median([m.stars.total_detected for m in members])),
+                        "median_background": float(np.median([m.background for m in members])),
+                    }
         self.filter_baselines["prefilters"] = {
             "enabled": f.enabled,
             "candidate_frames": len(usable),
             "median_stars": float(np.median(star_counts)) if star_counts else None,
             "median_background": float(np.median(background_values)) if background_values else None,
             "median_fwhm_px": float(np.median(fwhm_values)) if fwhm_values else None,
+            "per_exposure": {("unknown" if k is None else f"{k:g}s"): v for k, v in per_exposure.items()} or None,
         }
+        if per_exposure:
+            self.status("Mixed exposures: star-count and sky filters use per-exposure medians: " + ", ".join(f"{'?' if k is None else f'{k:g}s'}: {v['frames']} frames, {v['median_stars']:.0f} stars, sky {v['median_background']:.0f}" for k, v in sorted(per_exposure.items(), key=lambda kv: (kv[0] is None, kv[0] or 0))))
         if not f.enabled:
             return
         if len(usable) < 3:
@@ -369,11 +504,14 @@ class StackingPipeline:
         med_bg = float(np.median([i.background for i in usable]))
         med_fwhm = float(np.nanmedian([i.fwhm for i in usable if np.isfinite(i.fwhm)] or [np.nan]))
         for i in usable:
+            group = per_exposure.get(exposure_key(i.meta.exposure if i.meta is not None else None))
+            g_stars = group["median_stars"] if group else med_stars
+            g_bg = group["median_background"] if group else med_bg
             reasons = []
-            if f.stars_min_ratio > 0 and i.stars.total_detected < f.stars_min_ratio * med_stars:
-                reasons.append(f"stars {i.stars.total_detected} < {f.stars_min_ratio:.0%} of median {med_stars:.0f}")
-            if f.background_max_ratio > 0 and med_bg > 0 and i.background > f.background_max_ratio * med_bg:
-                reasons.append(f"sky {i.background:.0f} > {f.background_max_ratio:.1f}x median {med_bg:.0f}")
+            if f.stars_min_ratio > 0 and i.stars.total_detected < f.stars_min_ratio * g_stars:
+                reasons.append(f"stars {i.stars.total_detected} < {f.stars_min_ratio:.0%} of median {g_stars:.0f}")
+            if f.background_max_ratio > 0 and g_bg > 0 and i.background > f.background_max_ratio * g_bg:
+                reasons.append(f"sky {i.background:.0f} > {f.background_max_ratio:.1f}x median {g_bg:.0f}")
             if f.fwhm_max_ratio > 0 and np.isfinite(med_fwhm) and np.isfinite(i.fwhm) and i.fwhm > f.fwhm_max_ratio * med_fwhm:
                 reasons.append(f"FWHM {i.fwhm:.2f} > {f.fwhm_max_ratio:.1f}x median {med_fwhm:.2f}")
             if reasons:
@@ -439,6 +577,16 @@ class StackingPipeline:
         usable = [f for f in infos if f.rejected_reason is None and np.isfinite(f.fwhm)]
         if not usable:
             raise ValueError("No usable frames (too few stars detected everywhere)")
+        # with mixed exposures, pick from the group carrying the most integration time: its deeper star
+        # catalogue registers every shorter sub, and the noise tie-break would otherwise favour short subs
+        by_exposure: dict[float | None, list[FrameInfo]] = {}
+        for f in usable:
+            by_exposure.setdefault(exposure_key(f.meta.exposure), []).append(f)
+        if len(by_exposure) > 1:
+            dominant = max(by_exposure.items(), key=lambda kv: (kv[0] or 0.0) * len(kv[1]))
+            if dominant[0] is not None and len(dominant[1]) >= 3:
+                usable = dominant[1]
+                self.status(f"Reference candidates limited to the {dominant[0]:g}s exposure group ({len(usable)} frames)")
         median_stars = float(np.median([f.stars.total_detected for f in usable]))
         pool = [f for f in usable if f.stars.total_detected >= 0.8 * median_stars] or usable
         # Exposure-normalized star flux avoids systematically favoring longer subs.
@@ -482,11 +630,13 @@ class StackingPipeline:
         if not usable:
             return
         mode = mode or self.settings.weighting
+        # the raw flux ratio is the frame's signal scale after normalisation, so (ratio / noise)^2 is its
+        # inverse variance; the exposure-corrected transparency would over-weight short subs
         w = compute_weights(
             mode,
             np.array([f.noise for f in usable]),
             np.array([f.fwhm for f in usable]),
-            np.array([f.transparency for f in usable]),
+            np.array([f.flux_ratio for f in usable]),
         )
         for f, wi in zip(usable, w):
             f.weight = float(wi)
@@ -494,7 +644,7 @@ class StackingPipeline:
             store.norms[f.store_index].weight_map = None
         if mode == "psfsw+field":
             self._set_field_weight_maps(infos, store)
-        unknown = sum(1 for f in usable if not np.isfinite(f.transparency))
+        unknown = sum(1 for f in usable if not np.isfinite(f.flux_ratio))
         note = f" ({unknown} frame(s) without transparency fell back to noise-only)" if mode.startswith("psfsw") and unknown else ""
         self.status(f"Weights ({mode}): min {w.min():.2f}, median {np.median(w):.2f}, max {w.max():.2f}{note}")
 
@@ -545,8 +695,41 @@ class StackingPipeline:
         self.status(f"Photometry on {len(self.phot)} reference stars (aperture r={self.phot.radius}px)")
         ref_norm: tuple[np.ndarray, np.ndarray] | None = None
         ref_flux_ch: list[np.ndarray] | None = None
+        ref_exposure = exposure_key(ref.meta.exposure)
         writes: list[Future] = []
-        with ThreadPoolExecutor(self.io_workers) as loader, ThreadPoolExecutor(2) as writer:
+        align_ahead = max(4, 4 * self.cpu_workers)
+        with ThreadPoolExecutor(self.io_workers) as loader, ThreadPoolExecutor(2) as writer, self._detection_pool() as align_pool:
+            # alignment is CPU work (astroalign) that used to serialise with the GPU warp; solve it ahead on the
+            # worker pool, a bounded window at a time, so the GPU loop only waits for an already-finished result
+            align_futures: dict[int, Future] = {}
+            align_queue = [f for f in order if f.index != reference_index]
+            align_next = 0
+            pool_state = {"broken": False}
+
+            def submit_alignments(limit: int) -> None:
+                nonlocal align_next
+                while align_next < len(align_queue) and len(align_futures) < limit:
+                    f = align_queue[align_next]
+                    align_next += 1
+                    executor = _InlineExecutor() if pool_state["broken"] else align_pool
+                    try:
+                        align_futures[f.index] = executor.submit(_solve_alignment, f.stars, ref.stars, self.settings.refine_registration)
+                    except BrokenProcessPool:
+                        pool_state["broken"] = True
+                        align_futures[f.index] = _InlineExecutor().submit(_solve_alignment, f.stars, ref.stars, self.settings.refine_registration)
+
+            def alignment_for(f: FrameInfo) -> Alignment:
+                submit_alignments(align_ahead)
+                fut = align_futures.pop(f.index)
+                try:
+                    return fut.result()
+                except BrokenProcessPool:
+                    if not pool_state["broken"]:
+                        pool_state["broken"] = True
+                        self.status("Alignment worker pool failed; continuing in-process for the remaining frames")
+                    return _solve_alignment(f.stars, ref.stars, self.settings.refine_registration)
+
+            submit_alignments(align_ahead)
             for n, (path, data, meta) in enumerate(self._prefetch([f.path for f in order], loader)):
                 self._check_cancel()
                 info = by_path[path]
@@ -554,10 +737,7 @@ class StackingPipeline:
                     info.alignment = Alignment.identity()
                 else:
                     try:
-                        align = estimate_alignment(info.stars, ref.stars)
-                        if self.settings.refine_registration:
-                            align = refine_alignment(align, info.stars, ref.stars)
-                        info.alignment = align
+                        info.alignment = alignment_for(info)
                     except Exception as exc:  # astroalign raises several types on failure
                         info.rejected_reason = f"alignment failed: {exc}"
                         self.status(f"Skipping {info.path.name}: {info.rejected_reason}")
@@ -574,7 +754,11 @@ class StackingPipeline:
                 flux = aperture_flux(lum, self.phot)
                 if self.phot.ref_flux is None:
                     self.phot.ref_flux = flux
-                info.transparency, info.phot_stars = transparency(flux, self.phot.ref_flux)
+                info.flux_ratio, info.phot_stars = transparency(flux, self.phot.ref_flux)
+                # expected flux ratio from exposure alone; 1 when either exposure is unknown
+                exposure = exposure_key(info.meta.exposure)
+                expected = exposure / ref_exposure if exposure is not None and ref_exposure is not None else 1.0
+                info.transparency = info.flux_ratio / expected
                 # flux scale from star photometry per channel (PI LocalNormalization >= 1.8.9 style): puts stars
                 # AND nebula of every frame on the reference's flux scale; the noise ratio is only a fallback
                 flux_ch = [aperture_flux(warped[c], self.phot) for c in range(channels)]
@@ -582,16 +766,23 @@ class StackingPipeline:
                     ref_flux_ch = flux_ch
                 t_ch = np.array([transparency(f, r)[0] for f, r in zip(flux_ch, ref_flux_ch)], dtype=np.float32)
                 noise_scale = ref_norm[1] / np.maximum(mad, 1e-12)
-                scale = np.where(np.isfinite(t_ch) & (t_ch > 0), 1.0 / np.clip(t_ch, 1 / 3, 3), noise_scale).astype(np.float32)
+                scale = np.where(np.isfinite(t_ch) & (t_ch > 0), 1.0 / np.clip(t_ch, expected / 3, expected * 3), noise_scale).astype(np.float32)
                 info.flux_scaled = bool(np.isfinite(t_ch).all())
                 info.store_index = len(store)
-                writes.append(store.add_async(info.path.name, to_numpy(warped), FrameNorm(offset=med, scale=scale, weight=1.0), writer))
+                norm = FrameNorm(offset=med, scale=scale, weight=1.0)
+                if self.settings.local_norm.enabled:
+                    # block statistics for the local-normalisation fit, taken now while the warped frame is
+                    # on the device instead of re-reading every registered frame from disk later
+                    norm.block_stats = tuple(t.cpu().numpy() for t in block_stats(warped, self.settings.local_norm.block))
+                writes.append(store.add_async(info.path.name, to_numpy(warped), norm, writer))
                 while len(writes) > 4:  # bound host memory held by queued writes
                     writes.pop(0).result()
                 a = info.alignment
                 refined = f" poly rms {a.residual_rms:.2f}px/{a.refined_matches}" if a.inverse_poly is not None else ""
                 flip = " FLIP" if a.flipped else ""
                 tr = f" T={info.transparency:.2f}" if np.isfinite(info.transparency) else ""
+                if np.isfinite(info.flux_ratio) and expected != 1.0:
+                    tr += f" flux {info.flux_ratio:.2f}x (exp {expected:.2f}x)"
                 self.status(f"Registered {info.path.name}: shift ({a.shift[0]:+.1f}, {a.shift[1]:+.1f}) rot {a.rotation_deg:+.2f}°{flip} matched {a.matched}{refined}{tr}")
                 self.progress(0.2 + 0.35 * (n + 1) / total, f"Registering {n + 1}/{total}")
                 del tensor, warped, lum, data
@@ -607,8 +798,11 @@ class StackingPipeline:
         n = len(store)
         for i, path in enumerate(store.paths):
             self._check_cancel()
-            frame = torch.from_numpy(np.load(path)).to(self.backend.device)
-            scale_map, offset_map = fit_norm_maps(frame, ref_med, ref_mad, ref_frac, ln, scale=store.norms[i].scale)
+            stats = store.norms[i].block_stats
+            if stats is not None and stats[0].shape[0] != reference.shape[0]:
+                stats = None  # taken for a different channel count (should not happen); refit from disk
+            frame = None if stats is not None else torch.from_numpy(np.load(path)).to(self.backend.device)
+            scale_map, offset_map = fit_norm_maps(frame, ref_med, ref_mad, ref_frac, ln, scale=store.norms[i].scale, stats=stats)
             store.norms[i].scale_map = scale_map
             store.norms[i].offset_map = offset_map
             del frame
@@ -711,6 +905,7 @@ class StackingPipeline:
             "alignment": alignment_data,
             "weight": self._checkpoint_float(info.weight),
             "transparency": self._checkpoint_float(info.transparency),
+            "flux_ratio": self._checkpoint_float(info.flux_ratio),
             "phot_stars": info.phot_stars,
             "flux_scaled": info.flux_scaled,
             "rejected_reason": info.rejected_reason,
@@ -871,6 +1066,7 @@ class StackingPipeline:
                     alignment=alignment,
                     weight=1.0 if item["weight"] is None else float(item["weight"]),
                     transparency=float("nan") if item["transparency"] is None else float(item["transparency"]),
+                    flux_ratio=float("nan") if item.get("flux_ratio", item["transparency"]) is None else float(item.get("flux_ratio", item["transparency"])),
                     phot_stars=int(item["phot_stars"]),
                     flux_scaled=bool(item["flux_scaled"]),
                     rejected_reason=item["rejected_reason"],
@@ -1126,6 +1322,7 @@ class StackingPipeline:
                         alignment=None,
                         weight=1.0,
                         transparency=float("nan"),
+                        flux_ratio=float("nan"),
                         phot_stars=0,
                         flux_scaled=False,
                         rejected_reason=rejected,
@@ -1134,31 +1331,35 @@ class StackingPipeline:
                 self.status(f"Reusing analysis for {len(infos)} frame(s)")
                 s.analysis_cache = None
             else:
-                infos = self.analyse()
-            self.apply_prefilters(infos)
-            tilt = self.tilt_summary(infos)
-            ref_index = self.choose_reference(infos)
-            self.status(f"Reference frame: {infos[ref_index].path.name}")
+                with self._stage("analyse"):
+                    infos = self.analyse()
+            with self._stage("prefilter + reference"):
+                self.apply_prefilters(infos)
+                tilt = self.tilt_summary(infos)
+                ref_index = self.choose_reference(infos)
+                self.status(f"Reference frame: {infos[ref_index].path.name}")
 
-            probe, _ = self._load_calibrated(infos[ref_index].path)
-            shape = tuple(int(v) for v in probe.shape)
-            del probe
+                probe, _ = self._load_calibrated(infos[ref_index].path)
+                shape = tuple(int(v) for v in probe.shape)
+                del probe
             store = FrameStore(work_dir, shape)  # type: ignore[arg-type]
         completed = False
         try:
             if not resuming and not from_registered_store:
-                self.register(infos, ref_index, store)
+                with self._stage("register"):
+                    self.register(infos, ref_index, store)
                 if len(store) == 0:
                     raise ValueError("No frames could be registered")
-                self.apply_transparency_filter(infos, store)
-                if len(store) == 0:
-                    raise ValueError("All frames were excluded by the transparency filter")
-                self.compute_weights(infos, store)
-                flips = self._flip_summary(infos)
-                if s.resume:
-                    self._save_registered_checkpoint(work_dir, store, infos, ref_index, tilt, fingerprints)
-                else:
-                    store.save_index()
+                with self._stage("transparency + weights"):
+                    self.apply_transparency_filter(infos, store)
+                    if len(store) == 0:
+                        raise ValueError("All frames were excluded by the transparency filter")
+                    self.compute_weights(infos, store)
+                    flips = self._flip_summary(infos)
+                    if s.resume:
+                        self._save_registered_checkpoint(work_dir, store, infos, ref_index, tilt, fingerprints)
+                    else:
+                        store.save_index()
             if (s.keep_registered or s.distributed_enabled) and not from_registered_store:
                 self._save_registered_store_manifest(work_dir, store, infos, ref_index, tilt)
 
@@ -1178,20 +1379,23 @@ class StackingPipeline:
                 else:
                     self.status(f"Stacking {len(store)} frames with {s.stack.method} rejection" + (" (pass 1 of 2, global normalisation)" if two_pass else ""))
                     span = 0.13 if two_pass else 0.3
-                    result = self._stack_store(store, "Stacking", "global", lambda f, m: self.progress(0.55 + span * f, m), reject_masks=want_masks and not two_pass, cancel_cb=self._check_cancel)
+                    with self._stage("stack pass 1 (global)" if two_pass else "stack"):
+                        result = self._stack_store(store, "Stacking", "global", lambda f, m: self.progress(0.55 + span * f, m), reject_masks=want_masks and not two_pass, cancel_cb=self._check_cancel)
                     first_pass_image = result.image
                     if two_pass and s.resume:
                         self._save_global_stack_checkpoint(work_dir, store, infos, ref_index, tilt, fingerprints, first_pass_image)
                 if two_pass:
                     if resume_stage != "local_norm_before_final_stack":
                         self.status("Fitting local normalisation maps against the first-pass stack")
-                        self._fit_local_norm(store, first_pass_image)
+                        with self._stage("local norm fit"):
+                            self._fit_local_norm(store, first_pass_image)
                         if s.distributed_enabled:
                             store.save_index()
                         if s.resume:
                             self._save_local_norm_checkpoint(work_dir, store, infos, ref_index, tilt, fingerprints, first_pass_image)
                     self.status(f"Stacking pass 2 of 2 with local normalisation ({s.local_norm.block}px blocks)")
-                    result = self._stack_store(store, "Stacking (local norm)", "local", lambda f, m: self.progress(0.75 + 0.1 * f, m), reject_masks=want_masks, cancel_cb=self._check_cancel)
+                    with self._stage("stack pass 2 (local norm)"):
+                        result = self._stack_store(store, "Stacking (local norm)", "local", lambda f, m: self.progress(0.75 + 0.1 * f, m), reject_masks=want_masks, cancel_cb=self._check_cancel)
 
             crop_items: list[tuple] = []
             if resume_stage == "master_before_optional_products" and result.crop_box is not None:
@@ -1235,13 +1439,14 @@ class StackingPipeline:
             if exposures and exposures[0]:
                 header_items.append(("EXPTIME", float(sum(exposures)), "Total exposure [s]"))
             product_statuses = {}
-            save_fits(s.output, result.image, header_items, infos[ref_index].meta.header)
-            product_statuses["master"] = {"status": "complete", "path": str(s.output)}
-            if s.resume:
-                self._save_master_checkpoint(work_dir, store, infos, ref_index, tilt, fingerprints, result)
-            gain = med_frame_noise / noise if noise > 0 and np.isfinite(med_frame_noise) else float("nan")
-            self.status(f"Saved stack -> {s.output} (rejected {result.rejection_fraction * 100:.2f}%, noise {noise:.3g} ADU = {gain:.1f}x better than a single sub, N_eff {n_eff:.1f})")
-            self._plate_solve(s.output)
+            with self._stage("save master + plate solve"):
+                save_fits(s.output, result.image, header_items, infos[ref_index].meta.header)
+                product_statuses["master"] = {"status": "complete", "path": str(s.output)}
+                if s.resume:
+                    self._save_master_checkpoint(work_dir, store, infos, ref_index, tilt, fingerprints, result)
+                gain = med_frame_noise / noise if noise > 0 and np.isfinite(med_frame_noise) else float("nan")
+                self.status(f"Saved stack -> {s.output} (rejected {result.rejection_fraction * 100:.2f}%, noise {noise:.3g} ADU = {gain:.1f}x better than a single sub, N_eff {n_eff:.1f})")
+                self._plate_solve(s.output)
             if s.save_maps and result.coverage is not None:
                 map_outputs = (
                     ("coverage_map", s.output.with_name(s.output.stem + "_coverage" + s.output.suffix), result.coverage.astype(np.float32), ("MAPTYPE", "coverage", "Valid frames per pixel")),
@@ -1344,7 +1549,8 @@ class StackingPipeline:
             drz_out = None
             if s.drizzle.enabled:
                 try:
-                    drz_out, drizzle_weight_path, drizzle_weight_error = self._run_drizzle(store, infos, header_items, result.crop_box)
+                    with self._stage("drizzle"):
+                        drz_out, drizzle_weight_path, drizzle_weight_error = self._run_drizzle(store, infos, header_items, result.crop_box)
                     product_statuses["drizzle"] = {"status": "complete", "path": str(drz_out)}
                     if drizzle_weight_path is not None:
                         product_statuses["drizzle_weight"] = {"status": "complete", "path": str(drizzle_weight_path)}
@@ -1362,7 +1568,8 @@ class StackingPipeline:
                     self.status(f"Drizzle failed; master retained: {exc}")
             if s.mfdeconv is not None:
                 try:
-                    mf_out, mf_result = self._run_mfdeconv(store, infos, s.mfdeconv, header_items, result.crop_box, result.image)
+                    with self._stage("mfdeconv"):
+                        mf_out, mf_result = self._run_mfdeconv(store, infos, s.mfdeconv, header_items, result.crop_box, result.image)
                     product_statuses["mfdeconv"] = {"status": "complete", "path": str(mf_out)}
                 except Exception as exc:
                     if self._cancel:
@@ -1379,11 +1586,14 @@ class StackingPipeline:
             report = self._write_report(infos, ref_index, result, mf_result, flips, noise, n_eff, drz_out, tilt, weighting_outputs, product_statuses)
             self.progress(1.0, "Done")
             completed = True
-            return PipelineResult(s.output, result, infos, ref_index, mf_out, mf_result, drz_out, report, csv_path, time.perf_counter() - t0, weighting_outputs)
+            total = time.perf_counter() - t0
+            self._log_timings(total)
+            return PipelineResult(s.output, result, infos, ref_index, mf_out, mf_result, drz_out, report, csv_path, total, weighting_outputs)
         finally:
             if not from_registered_store and not s.keep_registered and (completed or not s.resume):
-                store.cleanup()
-                shutil.rmtree(work_dir, ignore_errors=True)
+                with self._stage("cleanup"):
+                    store.cleanup()
+                    shutil.rmtree(work_dir, ignore_errors=True)
 
     def _run_mfdeconv(self, store: FrameStore, infos: list[FrameInfo], settings: MFDeconvSettings, header_items: list, crop_box, master_image: np.ndarray) -> tuple[Path, MFDeconvResult]:
         by_name = {f.path.name: f for f in infos}
@@ -1539,6 +1749,7 @@ class StackingPipeline:
                     "noise": round(f.noise, 4),
                     "background": round(f.background, 2),
                     "transparency": None if not np.isfinite(f.transparency) else round(f.transparency, 4),
+                    "flux_ratio": None if not np.isfinite(f.flux_ratio) else round(f.flux_ratio, 4),
                     "phot_stars": f.phot_stars,
                     "flux_scaled": f.flux_scaled,
                     "weight": round(f.weight, 4) if f.rejected_reason is None else None,
@@ -1582,6 +1793,7 @@ class StackingPipeline:
                 "drizzle": asdict(s.drizzle),
             },
             "filter_baselines": self.filter_baselines,
+            "timings_s": {name: round(dt, 2) for name, dt in self.timings.items()},
             "drizzle_output": None if drizzle_out is None else str(drizzle_out),
             "weighting_outputs": {mode: str(path) for mode, path in (weighting_outputs or {}).items()},
             "stack": {

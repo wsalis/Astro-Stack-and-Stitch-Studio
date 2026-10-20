@@ -338,7 +338,7 @@ def _execute_stack_band_task(
             raise WorkerProbeError("Registered-store fingerprint changed before task execution")
         if store_cache.get("fingerprint") != current_fingerprint:
             store_cache["store"] = FrameStore.load_index(store_path)
-            store_cache["maps"] = store_cache["store"].memmaps()
+            store_cache["maps"] = store_cache["store"].band_reader()
             store_cache["fingerprint"] = current_fingerprint
         store = store_cache["store"]
         if task.row_stop > store.shape[1]:
@@ -705,7 +705,7 @@ def stack_store_distributed(
     retry_locally: deque[StackBandTask] = deque()
     completed_rows = 0
     lock = threading.Lock()
-    frame_maps = store.memmaps()
+    frame_maps = store.band_reader()
     remote_enabled = True
     image = np.empty((channels, height, width), dtype=np.float32)
     coverage = np.empty((height, width), dtype=np.uint16)

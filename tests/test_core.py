@@ -27,6 +27,36 @@ def test_stack_store_per_channel_normalisation(tmp_path):
     assert np.allclose(out, base, atol=1e-3)  # colour cast of the second frame fully removed
 
 
+def test_local_norm_maps_band_upsample_matches_full_interpolation():
+    """Band-wise grid_sample must reproduce per-frame full-frame bilinear interpolation + row slice."""
+
+    import torch.nn.functional as F
+    from gpustacker.stacking import LocalNormMaps
+
+    rng = np.random.default_rng(3)
+    n, channels, height, width = 5, 3, 70, 53
+    norms = []
+    for i in range(n):
+        if i == 2:
+            norms.append(FrameNorm())  # a frame without maps is left untouched
+            continue
+        norms.append(FrameNorm(scale_map=rng.uniform(0.8, 1.2, (channels, 3, 4)).astype(np.float32), offset_map=rng.normal(0, 50, (channels, 3, 4)).astype(np.float32)))
+    x = torch.from_numpy(rng.normal(1000, 30, (n, channels, height, width)).astype(np.float32))
+    expected = x.clone()
+    for i, norm in enumerate(norms):
+        if norm.scale_map is None:
+            continue
+        s_full = F.interpolate(torch.from_numpy(norm.scale_map).unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False)[0]
+        o_full = F.interpolate(torch.from_numpy(norm.offset_map).unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False)[0]
+        expected[i] = expected[i] * s_full + o_full
+    maps = LocalNormMaps(norms, channels, torch.device("cpu"), max_chunk_bytes=4 * width * 16 * 4 * 2)  # force several chunks
+    got = x.clone()
+    for r0, r1 in ((0, 16), (16, 32), (32, 48), (48, 64), (64, 70)):
+        maps.apply_(got[:, :, r0:r1, :], r0, height)
+    torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-2)
+    assert not LocalNormMaps([FrameNorm(), FrameNorm()], channels, torch.device("cpu")).enabled
+
+
 def test_stack_store_bands_match_full_stack_with_local_norm_weights_and_masks(tmp_path):
     from gpustacker.backend import select_backend
 
@@ -429,6 +459,74 @@ def test_vng_keeps_star_sharper_than_bilinear():
     bil = debayer_bilinear(cfa, "RGGB").mean(dim=0)
     assert float(vng.max()) > float(bil.max())
     assert abs(float(vng.max()) - truth_peak) < abs(float(bil.max()) - truth_peak)
+
+
+def _vng_reference(cfa: torch.Tensor, pattern: str) -> torch.Tensor:
+    """Original straightforward VNG implementation, kept as the oracle for the tiled/shared-plane version."""
+
+    import torch.nn.functional as F
+    from gpustacker.debayer import _DIRS, cfa_masks
+
+    _, height, width = cfa.shape
+    raw = cfa[0]
+    pad = 3
+    rp = F.pad(raw.view(1, 1, height, width), (pad, pad, pad, pad), mode="reflect")[0, 0]
+
+    def at(dy: int, dx: int) -> torch.Tensor:
+        return rp[pad + dy : pad + dy + height, pad + dx : pad + dx + width]
+
+    grads = []
+    for dy, dx in _DIRS:
+        if dy == 0 or dx == 0:
+            py, px = dx, dy
+            g = (at(dy, dx) - at(-dy, -dx)).abs() + (at(2 * dy, 2 * dx) - at(0, 0)).abs()
+            g = g + 0.5 * ((at(dy + py, dx + px) - at(-dy + py, -dx + px)).abs() + (at(dy - py, dx - px) - at(-dy - py, -dx - px)).abs())
+            g = g + 0.5 * ((at(2 * dy + py, 2 * dx + px) - at(py, px)).abs() + (at(2 * dy - py, 2 * dx - px) - at(-py, -px)).abs())
+        else:
+            g = (at(dy, dx) - at(-dy, -dx)).abs() + (at(2 * dy, 2 * dx) - at(0, 0)).abs()
+            g = g + 0.5 * ((at(dy, 0) - at(0, -dx)).abs() + (at(0, dx) - at(-dy, 0)).abs())
+            g = g + 0.5 * ((at(2 * dy, dx) - at(dy, 0)).abs() + (at(dy, 2 * dx) - at(0, dx)).abs())
+        grads.append(g)
+    grads = torch.stack(grads)
+    gmin, gmax = grads.min(dim=0).values, grads.max(dim=0).values
+    use = (grads <= 1.5 * gmin + 0.5 * (gmax - gmin)).float()
+    masks = cfa_masks(pattern, height, width, cfa.device)
+    bil = debayer_bilinear(cfa, pattern)
+    bp = F.pad(bil.unsqueeze(0), (2, 2, 2, 2), mode="reflect")[0]
+    diff_sum = torch.zeros((3, height, width), device=cfa.device, dtype=cfa.dtype)
+    for i, (dy, dx) in enumerate(_DIRS):
+        for step in (1, 2):
+            sy, sx = 2 + step * dy, 2 + step * dx
+            nb = bp[:, sy : sy + height, sx : sx + width]
+            nb_centre_colour = (nb * masks).sum(dim=0)
+            diff_sum += 0.5 * use[i] * (nb - nb_centre_colour)
+    rgb = raw.unsqueeze(0) + diff_sum / use.sum(dim=0)
+    return torch.where(masks > 0, raw.unsqueeze(0).expand_as(rgb), rgb)
+
+
+@pytest.mark.parametrize("pattern", ["RGGB", "GRBG", "BGGR", "GBRG"])
+def test_vng_tiled_matches_reference(pattern):
+    """Shared-plane gradients and row tiling must reproduce the plain implementation (odd sizes too)."""
+
+    from gpustacker.debayer import debayer_vng
+
+    rng = np.random.default_rng(3)
+    height, width = 601, 83  # several 256-row tiles with a short last one; odd width
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    scene = 500.0 + 20.0 * (xx / width) + rng.normal(0, 3, (height, width)).astype(np.float32)
+    for _ in range(40):  # stars of different colours
+        cy, cx = rng.uniform(0, height), rng.uniform(0, width)
+        scene += rng.uniform(300, 3000) * np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * rng.uniform(0.7, 1.6) ** 2)).astype(np.float32)
+    tint = np.ones((height, width), np.float32)
+    tint[0::2, 1::2] *= 1.3
+    tint[1::2, 0::2] *= 0.8
+    cfa = torch.from_numpy((scene * tint).astype(np.float32))[None]
+    devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+    for device in devices:
+        x = cfa.to(device)
+        expected = _vng_reference(x, pattern)
+        actual = debayer_vng(x, pattern)
+        assert torch.allclose(actual, expected, rtol=1e-5, atol=1e-2), f"{device}: max diff {(actual - expected).abs().max():.4g}"
 
 
 def test_sigma_clip_rejects_outlier():

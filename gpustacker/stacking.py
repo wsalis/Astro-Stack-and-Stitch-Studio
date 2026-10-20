@@ -41,6 +41,8 @@ class FrameNorm:
     scale_map: np.ndarray | None = None
     offset_map: np.ndarray | None = None
     weight_map: np.ndarray | None = None  # low-resolution spatial quality weights on the reference grid
+    # (median, MAD-sigma, valid fraction) per local-normalisation block, (C, bh, bw) each, taken at registration
+    block_stats: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
 
 
 def norm_vec(value: float | np.ndarray, channels: int) -> np.ndarray:
@@ -90,6 +92,9 @@ class FrameStore:
 
     def memmaps(self) -> list[np.memmap]:
         return [np.load(p, mmap_mode="r") for p in self.paths]
+
+    def band_reader(self, workers: int = 8) -> "BandReader":
+        return BandReader(self.paths, self.shape, workers)
 
     @classmethod
     def load_index(cls, directory: Path, allow_missing: bool = False) -> "FrameStore":
@@ -462,22 +467,70 @@ def gesd_critical_table(n_max: int, k: int, alpha: float) -> np.ndarray:
         return cached
     from scipy.stats import t as student_t
 
-    table = np.full((k, n_max + 1), np.inf, dtype=np.float32)
-    for n in range(3, n_max + 1):
-        for i in range(1, min(k, n - 2) + 1):
-            dof = n - i - 1
-            p = 1.0 - alpha / (2.0 * (n - i + 1))
-            tv = student_t.ppf(p, dof)
-            table[i - 1, n] = (n - i) * tv / np.sqrt((dof + tv * tv) * (n - i + 1))
+    # lambda depends only on m = n - i, so evaluate the t quantile once per m instead of per (i, n)
+    # (the per-cell loop was 14.7M scalar ppf calls ≈ 6 min at n_max=7000, k=2100).
+    m = np.arange(2, n_max + 1, dtype=np.float64)
+    dof = m - 1.0
+    tv = student_t.ppf(1.0 - alpha / (2.0 * (m + 1.0)), dof)
+    lam = np.full(n_max + 1, np.inf)
+    lam[2:] = m * tv / np.sqrt((dof + tv * tv) * (m + 1.0))
+    mi = np.arange(n_max + 1)[None, :] - np.arange(1, k + 1)[:, None]
+    table = np.where(mi >= 2, lam[np.clip(mi, 0, n_max)], np.inf).astype(np.float32)
     _GESD_TABLE_CACHE[key] = table
     return table
+
+
+# Graph replay measured slower than eager (7.1 s vs 5.0 s at N=853; 357 s vs 15 s at N=7000 once the
+# graph pool pushed the device past its 8 GB) so it is disabled unless explicitly lowered.
+GRAPH_MIN_STEPS = 1 << 62
+_graph_stats = {"captured": 0, "fallback": 0, "last_error": None}  # diagnostics for _run_steps
+
+
+def _run_steps(body: Callable[[], None], steps: int, state: tuple[torch.Tensor, ...]) -> None:
+    """Run ``body`` ``steps`` times. On CUDA the body (a few dozen tiny kernels on in-place state) is
+    captured once into a CUDA graph and replayed, which removes the per-kernel launch cost that
+    otherwise dominates for thousands of steps per band. Falls back to an eager loop anywhere else."""
+
+    if steps <= 0:
+        return
+    device = state[0].device
+    if device.type != "cuda" or steps < GRAPH_MIN_STEPS or not hasattr(torch.cuda, "CUDAGraph"):
+        for _ in range(steps):
+            body()
+        return
+    saved = [t.clone() for t in state]
+    try:
+        side = torch.cuda.Stream(device=device)
+        side.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(side):
+            body()  # warm-up (lazy kernel loading) on a side stream, as capture requires
+        torch.cuda.current_stream(device).wait_stream(side)
+        for t, s in zip(state, saved):
+            t.copy_(s)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=side):
+            body()
+    except Exception as exc:
+        _graph_stats["fallback"] += 1
+        _graph_stats["last_error"] = exc
+        for t, s in zip(state, saved):
+            t.copy_(s)
+        for _ in range(steps):
+            body()
+        return
+    _graph_stats["captured"] += 1
+    for _ in range(steps):
+        graph.replay()
 
 
 def _gesd_clip(x: torch.Tensor, max_frac: float, alpha: float, low_relax: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generalized Extreme Studentized Deviate test, vectorised over pixels.
 
-    The most extreme sample is always the current min or max, so each pixel is sorted once
-    and the test walks inward with running sums: O(N log N) sort + O(k) cheap steps.
+    The most extreme sample is always the current min or max, so each pixel is sorted once and the
+    test walks inward with running sums: O(N log N) sort + k cheap steps on (pixels,) vectors.
+    Only the accepted step count and its low/high split are kept per pixel, so device memory stays
+    at ~4x the band regardless of k. Steps past a pixel's valid sample count are neutralised by the
+    critical table (lambda = inf there), which removes all per-step masking from the loop.
     """
 
     n = x.shape[0]
@@ -487,56 +540,70 @@ def _gesd_clip(x: torch.Tensor, max_frac: float, alpha: float, low_relax: float)
     flat = x.reshape(n, -1)
     pixels = flat.shape[1]
     device = x.device
-    median = torch.nanmedian(flat, dim=0).values
-    shifted = flat - median  # small magnitudes keep the running sums precise
-    sorted_vals, sort_idx = torch.sort(shifted, dim=0)  # NaN sorts last
-    sort_idx = sort_idx.to(torch.int32)
-    valid = ~torch.isnan(shifted)
-    count = valid.sum(dim=0).to(torch.float64)
-    n_valid = count.to(torch.long)
-    s1 = torch.where(valid, shifted, torch.zeros_like(shifted)).sum(dim=0, dtype=torch.float64)
-    s2 = torch.where(valid, shifted * shifted, torch.zeros_like(shifted)).sum(dim=0, dtype=torch.float64)
-    del shifted, valid
-    cols = torch.arange(pixels, device=device)
+    n_valid = (~torch.isnan(flat)).sum(dim=0)  # (P,) int64
+    sorted_vals, sort_idx = torch.sort(flat, dim=0)  # NaN sorts last
+    # lower median of the valid samples (what torch.nanmedian returns); NaN where nothing is valid
+    median = sorted_vals.gather(0, ((n_valid - 1).clamp_min(0) // 2).view(1, -1))[0]
+    sorted_vals.sub_(median)  # centred values keep the running sums well conditioned
+    # running sums in float64: downdating the sum of squares after removing a saturated outlier
+    # cancels catastrophically in float32 (the per-step vectors are tiny, so this costs little)
+    count = n_valid.to(torch.float64)
+    s1 = torch.nansum(sorted_vals, dim=0, dtype=torch.float64)
+    s2 = torch.empty_like(s1)
+    chunk = max(1, pixels // 8)  # bounds the squared temporary while the int64 sort indices are alive
+    for a in range(0, pixels, chunk):
+        part = sorted_vals[:, a : a + chunk]
+        s2[a : a + chunk] = torch.nansum(part * part, dim=0, dtype=torch.float64)
     lo = torch.zeros(pixels, dtype=torch.long, device=device)
     hi = (n_valid - 1).clamp_min(0)
-    stats = torch.full((k, pixels), float("-inf"), dtype=torch.float32, device=device)
-    removed = torch.zeros((k, pixels), dtype=torch.int32, device=device)
-    for i in range(k):
-        active = count >= 3
-        c = count.clamp_min(1)
+    n_out = torch.zeros(pixels, dtype=torch.long, device=device)
+    low_out = torch.zeros(pixels, dtype=torch.long, device=device)
+    table = torch.from_numpy(gesd_critical_table(n, k, alpha)).to(device)  # (k, n + 1), inf where undefined
+    inv_relax = 1.0 / low_relax
+    step = torch.zeros(1, dtype=torch.long, device=device)  # steps taken so far (device-side loop counter)
+
+    def walk_step() -> None:
+        """One GESD step, entirely in place on the state tensors (no host syncs, so it can be graph-captured)."""
+
+        c = count.clamp_min(1.0)
         mean = s1 / c
-        var = (s2 - s1 * s1 / c) / (c - 1).clamp_min(1)
-        std = var.clamp_min(1e-24).sqrt()
-        vlo = sorted_vals[lo, cols].to(torch.float64)
-        vhi = sorted_vals[hi, cols].to(torch.float64)
-        dlo = (mean - vlo) / std / low_relax
-        dhi = (vhi - mean) / std
+        inv_std = ((s2 - s1 * mean) / (c - 1.0).clamp_min(1.0)).clamp_min(1e-24).rsqrt()
+        ends = sorted_vals.gather(0, torch.stack((lo, hi))).to(torch.float64)  # (2, P): current min, max
+        vlo, vhi = ends[0], ends[1]
+        dlo = (mean - vlo) * inv_std
+        if low_relax != 1.0:
+            dlo = dlo * inv_relax
+        dhi = (vhi - mean) * inv_std
         pick_hi = dhi >= dlo
         r_i = torch.where(pick_hi, dhi, dlo)
-        stats[i] = torch.where(active, r_i, torch.full_like(r_i, float("-inf"))).to(torch.float32)
-        pos = torch.where(pick_hi, hi, lo)
-        removed[i] = sort_idx[pos, cols]
+        lam = table.index_select(0, step)[0].index_select(0, n_valid)  # inf for exhausted pixels
+        exceeds = r_i > lam  # False for NaN r_i
         v = torch.where(pick_hi, vhi, vlo)
-        s1 = torch.where(active, s1 - v, s1)
-        s2 = torch.where(active, s2 - v * v, s2)
-        count = torch.where(active, count - 1, count)
-        hi = torch.where(active & pick_hi, hi - 1, hi).clamp_min(0)
-        lo = torch.where(active & ~pick_hi, lo + 1, lo).clamp_max(n - 1)
-    del sorted_vals
-    table = torch.from_numpy(gesd_critical_table(n, k, alpha)).to(device)
-    lam = table[:, n_valid.clamp(0, n)]  # (k, pixels)
-    steps = torch.arange(1, k + 1, device=device).view(k, 1)
-    n_out = torch.where(stats > lam, steps, torch.zeros_like(steps)).max(dim=0).values  # (pixels,)
-    reject = torch.zeros((n, pixels), dtype=torch.bool, device=device)
-    for i in range(k):
-        sel = n_out > i
-        if not bool(sel.any()):
-            break
-        reject[removed[i, sel].long(), cols[sel]] = True
-    rej_low = (reject & (flat < median)).reshape(x.shape)
-    rej_high = (reject & ~(flat < median)).reshape(x.shape)
-    out = torch.where(reject, torch.full_like(flat, float("nan")), flat).reshape(x.shape)
+        s1.sub_(v)
+        s2.addcmul_(v, v, value=-1.0)
+        count.sub_(1.0)
+        took_hi = pick_hi.to(torch.long)
+        hi.sub_(took_hi).clamp_min_(0)
+        lo.add_(1 - took_hi).clamp_max_(n - 1)
+        step.add_(1)
+        torch.where(exceeds, step, n_out, out=n_out)  # accepted step count (step already = i + 1)
+        torch.where(exceeds, lo, low_out, out=low_out)  # low-side removals among the accepted steps
+
+    _run_steps(walk_step, k, (s1, s2, count, lo, hi, n_out, low_out, step))
+    del sorted_vals, s1, s2, count, lo, hi
+    # the removed samples are the lowest low_out and the highest (n_out - low_out) sorted positions
+    rank = torch.arange(n, device=device).view(n, 1)
+    reject_sorted = (rank < low_out) | ((rank >= n_valid - (n_out - low_out)) & (rank < n_valid))
+    # un-sort only the (few) rejected positions: far cheaper than a full scatter of the mask
+    sort_idx.mul_(pixels).add_(torch.arange(pixels, device=device))
+    reject = torch.zeros(n * pixels, dtype=torch.bool, device=device)
+    reject.index_fill_(0, sort_idx[reject_sorted], True)
+    reject = reject.view(n, pixels)
+    del sort_idx, reject_sorted
+    below = flat < median
+    rej_low = (reject & below).reshape(x.shape)
+    rej_high = (reject & ~below).reshape(x.shape)
+    out = torch.where(reject, float("nan"), flat).reshape(x.shape)
     return out, rej_low, rej_high
 
 
@@ -591,14 +658,17 @@ def combine_full(x: torch.Tensor, settings: StackSettings, weights: torch.Tensor
             w = w.view(-1, *([1] * (x.ndim - 1)))
         elif w.ndim == x.ndim - 1:
             w = w.unsqueeze(1)
-        w = torch.broadcast_to(w, x.shape)
-        num = torch.where(valid, work * w, torch.zeros_like(work)).sum(dim=0)
-        den = (valid.to(x.dtype) * w).sum(dim=0)
+        if work is x:
+            work = work.clone()
+        work.mul_(w)  # in place: NaN stays NaN, so nansum is the weighted sum over valid samples
+        num = torch.nansum(work, dim=0)
+        den = torch.where(valid, w, 0.0).sum(dim=0)
         out = num / den.clamp_min(1e-12)
     # pixels rejected everywhere fall back to the plain median so nothing is left as NaN
-    fallback = torch.nanmedian(x, dim=0).values
-    out = torch.where(torch.isnan(out), fallback, out)
-    out = torch.nan_to_num(out, nan=0.0)
+    if bool(torch.isnan(out).any()):
+        fallback = torch.nanmedian(x, dim=0).values
+        out = torch.where(torch.isnan(out), fallback, out)
+        out = torch.nan_to_num(out, nan=0.0)
     return CombineOut(out, rl, rh, present)
 
 
@@ -609,17 +679,61 @@ def combine_tensor(x: torch.Tensor, settings: StackSettings, weights: torch.Tens
     return res.image, int(res.rej_low.sum()) if res.rej_low is not None else 0, int(res.rej_high.sum()) if res.rej_high is not None else 0
 
 
+class LocalNormMaps:
+    """All frames' low-res local-normalisation maps on the device, upsampled per band on demand.
+
+    Equivalent to bilinear ``F.interpolate(..., align_corners=False)`` of each frame's full map followed
+    by a row slice, but only the band's rows are ever materialised and all frames share one kernel launch
+    per chunk instead of two full-frame interpolations per frame per band.
+    """
+
+    def __init__(self, norms: list[FrameNorm], channels: int, device: torch.device, max_chunk_bytes: int = 256 * 2**20) -> None:
+        shapes = {tuple(norm.scale_map.shape) for norm in norms if norm.scale_map is not None and norm.offset_map is not None}
+        self.enabled = bool(shapes)
+        if not self.enabled:
+            return
+        if len(shapes) != 1:
+            raise ValueError(f"Local normalisation maps have mixed shapes: {sorted(shapes)}")
+        shape = next(iter(shapes))
+        n = len(norms)
+        scale = np.ones((n, *shape), dtype=np.float32)
+        offset = np.zeros((n, *shape), dtype=np.float32)
+        for i, norm in enumerate(norms):
+            if norm.scale_map is not None and norm.offset_map is not None:
+                scale[i] = norm.scale_map
+                offset[i] = norm.offset_map
+        self.map_h, self.map_w = int(shape[-2]), int(shape[-1])
+        self.channels = channels
+        self.scale = torch.from_numpy(scale).to(device).reshape(n * channels, 1, self.map_h, self.map_w)
+        self.offset = torch.from_numpy(offset).to(device).reshape(n * channels, 1, self.map_h, self.map_w)
+        self.max_chunk_bytes = max_chunk_bytes
+
+    def apply_(self, x: torch.Tensor, r0: int, height: int) -> torch.Tensor:
+        """In place: x[i] = x[i] * scale_i + offset_i for band rows r0..r0+rows of a (N, C, rows, W) tensor."""
+
+        if not self.enabled:
+            return x
+        n, channels, rows, width = x.shape
+        # normalised sample coordinates matching F.interpolate(align_corners=False) + border clamp
+        ys = (2.0 * torch.arange(r0, r0 + rows, device=x.device, dtype=torch.float32) + 1.0) / height - 1.0
+        xs = (2.0 * torch.arange(width, device=x.device, dtype=torch.float32) + 1.0) / width - 1.0
+        grid = torch.stack(torch.meshgrid(ys, xs, indexing="ij")[::-1], dim=-1).unsqueeze(0)  # (1, rows, W, 2) as (x, y)
+        flat = x.view(n * channels, rows, width)  # view, so the in-place update reaches x
+        per_plane = rows * width * 4 * 2  # scale + offset planes in float32
+        chunk = max(1, min(flat.shape[0], self.max_chunk_bytes // per_plane))
+        for start in range(0, flat.shape[0], chunk):
+            stop = min(flat.shape[0], start + chunk)
+            g = grid.expand(stop - start, rows, width, 2)
+            s = F.grid_sample(self.scale[start:stop], g, mode="bilinear", padding_mode="border", align_corners=False)[:, 0]
+            o = F.grid_sample(self.offset[start:stop], g, mode="bilinear", padding_mode="border", align_corners=False)[:, 0]
+            flat[start:stop].mul_(s).add_(o)
+        return x
+
+
 def _apply_norm_maps(x: torch.Tensor, norms: list[FrameNorm], r0: int, r1: int, height: int) -> torch.Tensor:
     """Apply per-frame local normalisation maps to a band in place. x: (N, C, rows, W)."""
 
-    n, channels, rows, width = x.shape
-    for i, norm in enumerate(norms):
-        if norm.scale_map is None or norm.offset_map is None:
-            continue
-        s_full = F.interpolate(torch.from_numpy(norm.scale_map).to(x.device).unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False)[0]
-        o_full = F.interpolate(torch.from_numpy(norm.offset_map).to(x.device).unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False)[0]
-        x[i] = x[i] * s_full[:, r0:r1, :] + o_full[:, r0:r1, :]
-    return x
+    return LocalNormMaps(norms, x.shape[1], x.device).apply_(x, r0, height)
 
 
 def _combine_stack_band(
@@ -632,13 +746,16 @@ def _combine_stack_band(
     offsets: torch.Tensor,
     scales: torch.Tensor,
     weights: torch.Tensor | None,
+    local_maps: LocalNormMaps | None = None,
 ) -> StackBandResult:
     n, channels, rows, width = x.shape
     height = store.shape[1]
-    if any(norm.scale_map is not None for norm in store.norms):
-        x = _apply_norm_maps(x, store.norms, r0, r0 + rows, height)
+    if local_maps is None:
+        local_maps = LocalNormMaps(store.norms, channels, x.device)
+    if local_maps.enabled:
+        x = local_maps.apply_(x, r0, height)
     elif settings.normalize:
-        x = (x - offsets) * scales + offsets[0]
+        x.sub_(offsets).mul_(scales).add_(offsets[0])  # in place: x is the band's own device copy
 
     band_weights = weights
     if settings.use_weights and any(norm.weight_map is not None for norm in store.norms):
@@ -680,14 +797,93 @@ def _combine_stack_band(
     return StackBandResult(image, rejected_low, rejected_high, n * channels * rows * width, coverage, rejection, masks)
 
 
-def read_store_band(maps: list[np.memmap], shape: tuple[int, int, int], row_start: int, row_stop: int) -> np.ndarray:
+class BandReader:
+    """Reads the same row range out of every registered ``.npy`` frame with explicit, threaded reads.
+
+    A band is one contiguous run of bytes per channel per frame, so seek + readinto from several
+    threads keeps an NVMe busy; strided memmap copies from one thread run at a fraction of that.
+    """
+
+    def __init__(self, paths: list[Path], shape: tuple[int, int, int], workers: int = 8) -> None:
+        channels, height, width = shape
+        self.paths = [str(p) for p in paths]
+        self.shape = shape
+        self.row_bytes = width * 4
+        self.plane_bytes = height * self.row_bytes
+        self.workers = max(1, workers)
+        self.data_offsets: list[int] = []
+        for path in self.paths:
+            array = np.load(path, mmap_mode="r", allow_pickle=False)
+            if array.shape != shape or array.dtype != np.float32:
+                raise ValueError(f"Registered frame {path} does not match the store shape")
+            self.data_offsets.append(int(array.offset))
+            del array
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def read_into(self, row_start: int, row_stop: int, out: np.ndarray) -> None:
+        """Fill ``out[:, :, :rows, :]`` (N, C, >=rows, W float32, C-contiguous) with the row range."""
+
+        rows = row_stop - row_start
+        channels = self.shape[0]
+        if out.dtype != np.float32 or out.shape[0] != len(self.paths) or out.shape[1] != channels or out.shape[2] < rows or out.shape[3] != self.shape[2]:
+            raise ValueError("Band buffer does not match the store")
+        band_bytes = rows * self.row_bytes
+        row_offset = row_start * self.row_bytes
+
+        def read_frames(first: int, last: int) -> None:
+            for index in range(first, last):
+                base = self.data_offsets[index] + row_offset
+                with open(self.paths[index], "rb", buffering=0) as handle:
+                    for c in range(channels):
+                        handle.seek(base + c * self.plane_bytes)
+                        view = memoryview(out[index, c, :rows, :]).cast("B")
+                        filled = 0
+                        while filled < band_bytes:
+                            got = handle.readinto(view[filled:])
+                            if not got:
+                                raise OSError(f"Short read in registered frame {self.paths[index]}")
+                            filled += got
+
+        n = len(self.paths)
+        workers = min(self.workers, n)
+        if workers <= 1:
+            read_frames(0, n)
+            return
+        step = math.ceil(n / workers)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(read_frames, first, min(n, first + step)) for first in range(0, n, step)]
+            for future in futures:
+                future.result()
+
+    def read(self, row_start: int, row_stop: int) -> np.ndarray:
+        band = np.empty((len(self.paths), self.shape[0], row_stop - row_start, self.shape[2]), dtype=np.float32)
+        self.read_into(row_start, row_stop, band)
+        return band
+
+
+def read_store_band(maps: list[np.memmap] | BandReader, shape: tuple[int, int, int], row_start: int, row_stop: int) -> np.ndarray:
     """Copy an absolute row range from every registered frame into one (N, C, rows, W) array."""
 
+    if isinstance(maps, BandReader):
+        return maps.read(row_start, row_stop)
     channels, _, width = shape
     band = np.empty((len(maps), channels, row_stop - row_start, width), dtype=np.float32)
     for index, frame in enumerate(maps):
         band[index] = frame[:, row_start:row_stop, :]
     return band
+
+
+def band_overhead(settings: StackSettings) -> float:
+    """Device-memory multiple of one band that the chosen rejection needs for its intermediates."""
+
+    # gesd: torch.sort along the frame axis peaks at ~6x band for N=853 and ~13x for N=7000
+    # (values + int64 indices + transposed scratch), so size bands for the large-N case.
+    overhead = 14.0 if settings.method == "gesd" else 6.0
+    if settings.large_scale:
+        overhead += 2.0
+    return overhead
 
 
 def stack_store_band(
@@ -697,7 +893,7 @@ def stack_store_band(
     row_start: int,
     row_stop: int,
     reject_masks: bool = False,
-    frame_maps: list[np.memmap] | None = None,
+    frame_maps: list[np.memmap] | BandReader | None = None,
     host_data: np.ndarray | None = None,
 ) -> StackBandResult:
     """Stack an absolute half-open row range with the same math as ``stack_store``."""
@@ -708,13 +904,10 @@ def stack_store_band(
     channels, height, width = store.shape
     if row_start < 0 or row_stop <= row_start or row_stop > height:
         raise ValueError("Stack band row range is outside the registered store")
-    overhead = 10.0 if settings.method == "gesd" else 6.0
-    if settings.large_scale:
-        overhead += 2.0
-    max_band = max(1, rows_per_band(n, width, channels, backend.budget_bytes, overhead=overhead))
-    maps: list[np.memmap] = []
+    max_band = max(1, rows_per_band(n, width, channels, backend.budget_bytes, overhead=band_overhead(settings)))
+    maps: list[np.memmap] | BandReader = []
     if host_data is None:
-        maps = store.memmaps() if frame_maps is None else frame_maps
+        maps = store.band_reader() if frame_maps is None else frame_maps
         if len(maps) != n:
             raise ValueError("Registered-frame map count does not match the store")
     elif host_data.shape != (n, channels, row_stop - row_start, width) or host_data.dtype != np.float32:
@@ -722,6 +915,7 @@ def stack_store_band(
     offsets = torch.from_numpy(np.stack([norm_vec(norm.offset, channels) for norm in store.norms])).to(backend.device).view(n, channels, 1, 1)
     scales = torch.from_numpy(np.stack([norm_vec(norm.scale, channels) for norm in store.norms])).to(backend.device).view(n, channels, 1, 1)
     weights = torch.tensor([norm.weight for norm in store.norms], device=backend.device) if settings.use_weights else None
+    local_maps = LocalNormMaps(store.norms, channels, backend.device)
     row_count = row_stop - row_start
     image = np.empty((channels, row_count, width), dtype=np.float32)
     coverage = np.empty((row_count, width), dtype=np.uint16)
@@ -734,13 +928,16 @@ def stack_store_band(
         if host_data is None:
             host = torch.empty((n, channels, rows, width), dtype=torch.float32, pin_memory=backend.is_cuda)
             host_np = host.numpy()
-            for index, frame in enumerate(maps):
-                host_np[index] = frame[:, absolute_start:absolute_stop, :]
+            if isinstance(maps, BandReader):
+                maps.read_into(absolute_start, absolute_stop, host_np)
+            else:
+                for index, frame in enumerate(maps):
+                    host_np[index] = frame[:, absolute_start:absolute_stop, :]
         else:
             offset = absolute_start - row_start
-            host = torch.from_numpy(np.ascontiguousarray(host_data[:, :, offset : offset + rows, :]))
+            host = torch.from_numpy(host_data[:, :, offset : offset + rows, :]).clone()  # the band is normalised in place
         tensor = host.to(backend.device, non_blocking=backend.is_cuda)
-        result = _combine_stack_band(tensor, store, backend, settings, absolute_start, reject_masks, offsets, scales, weights)
+        result = _combine_stack_band(tensor, store, backend, settings, absolute_start, reject_masks, offsets, scales, weights, local_maps)
         local_start = absolute_start - row_start
         local_stop = local_start + rows
         image[:, local_start:local_stop, :] = result.image
@@ -766,15 +963,12 @@ def stack_store(store: FrameStore, backend: Backend, settings: StackSettings, pr
     if n == 0:
         raise ValueError("No frames to stack")
     channels, height, width = store.shape
-    maps = store.memmaps()
+    reader = store.band_reader()
     mask_maps: list[np.memmap] = []
     if reject_masks:
         store.mask_paths = [p.with_name(p.name.replace("reg_", "rej_")) for p in store.paths]
         mask_maps = [np.lib.format.open_memmap(p, mode="w+", dtype=np.uint8, shape=(height, width)) for p in store.mask_paths]
-    overhead = 10.0 if settings.method == "gesd" else 6.0
-    if settings.large_scale:
-        overhead += 2.0
-    band = rows_per_band(n, width, channels, backend.budget_bytes, overhead=overhead)
+    band = rows_per_band(n, width, channels, backend.budget_bytes, overhead=band_overhead(settings))
     bands = math.ceil(height / band)
     out = np.empty((channels, height, width), dtype=np.float32)
     coverage = np.empty((height, width), dtype=np.uint16)
@@ -784,6 +978,7 @@ def stack_store(store: FrameStore, backend: Backend, settings: StackSettings, pr
     scales = torch.from_numpy(np.stack([norm_vec(f.scale, channels) for f in store.norms])).to(backend.device).view(n, channels, 1, 1)
     ref_offset = offsets[0]
     weights = torch.tensor([f.weight for f in store.norms], device=backend.device) if settings.use_weights else None
+    local_maps = LocalNormMaps(store.norms, channels, backend.device)
 
     host_buffers = [torch.empty((n, channels, band, width), dtype=torch.float32, pin_memory=backend.is_cuda)]
     if backend.is_cuda and bands > 1:
@@ -791,9 +986,7 @@ def stack_store(store: FrameStore, backend: Backend, settings: StackSettings, pr
     host_np_buffers = [buffer.numpy() for buffer in host_buffers]
 
     def stage_host_band(buffer_index: int, r0: int, r1: int) -> None:
-        host_np = host_np_buffers[buffer_index]
-        for i, mm in enumerate(maps):
-            host_np[i, :, : r1 - r0, :] = mm[:, r0:r1, :]
+        reader.read_into(r0, r1, host_np_buffers[buffer_index])
 
     rej_low = rej_high = 0
     prefetch = ThreadPoolExecutor(max_workers=1) if len(host_buffers) > 1 else None
@@ -817,7 +1010,7 @@ def stack_store(store: FrameStore, backend: Backend, settings: StackSettings, pr
                 next_r0 = (bi + 1) * band
                 next_r1 = min(height, next_r0 + band)
                 pending_stage = prefetch.submit(stage_host_band, (bi + 1) % len(host_buffers), next_r0, next_r1)
-            band_result = _combine_stack_band(x, store, backend, settings, r0, reject_masks, offsets, scales, weights)
+            band_result = _combine_stack_band(x, store, backend, settings, r0, reject_masks, offsets, scales, weights, local_maps)
             out[:, r0:r1, :] = band_result.image
             coverage[r0:r1, :] = band_result.coverage
             rejection[r0:r1, :] = band_result.rejection

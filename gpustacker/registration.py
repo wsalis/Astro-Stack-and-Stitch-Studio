@@ -167,35 +167,43 @@ def _lanczos_weights(t: torch.Tensor, a: int = 3) -> torch.Tensor:
     return torch.where(t.abs() < a, out, torch.zeros_like(t))
 
 
-def _warp_lanczos(image: torch.Tensor, sx: torch.Tensor, sy: torch.Tensor, a: int = 3) -> torch.Tensor:
+def _warp_lanczos(image: torch.Tensor, sx: torch.Tensor, sy: torch.Tensor, a: int = 3, tile_rows: int = 128) -> torch.Tensor:
     """Separable Lanczos-a resampling. Ringing is suppressed only where it actually occurs: an output
     pixel is never allowed below the darkest input sample that contributed to it (dark halos around
-    stars), while the sharpening from the negative lobes is otherwise kept intact."""
+    stars), while the sharpening from the negative lobes is otherwise kept intact.
+
+    The output is produced in row tiles so the accumulators and the source rows the 36 taps gather
+    from stay cache-resident; the result does not depend on the tiling."""
 
     channels, height, width = image.shape
-    out_shape = tuple(sx.shape)  # output grid may differ from the source image (mosaic reprojection)
-    x0 = torch.floor(sx)
-    y0 = torch.floor(sy)
-    offs = torch.arange(-a + 1, a + 1, device=image.device, dtype=torch.float32)  # 2a taps
-    wx = _lanczos_weights((sx - x0).unsqueeze(0) - offs.view(-1, 1, 1))  # (2a, Ho, Wo)
-    wy = _lanczos_weights((sy - y0).unsqueeze(0) - offs.view(-1, 1, 1))
-    xi_all = (x0.unsqueeze(0) + offs.view(-1, 1, 1)).clamp(0, width - 1).long()
-    yi_all = (y0.unsqueeze(0) + offs.view(-1, 1, 1)).clamp(0, height - 1).long()
+    out_h, out_w = sx.shape  # output grid may differ from the source image (mosaic reprojection)
+    device = image.device
+    offs = torch.arange(-a + 1, a + 1, device=device, dtype=torch.float32).view(-1, 1, 1)  # 2a taps
     flat = image.reshape(channels, -1)
-    acc = torch.zeros((channels, *out_shape), device=image.device, dtype=image.dtype)
-    wsum = torch.zeros(out_shape, device=image.device)
-    floor = torch.full((channels, *out_shape), float("inf"), device=image.device, dtype=image.dtype)
-    for iy in range(2 * a):
-        row = yi_all[iy] * width
-        for ix in range(2 * a):
-            w = wy[iy] * wx[ix]
-            idx = (row + xi_all[ix]).reshape(-1)
-            vals = flat[:, idx].reshape(channels, *out_shape)
-            acc += vals * w
-            wsum += w
-            floor = torch.minimum(floor, vals)
-    out = acc / wsum.clamp_min(1e-6)
-    return torch.maximum(out, floor)
+    out = torch.empty((channels, out_h, out_w), device=device, dtype=image.dtype)
+    tile_rows = max(1, tile_rows)
+    for r0 in range(0, out_h, tile_rows):
+        r1 = min(out_h, r0 + tile_rows)
+        tsx, tsy = sx[r0:r1], sy[r0:r1]
+        rows = r1 - r0
+        x0 = torch.floor(tsx)
+        y0 = torch.floor(tsy)
+        wx = _lanczos_weights((tsx - x0).unsqueeze(0) - offs)  # (2a, rows, Wo)
+        wy = _lanczos_weights((tsy - y0).unsqueeze(0) - offs)
+        xi_all = (x0.unsqueeze(0) + offs).clamp_(0, width - 1).to(torch.int32)
+        row_all = (y0.unsqueeze(0) + offs).clamp_(0, height - 1).to(torch.int32).mul_(width)
+        acc = torch.zeros((channels, rows, out_w), device=device, dtype=image.dtype)
+        floor = torch.full((channels, rows, out_w), float("inf"), device=device, dtype=image.dtype)
+        xi_taps, wx_taps = xi_all.unbind(0), wx.unsqueeze(1).unbind(0)
+        for row, wy_row in zip(row_all.unbind(0), wy.unsqueeze(1).unbind(0)):
+            for xi, wx_tap in zip(xi_taps, wx_taps):
+                vals = flat.index_select(1, (row + xi).view(-1)).view(channels, rows, out_w)
+                acc.addcmul_(vals, wy_row * wx_tap)
+                torch.minimum(floor, vals, out=floor)
+        wsum = wy.sum(dim=0) * wx.sum(dim=0)  # sum over the 2a x 2a taps factorises
+        acc.div_(wsum.clamp_min_(1e-6))
+        out[:, r0:r1] = torch.maximum(acc, floor)
+    return out
 
 
 def warp_to_reference(image: torch.Tensor, alignment: Alignment, mode: str = "lanczos3") -> torch.Tensor:

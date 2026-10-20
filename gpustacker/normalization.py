@@ -64,19 +64,35 @@ def _fill_and_smooth(arr: np.ndarray, bad: np.ndarray, sigma: float) -> np.ndarr
     return out
 
 
-def fit_norm_maps(frame: torch.Tensor, ref_med: torch.Tensor, ref_mad: torch.Tensor, ref_frac: torch.Tensor, settings: LocalNormSettings, scale: float | np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+def fit_norm_maps(
+    frame: torch.Tensor | None,
+    ref_med: torch.Tensor,
+    ref_mad: torch.Tensor,
+    ref_frac: torch.Tensor,
+    settings: LocalNormSettings,
+    scale: float | np.ndarray | None = None,
+    stats: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """Return (scale_map, offset_map) as (C, bh, bw) float32 so that frame' matches the reference blocks.
 
     ``scale``: the frame's global flux scale (scalar or (C,)); the scale map is then constant and only the
     offsets vary. Without it the per-block noise ratio is used (legacy behaviour).
+    ``stats``: the frame's ``block_stats`` if already known (e.g. taken while the warped frame was still on
+    the device at registration); ``frame`` is then not needed.
     """
 
-    med, mad, frac = block_stats(frame, settings.block)
+    if stats is None:
+        if frame is None:
+            raise ValueError("fit_norm_maps needs the frame or its block statistics")
+        med, mad, frac = block_stats(frame, settings.block)
+    else:
+        med, mad, frac = (torch.as_tensor(np.asarray(s), device=ref_med.device) for s in stats)
+    device = med.device
     if scale is None:
         lo, hi = settings.scale_limits
         scale_t = (ref_mad / mad.clamp_min(1e-9)).clamp(lo, hi)
     else:
-        s = torch.as_tensor(np.asarray(scale, dtype=np.float32).reshape(-1), device=frame.device)
+        s = torch.as_tensor(np.asarray(scale, dtype=np.float32).reshape(-1), device=device)
         scale_t = s.view(-1, 1, 1).expand_as(med).clone() if s.numel() > 1 else torch.full_like(med, float(s))
     offset = ref_med - scale_t * med
     bad = ((frac < settings.min_valid_fraction) | (ref_frac < settings.min_valid_fraction) | ~torch.isfinite(scale_t) | ~torch.isfinite(offset)).cpu().numpy()

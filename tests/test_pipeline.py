@@ -1055,6 +1055,70 @@ def test_compare_regional_medians_and_rows():
     assert "Matched-star SNR top left (n=6)" in labels
 
 
+def test_prefilters_use_per_exposure_medians_for_stars_and_sky(tmp_path):
+    from gpustacker.io import FrameMeta
+
+    pipeline = StackingPipeline(PipelineSettings(lights=[], output=tmp_path / "unused.fit", device="cpu"), lambda _: None)
+
+    def info(index: int, exposure: float, stars: int, background: float) -> FrameInfo:
+        meta = FrameMeta(Path(f"f{index}.fit"), (10, 10), 1, exposure=exposure)
+        detected = Stars(*(np.empty(0, dtype=np.float32) for _ in range(6)), total_detected=stars)
+        return FrameInfo(index, meta.path, meta, detected, fwhm=2.0, noise=1.0, background=background)
+
+    # four 60 s subs and four 20 s subs; the short subs have a third of the stars and sky
+    infos = [info(i, 60.0, 1500 + i, 1500.0) for i in range(4)] + [info(4 + i, 20.0, 500 + i, 500.0) for i in range(4)]
+    infos.append(info(8, 20.0, 150, 500.0))  # genuinely poor short sub
+
+    pipeline.apply_prefilters(infos)
+
+    assert all(i.rejected_reason is None for i in infos[:8])
+    assert infos[8].rejected_reason and "stars 150" in infos[8].rejected_reason
+    per_exposure = pipeline.filter_baselines["prefilters"]["per_exposure"]
+    assert set(per_exposure) == {"60s", "20s"}
+    assert per_exposure["20s"]["frames"] == 5
+
+
+def test_mixed_exposures_are_kept_and_weighted_by_signal(tmp_path, scene):
+    """20 s subs beside 60 s subs: the transparency filter must not drop them, and their weights must reflect signal."""
+
+    rng = np.random.default_rng(7)
+    base, _ = scene
+    folder = tmp_path / "mixed"
+    folder.mkdir()
+    shifts = [(0, 0), (3.2, -1.7), (-2.4, 2.9), (5.1, 4.4), (-4.6, -3.3), (1.3, 6.0), (2.2, -4.1), (-1.5, 1.1)]
+    exposures = [60.0] * 4 + [20.0] * 4
+    from astropy.io import fits
+    from conftest import shifted_noisy
+
+    for i, ((dx, dy), exposure) in enumerate(zip(shifts, exposures)):
+        frame = shifted_noisy(base * (exposure / 60.0), dx, dy, rng)
+        hdr = fits.Header()
+        hdr["EXPTIME"] = exposure
+        hdr["EGAIN"] = 1.0
+        hdr["FILTER"] = "L"
+        fits.PrimaryHDU(data=frame, header=hdr).writeto(folder / f"light_{i:02d}.fit")
+    lights = sorted(folder.glob("*.fit"))
+    out = tmp_path / "mixed.fit"
+    log: list[str] = []
+    result = StackingPipeline(PipelineSettings(lights=lights, output=out, device="cpu", local_norm=LocalNormSettings(enabled=False)), log.append).run()
+
+    report = json.loads(result.report_path.read_text())
+    assert report["frame_counts"]["stacked"] == 8, report["excluded"]
+    assert report["timings_s"]["register"] > 0 and "stack" in report["timings_s"]
+    rows = {row["file"]: row for row in report["frames"]}
+    long_rows = [rows[f"light_{i:02d}.fit"] for i in range(4)]
+    short_rows = [rows[f"light_{i:02d}.fit"] for i in range(4, 8)]
+    for row in long_rows + short_rows:
+        assert 0.85 < row["transparency"] < 1.15, row
+    assert report["reference"].endswith(("light_00.fit", "light_01.fit", "light_02.fit", "light_03.fit"))
+    assert all(0.8 < row["flux_ratio"] < 1.25 for row in long_rows), long_rows
+    assert all(0.25 < row["flux_ratio"] < 0.42 for row in short_rows), short_rows
+    assert max(row["weight"] for row in short_rows) < min(row["weight"] for row in long_rows)
+    stacked, meta = load_frame(out)
+    assert meta.header["EXPTOTAL"] == 320.0
+    assert any(line.startswith("Stage timings:") for line in log)
+
+
 def test_pipeline_end_to_end(light_dir, tmp_path, backend, scene):
     lights = sorted(light_dir.glob("*.fit"))
     out = tmp_path / "stack.fit"

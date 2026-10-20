@@ -66,3 +66,53 @@ def test_lanczos_keeps_star_sharpness_and_blocks_dark_halos():
     assert abs(width(out) / width(truth) - 1.0) < 0.01
     assert abs(out[inner].sum() / truth[inner].sum() - 1.0) < 0.01  # flux conserved
     assert out.min() >= -1e-3  # no dark ring below the sky
+
+
+def _warp_lanczos_reference(image: torch.Tensor, sx: torch.Tensor, sy: torch.Tensor, a: int = 3) -> torch.Tensor:
+    """Plain single-pass Lanczos used as the oracle for the tiled implementation."""
+
+    from gpustacker.registration import _lanczos_weights
+
+    channels, height, width = image.shape
+    out_shape = tuple(sx.shape)
+    x0, y0 = torch.floor(sx), torch.floor(sy)
+    offs = torch.arange(-a + 1, a + 1, device=image.device, dtype=torch.float32)
+    wx = _lanczos_weights((sx - x0).unsqueeze(0) - offs.view(-1, 1, 1))
+    wy = _lanczos_weights((sy - y0).unsqueeze(0) - offs.view(-1, 1, 1))
+    xi_all = (x0.unsqueeze(0) + offs.view(-1, 1, 1)).clamp(0, width - 1).long()
+    yi_all = (y0.unsqueeze(0) + offs.view(-1, 1, 1)).clamp(0, height - 1).long()
+    flat = image.reshape(channels, -1)
+    acc = torch.zeros((channels, *out_shape), device=image.device, dtype=image.dtype)
+    wsum = torch.zeros(out_shape, device=image.device)
+    floor = torch.full((channels, *out_shape), float("inf"), device=image.device, dtype=image.dtype)
+    for iy in range(2 * a):
+        row = yi_all[iy] * width
+        for ix in range(2 * a):
+            w = wy[iy] * wx[ix]
+            vals = flat[:, (row + xi_all[ix]).reshape(-1)].reshape(channels, *out_shape)
+            acc += vals * w
+            wsum += w
+            floor = torch.minimum(floor, vals)
+    return torch.maximum(acc / wsum.clamp_min(1e-6), floor)
+
+
+def test_lanczos_tiled_matches_reference():
+    from gpustacker.registration import Alignment, _warp_lanczos, source_coords
+
+    rng = np.random.default_rng(5)
+    height, width = 150, 70
+    img = torch.from_numpy(rng.normal(1000, 20, (3, height, width)).astype(np.float32))
+    yy, xx = np.mgrid[0:height, 0:width]
+    for _ in range(12):
+        cy, cx = rng.uniform(5, height - 5), rng.uniform(5, width - 5)
+        img += torch.from_numpy((rng.uniform(500, 8000) * np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * 1.2**2))).astype(np.float32))
+    theta = np.deg2rad(1.7)
+    matrix = np.array([[np.cos(theta), -np.sin(theta), 2.3], [np.sin(theta), np.cos(theta), -1.4], [0, 0, 1]])
+    devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+    for device in devices:
+        x = img.to(device)
+        sx, sy = source_coords(Alignment(matrix=matrix, matched=0, rotation_deg=1.7, scale=1.0, shift=(2.3, -1.4)), height, width, x.device)
+        expected = _warp_lanczos_reference(x, sx, sy, 3)
+        for tile_rows in (7, 64, 1000):  # ragged tiles, several tiles, single tile
+            actual = _warp_lanczos(x, sx, sy, 3, tile_rows=tile_rows)
+            assert torch.allclose(actual, expected, rtol=1e-5, atol=5e-2), f"{device} tile_rows={tile_rows}: {(actual - expected).abs().max():.4g}"

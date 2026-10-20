@@ -5,6 +5,18 @@ entry points remain named `GPUStacker` (`gpustacker`). It includes a dark tkinte
 **ImageMM multi-frame PSF-aware deconvolution** is an experimental optional output; it never
 changes the regular master.
 
+## Version 1.2.0: large-stack performance
+
+This release substantially accelerates high-frame-count stacking. On a benchmark of 1,044
+3840x2160 Seestar FITS lights (853 stacked), total runtime fell from 22m24s to 8m13s, about
+2.7x faster. Rejection remained 0.24%, measured noise 5.59 ADU, and effective frame count
+591.3, matching the prior run. Results depend on hardware, storage, and input data.
+
+The gains come from tiled VNG debayering and Lanczos warping, overlapping alignment solves with
+GPU registration, shared-memory star-detection input, faster registered-store reads, reusing
+local-normalization statistics captured during registration, and more efficient GESD rejection
+and critical-value calculation. The full test suite passes (198 tests).
+
 Pipeline: load FITS/XISF -> master calibration -> cosmetic hot/cold repair -> debayer (CFA) ->
 star detection (multi-process) -> frame filters (star count, sky level, FWHM) -> similarity
 registration (astroalign) refined with a cubic polynomial over all matched stars -> clamped
