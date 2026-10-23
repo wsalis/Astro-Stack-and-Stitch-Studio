@@ -20,7 +20,8 @@ from .mfdeconv import MFDECONV_PRESETS, MFDeconvSettings
 from .mosaic import BLEND_MODES, INTERPOLATIONS, ORIENTATIONS
 from .normalization import LocalNormSettings
 from .pipeline import PipelineSettings, StackingPipeline
-from .quality import WEIGHTING_CHOICES, FilterSettings
+from .quality import FILTER_PRESETS, WEIGHTING_CHOICES, FilterSettings, filter_preset
+from .runlog import RunLog
 from .stacking import StackSettings
 
 
@@ -95,6 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--interp", choices=["lanczos3", "bicubic", "bilinear"], default="lanczos3", help="Registration interpolation")
     st.add_argument("--no-refine", action="store_true", help="Skip the polynomial registration refinement")
     st.add_argument("--autocrop", type=float, default=0.0, help="Crop to the region covered by this fraction of frames (1.0 = all, 0 = off)")
+    st.add_argument("--full-field", action="store_true", help="Use the union of aligned frame footprints as the output canvas")
     st.add_argument("--no-maps", action="store_true", help="Do not write coverage/rejection map FITS files")
     st.add_argument("--no-solve", action="store_true", help="Do not plate solve the outputs with ASTAP")
     st.add_argument("--astap", type=Path, help="Path to astap_cli/astap executable (default: auto-detect)")
@@ -105,12 +107,15 @@ def build_parser() -> argparse.ArgumentParser:
     dz.add_argument("--drizzle-min-weight", type=float, default=0.05, help="Minimum drizzle weight relative to the map median")
     dz.add_argument("--no-cfa-drizzle", action="store_true", help="Drizzle debayered frames instead of raw Bayer sites (OSC)")
     fl = st.add_argument_group("frame filters (0 disables)")
+    fl.add_argument("--filter-preset", choices=[name.lower() for name in FILTER_PRESETS], default="balanced", help="Starting thresholds; individual --filter-* arguments override the preset")
     fl.add_argument("--no-filters", action="store_true", help="Disable all frame exclusion filters")
-    fl.add_argument("--filter-transparency", type=float, default=0.6, help="Exclude frames with star flux below this fraction of the reference")
-    fl.add_argument("--filter-stars", type=float, default=0.6, help="Exclude frames with star count below this fraction of the median")
-    fl.add_argument("--filter-background", type=float, default=2.0, help="Exclude frames with sky above this multiple of the median")
-    fl.add_argument("--filter-fwhm", type=float, default=1.4, help="Exclude frames with FWHM above this multiple of the median")
-    st.add_argument("--keep-registered", action="store_true", help="Keep registered .npy frames in the work dir")
+    fl.add_argument("--filter-transparency", type=float, default=None, help="Minimum exposure-corrected transparency relative to the session median")
+    fl.add_argument("--filter-stars", type=float, default=None, help="Exclude frames with star count below this fraction of the median")
+    fl.add_argument("--filter-background", type=float, default=None, help="Exclude frames with sky above this multiple of the median")
+    fl.add_argument("--filter-fwhm", type=float, default=None, help="Exclude frames with FWHM above this multiple of the median")
+    fl.add_argument("--filter-psfsw", type=float, default=0.0, help="Optional minimum PSFSW relative to its exposure-group median, measured after registration (default off)")
+    st.add_argument("--keep-registered", action="store_true", help="Keep registered .npy frames after stacking")
+    st.add_argument("--registered-drive", type=Path, action="append", default=[], dest="registered_storage_dirs", help="Folder on a drive for registered frames; repeat to distribute across drives")
     st.add_argument("--resume", action="store_true", help="Save a registered-stage checkpoint and resume it on a matching rerun after failure")
     st.add_argument("--work-dir", type=Path)
     st.add_argument("--cpu", action="store_true", help="Force CPU backend")
@@ -203,6 +208,7 @@ def _mf_values(args: argparse.Namespace) -> dict[str, float | int]:
 
 
 def settings_from_args(args: argparse.Namespace) -> PipelineSettings:
+    preset = filter_preset(args.filter_preset.title())
     lights = _collect_lights(args.lights)
     if not lights and args.registered_dir is None:
         raise SystemExit("No light frames found")
@@ -244,11 +250,19 @@ def settings_from_args(args: argparse.Namespace) -> PipelineSettings:
         detection_sigma=args.sigma,
         weighting=args.weighting,
         weightings=[args.weighting, *args.also_weighting],
-        filters=FilterSettings(enabled=not args.no_filters, transparency_min=args.filter_transparency, stars_min_ratio=args.filter_stars, background_max_ratio=args.filter_background, fwhm_max_ratio=args.filter_fwhm),
+        filters=FilterSettings(
+            enabled=not args.no_filters,
+            transparency_min=preset.transparency_min if args.filter_transparency is None else args.filter_transparency,
+            stars_min_ratio=preset.stars_min_ratio if args.filter_stars is None else args.filter_stars,
+            background_max_ratio=preset.background_max_ratio if args.filter_background is None else args.filter_background,
+            fwhm_max_ratio=preset.fwhm_max_ratio if args.filter_fwhm is None else args.filter_fwhm,
+            psfsw_min_ratio=args.filter_psfsw,
+        ),
         interpolation=args.interp,
         refine_registration=not args.no_refine,
         local_norm=LocalNormSettings(enabled=not args.no_local_norm, block=args.local_norm_block),
         autocrop=args.autocrop,
+        full_field=args.full_field,
         save_maps=not args.no_maps,
         plate_solve=not args.no_solve,
         astap_path=args.astap,
@@ -268,6 +282,7 @@ def settings_from_args(args: argparse.Namespace) -> PipelineSettings:
         mfdeconv_frames=int(mfv["frames"]),
         mfdeconv_blend=args.mf_blend,
         keep_registered=args.keep_registered,
+        registered_storage_dirs=args.registered_storage_dirs,
         resume=args.resume,
         device="cpu" if args.cpu else "auto",
         vram_fraction=args.vram_fraction,
@@ -278,9 +293,12 @@ def settings_from_args(args: argparse.Namespace) -> PipelineSettings:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    run_log: RunLog | None = None
 
     def status(msg: str) -> None:
         print(msg, flush=True)
+        if run_log is not None:
+            run_log.write(msg)
 
     if args.command == "compare":
         if args.gpu is None or args.reference is None:
@@ -416,6 +434,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     settings = settings_from_args(args)
+    if not args.list_groups:
+        if args.group_by:
+            output_dir = args.output if args.output.suffix.lower() not in (".fit", ".fits", ".fts") else args.output.parent
+            log_path = output_dir / "gpustacker_batch.log"
+        else:
+            log_path = settings.output.with_suffix(".log")
+        try:
+            run_log = RunLog(log_path)
+        except OSError as exc:
+            print(f"Could not create run log {log_path}: {exc}", file=sys.stderr, flush=True)
+        else:
+            print(f"Run log: {log_path}", flush=True)
+            run_log.write(f"GPUStacker {__version__}")
+            run_log.write(f"Output: {settings.output}")
 
     last = {"pct": -1}
 
@@ -423,36 +455,56 @@ def main(argv: list[str] | None = None) -> int:
         pct = int(frac * 100)
         if pct != last["pct"]:
             last["pct"] = pct
-            print(f"  [{pct:3d}%] {msg}", flush=True)
+            line = f"  [{pct:3d}%] {msg}"
+            print(line, flush=True)
+            if run_log is not None:
+                run_log.write(line)
 
-    if args.group_by or args.list_groups:
-        keys = tuple(k for k in (args.group_by or ",".join(DEFAULT_GROUP_KEYS)).split(",") if k.strip())
-        groups = group_frames(settings.lights, keys, status)
-        for line in describe_groups(groups):
-            print(line)
-        if args.list_groups:
-            return 0
-        out_dir = args.output if args.output.suffix.lower() not in (".fit", ".fits", ".fts") else args.output.parent
-        try:
-            batch = run_batch(settings, groups, out_dir, args.name_template, status, progress)
-        except KeyboardInterrupt:
-            print("Interrupted", file=sys.stderr)
-            return 130
-        failed = [g for g, p, _ in batch.outputs if p is None]
-        return 1 if failed and len(failed) == len(batch.outputs) else 0
-
-    pipeline = StackingPipeline(settings, status, progress)
     try:
+        if args.group_by or args.list_groups:
+            keys = tuple(k for k in (args.group_by or ",".join(DEFAULT_GROUP_KEYS)).split(",") if k.strip())
+            groups = group_frames(settings.lights, keys, status)
+            for line in describe_groups(groups):
+                print(line)
+                if run_log is not None:
+                    run_log.write(line)
+            if args.list_groups:
+                return 0
+            out_dir = args.output if args.output.suffix.lower() not in (".fit", ".fits", ".fts") else args.output.parent
+            batch = run_batch(settings, groups, out_dir, args.name_template, status, progress)
+            failed = [g for g, p, _ in batch.outputs if p is None]
+            for group, output, error in batch.outputs:
+                if output is None and run_log is not None:
+                    run_log.write(f"Batch group {group.key.label or '(all)'} failed: {error}")
+            return 1 if failed and len(failed) == len(batch.outputs) else 0
+
+        pipeline = StackingPipeline(settings, status, progress)
         result = pipeline.run()
+        finished = f"Finished in {result.seconds:.1f}s -> {result.output}"
+        print(finished)
+        if run_log is not None:
+            run_log.write(finished)
+        if result.drizzle_output:
+            print(f"Drizzle -> {result.drizzle_output}")
+            if run_log is not None:
+                run_log.write(f"Drizzle -> {result.drizzle_output}")
+        if result.mfdeconv_output:
+            print(f"MFDeconv -> {result.mfdeconv_output}")
+            if run_log is not None:
+                run_log.write(f"MFDeconv -> {result.mfdeconv_output}")
+        return 0
     except KeyboardInterrupt:
         print("Interrupted", file=sys.stderr)
+        if run_log is not None:
+            run_log.write("Run interrupted")
         return 130
-    print(f"Finished in {result.seconds:.1f}s -> {result.output}")
-    if result.drizzle_output:
-        print(f"Drizzle -> {result.drizzle_output}")
-    if result.mfdeconv_output:
-        print(f"MFDeconv -> {result.mfdeconv_output}")
-    return 0
+    except Exception as exc:
+        if run_log is not None:
+            run_log.write_exception("Run failed", exc)
+        raise
+    finally:
+        if run_log is not None:
+            run_log.close()
 
 
 if __name__ == "__main__":

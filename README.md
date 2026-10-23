@@ -5,6 +5,14 @@ entry points remain named `GPUStacker` (`gpustacker`). It includes a dark tkinte
 **ImageMM multi-frame PSF-aware deconvolution** is an experimental optional output; it never
 changes the regular master.
 
+## Version 1.3.0: filtering, storage, and run workflow
+
+This release adds editable frame-filter presets and preview, including an optional post-registration
+PSFSW cutoff; multi-drive registered-frame storage; full-field stacking; and persistent run logs.
+The CLI accepts preset overrides and repeated `--registered-drive` paths. Distributed stacking,
+registration, and storage handling also receive reliability improvements, with expanded regression
+coverage. The full test suite passes (242 tests).
+
 ## Version 1.2.0: large-stack performance
 
 This release substantially accelerates high-frame-count stacking. On a benchmark of 1,044
@@ -64,8 +72,42 @@ Key options: `--method {winsorized,gesd,sigma,percentile,median,none}`, `--sigma
 `--filter-transparency 0.6 --filter-stars 0.6 --filter-background 2.0 --filter-fwhm 1.4` (x median; 0 = off; `--no-filters` disables all),
 `--interp {lanczos3,bicubic,bilinear}`, `--no-refine`, `--no-local-norm`, `--local-norm-block 128`,
 `--autocrop 1.0` (keep only pixels covered by every frame; 0 = off), `--no-maps`,
-`--debayer {auto,on,off}` / `--bayer RGGB`, `--reference`, `--keep-registered`, `--cpu`,
+`--debayer {auto,on,off}` / `--bayer RGGB`, `--reference`, `--keep-registered`,
+`--registered-drive PATH` (repeat to distribute registered frames across drives), `--cpu`,
 `--vram-fraction`, `--workers`.
+
+### Filter presets and preview
+
+**Lenient**, **Balanced**, and **Selective** supply editable quality-filter thresholds. Balanced
+preserves the previous defaults; these are provisional starting points, not fixed rejection quotas.
+Presets do not alter stacking weights, pixel rejection, or the advanced PSFSW cutoff.
+
+| Preset | Transparency min | Stars min | Sky max | FWHM max |
+| --- | ---: | ---: | ---: | ---: |
+| Lenient | 0.4 | 0.35 | 3.0 | 1.8 |
+| Balanced | 0.6 | 0.6 | 2.0 | 1.4 |
+| Selective | 0.8 | 0.8 | 1.5 | 1.2 |
+
+**Preview filters...** analyzes one stacking group, then updates decisions from cached analysis as
+you edit thresholds. The sortable table shows measured values and reasons, with unique rejected
+frame counts and retained known exposure. Transparency and PSFSW are pending until registration;
+completed-run measurements are available afterward. Changing early filters can change late-stage
+baselines on the next run, so previews using previous registration measurements remain estimates.
+Batch runs evaluate presets independently for each group; cross-group preview is not supported.
+
+CLI presets accept individual overrides, for example:
+
+```powershell
+py -3 run_gpustacker.py stack "G:\Target\Lights" -o master.fit `
+  --filter-preset selective --filter-fwhm 1.6
+```
+
+The optional **PSFSW min (advanced)** / `--filter-psfsw` cutoff defaults to zero (off). It compares
+unclipped `(flux_ratio / noise)^2` with its exposure-group median after registration, independent of
+the chosen stacking weights. Groups need at least three valid measurements; unknown measurements
+are not rejected. Scores are recorded in the `psfsw` report column separately from stack `weight`.
+Retained registered stores reuse saved exclusions and weights and cannot apply a new cutoff.
+Disabling quality filters does not bypass unreadable-frame or registration failures.
 
 ### Reference review and storage preflight
 
@@ -76,6 +118,18 @@ candidate is previewed by default.
 Before a GUI stack starts, output confirmation estimates scratch and output storage on each relevant
 volume. Batch runs show group estimates. Treat estimates as planning guidance: actual peak use depends
 on the data and options, and representative runs are still needed to calibrate them.
+
+Registered frames can be distributed across multiple drives by adding one frame-storage folder per
+drive in the GUI, or repeating `--registered-drive` on the CLI:
+
+```powershell
+py -3 run_gpustacker.py stack "D:\Lights" -o "E:\Stacks\master.fit" `
+  --registered-drive "G:\GPUStacker frames" --registered-drive "P:\GPUStacker frames"
+```
+
+Frames are stored whole in per-run folders and mapped by the registered-store manifest. Use
+`--keep-registered` to retain the store after stacking. Multi-drive stores are not supported with
+experimental network workers in this first version.
 
 ### Resume interrupted runs
 

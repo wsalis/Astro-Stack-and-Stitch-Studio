@@ -112,7 +112,7 @@ def _norm_map_sample(map_np: np.ndarray, rx: torch.Tensor, ry: torch.Tensor, hei
     return F.grid_sample(m, grid, mode="bilinear", padding_mode="border", align_corners=False)[0, :, 0, :]
 
 
-def drizzle_frame(acc: DrizzleAccumulator, frame: torch.Tensor, alignment: Alignment, norm: FrameNorm, ref_offset: float | np.ndarray, settings: DrizzleSettings, reject_mask: torch.Tensor | None = None, cfa_pattern: str | None = None, ref_shape: tuple[int, int] | None = None) -> None:
+def drizzle_frame(acc: DrizzleAccumulator, frame: torch.Tensor, alignment: Alignment, norm: FrameNorm, ref_offset: float | np.ndarray, settings: DrizzleSettings, reject_mask: torch.Tensor | None = None, cfa_pattern: str | None = None, ref_shape: tuple[int, int] | None = None, output_origin: tuple[int, int] = (0, 0)) -> None:
     """Add one calibrated, UNREGISTERED frame to the accumulator.
 
     frame: (C, H, W) on device. With ``cfa_pattern`` the frame must be (1, H, W) raw CFA and the
@@ -147,6 +147,8 @@ def drizzle_frame(acc: DrizzleAccumulator, frame: torch.Tensor, alignment: Align
     # Process one kernel sample at a time to bound memory.
     for dy, dx, sample_weight in samples:
         rx, ry = reference_coords(alignment, xs_f + dx, ys_f + dy)
+        rx = rx - output_origin[0]
+        ry = ry - output_origin[1]
         ox = torch.floor(rx * scale + 0.5 * (scale - 1) + 0.5).long()  # sub-sample centre -> output pixel
         oy = torch.floor(ry * scale + 0.5 * (scale - 1) + 0.5).long()
         inside = valid_f & (ox >= 0) & (ox < out_w) & (oy >= 0) & (oy < out_h)

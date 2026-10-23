@@ -400,6 +400,7 @@ class DistributedWindow:
                     self.status_var.set("Worker service stopped.")
                 elif event == "worker_status":
                     self.status_var.set(str(payload))
+                    self._set_result(str(payload))
                 elif event == "probe_result":
                     success, version_match, summary = payload
                     self.probe_button.configure(state="normal")

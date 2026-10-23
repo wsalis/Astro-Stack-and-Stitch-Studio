@@ -11,7 +11,9 @@ import json
 import math
 import os
 import re
+import shutil
 import tempfile
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +53,14 @@ def norm_vec(value: float | np.ndarray, channels: int) -> np.ndarray:
     return np.broadcast_to(np.asarray(value, dtype=np.float32).reshape(-1), (channels,)).copy()
 
 
+def _storage_volume_id(path: Path) -> int:
+    return path.stat().st_dev
+
+
+def _allocated_file_bytes(size_bytes: int) -> int:
+    return ((size_bytes + 256 + 4095) // 4096) * 4096
+
+
 @dataclass
 class FrameStore:
     """Registered frames on disk plus their normalisation parameters."""
@@ -61,30 +71,71 @@ class FrameStore:
     norms: list[FrameNorm] = field(default_factory=list)
     names: list[str] = field(default_factory=list)
     mask_paths: list[Path] = field(default_factory=list)  # per-frame rejection masks (optional)
+    storage_roots: list[Path] = field(default_factory=list)
+    reserve_mask_bytes: int = 0
+    storage_dirs: list[Path] = field(default_factory=list, init=False)
+    _remaining_bytes: list[int] = field(default_factory=list, init=False, repr=False)
+    _data_offsets: dict[Path, int] = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        roots = [Path(root).expanduser().resolve() for root in self.storage_roots]
+        if roots:
+            seen_volumes = set()
+            selected_roots = []
+            for root in roots:
+                root.mkdir(parents=True, exist_ok=True)
+                volume = _storage_volume_id(root)
+                if volume not in seen_volumes:
+                    seen_volumes.add(volume)
+                    selected_roots.append(root)
+            store_id = uuid.uuid4().hex
+            self.storage_dirs = [root / f".gpustacker_registered_{store_id}" for root in selected_roots]
+            for directory in self.storage_dirs:
+                directory.mkdir()
+        else:
+            self.storage_dirs = [self.directory]
+        self._remaining_bytes = [int(shutil.disk_usage(directory).free) for directory in self.storage_dirs]
 
     def __len__(self) -> int:
         return len(self.paths)
 
     def add(self, name: str, data: np.ndarray, norm: FrameNorm | None = None) -> Path:
-        path = self._reserve(name, norm)
-        np.save(path, np.ascontiguousarray(data, dtype=np.float32))
+        arr = np.ascontiguousarray(data, dtype=np.float32)
+        path = self._reserve(name, norm, arr.nbytes)
+        np.save(path, arr)
         return path
 
     def add_async(self, name: str, data: np.ndarray, norm: FrameNorm | None, executor) -> "Future[Path]":
         """Reserve the slot now (keeps frame order) and write on the executor."""
 
-        path = self._reserve(name, norm)
         arr = np.ascontiguousarray(data, dtype=np.float32)
+        path = self._reserve(name, norm, arr.nbytes)
 
         def write() -> Path:
-            np.save(path, arr)
+            try:
+                np.save(path, arr)
+            except OSError as exc:
+                raise OSError(f"Failed writing registered frame {name!r} to {path} ({arr.nbytes} bytes): {exc}") from exc
             return path
 
         return executor.submit(write)
 
-    def _reserve(self, name: str, norm: FrameNorm | None) -> Path:
-        self.directory.mkdir(parents=True, exist_ok=True)
-        path = self.directory / f"reg_{len(self.paths):04d}.npy"
+    def _reserve(self, name: str, norm: FrameNorm | None, size_bytes: int) -> Path:
+        reserved_bytes = _allocated_file_bytes(size_bytes)
+        if self.reserve_mask_bytes:
+            reserved_bytes += _allocated_file_bytes(self.reserve_mask_bytes)
+        available = [
+            min(remaining, int(shutil.disk_usage(directory).free))
+            for directory, remaining in zip(self.storage_dirs, self._remaining_bytes)
+        ]
+        candidates = [index for index, free in enumerate(available) if free >= reserved_bytes]
+        if not candidates:
+            details = ", ".join(f"{directory}: {free} bytes free" for directory, free in zip(self.storage_dirs, available))
+            raise OSError(f"No selected registered-frame drive has space for a {size_bytes}-byte frame ({details})")
+        storage_index = max(candidates, key=lambda index: available[index])
+        self._remaining_bytes[storage_index] = available[storage_index] - reserved_bytes
+        path = self.storage_dirs[storage_index] / f"reg_{len(self.paths):04d}.npy"
         self.paths.append(path)
         self.norms.append(norm or FrameNorm())
         self.names.append(name)
@@ -94,22 +145,44 @@ class FrameStore:
         return [np.load(p, mmap_mode="r") for p in self.paths]
 
     def band_reader(self, workers: int = 8) -> "BandReader":
-        return BandReader(self.paths, self.shape, workers)
+        offsets = [self._data_offsets[path] for path in self.paths] if all(path in self._data_offsets for path in self.paths) else None
+        reader = BandReader(self.paths, self.shape, workers, data_offsets=offsets)
+        self._data_offsets.update(zip(self.paths, reader.data_offsets))
+        return reader
 
     @classmethod
-    def load_index(cls, directory: Path, allow_missing: bool = False) -> "FrameStore":
+    def load_index(
+        cls,
+        directory: Path,
+        allow_missing: bool = False,
+        allowed_storage_dirs: list[Path] | None = None,
+    ) -> "FrameStore":
         """Restore a registered store, validating that every frame belongs to it and matches its shape."""
 
         try:
             index = json.loads((directory / "index.json").read_text(encoding="utf-8"))
             shape = tuple(int(v) for v in index["shape"])
             frames = index["frames"]
+            stored_dirs = index.get("storage_dirs", [])
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"Cannot read registered-frame index in {directory}: {exc}") from exc
         if len(shape) != 3 or any(v < 1 for v in shape) or not isinstance(frames, list) or not frames:
             raise ValueError("Registered-frame index has an invalid shape or no frames")
         root = directory.resolve()
+        if not isinstance(stored_dirs, list) or any(not isinstance(path, str) for path in stored_dirs):
+            raise ValueError("Registered-frame index has invalid storage directories")
+        stored_paths = [Path(path) for path in stored_dirs]
+        if any(path.is_symlink() for path in stored_paths):
+            raise ValueError("Registered-frame index contains a symlinked storage directory")
+        external_dirs = [path.resolve(strict=not allow_missing) for path in stored_paths]
+        if any(path == root or re.fullmatch(r"\.gpustacker_registered_[0-9a-f]{32}", path.name) is None for path in external_dirs):
+            raise ValueError("Registered-frame index contains an invalid storage directory")
+        if allowed_storage_dirs is not None:
+            allowed = {Path(path).resolve(strict=not allow_missing) for path in allowed_storage_dirs}
+            if set(external_dirs) != allowed:
+                raise ValueError("Registered-frame storage directories do not match the store manifest")
         store = cls(directory, shape)
+        store.storage_dirs = [root, *external_dirs]
         for frame_index, entry in enumerate(frames):
             try:
                 stored_path = Path(entry["path"])
@@ -123,8 +196,8 @@ class FrameStore:
                         path = (directory / stored_path.name).resolve(strict=not allow_missing)
                 else:
                     path = (directory / stored_path).resolve(strict=not allow_missing)
-                if not path.is_relative_to(root):
-                    if not stored_path.is_absolute() or not is_registered_array:
+                if not path.is_relative_to(root) and not any(path.parent == storage_dir for storage_dir in external_dirs):
+                    if not stored_path.is_absolute() or not is_registered_array or external_dirs:
                         raise ValueError(f"Registered frame is outside its store: {path}")
                     path = (directory / stored_path.name).resolve(strict=not allow_missing)
                     if not path.is_relative_to(root):
@@ -132,9 +205,11 @@ class FrameStore:
                 if path.exists():
                     array = np.load(path, mmap_mode="r", allow_pickle=False)
                     valid_shape = array.shape == shape and array.dtype == np.float32
+                    data_offset = int(array.offset)
                     del array
                     if not valid_shape:
                         raise ValueError(f"Registered frame has invalid shape or dtype: {path}")
+                    store._data_offsets[path] = data_offset
                 offset_value = entry["offset"]
                 scale_value = entry["scale"]
                 offset = float(offset_value) if np.isscalar(offset_value) else np.asarray(offset_value, dtype=np.float32)
@@ -229,9 +304,10 @@ class FrameStore:
                     finally:
                         if temporary is not None:
                             temporary.unlink(missing_ok=True)
+            stored_frame_path = path.name if path.parent == self.directory.resolve() else str(path.resolve())
             frames.append({
                 "name": name,
-                "path": path.name,
+                "path": stored_frame_path,
                 "offset": np.asarray(norm.offset, dtype=float).tolist(),
                 "scale": np.asarray(norm.scale, dtype=float).tolist(),
                 "weight": norm.weight,
@@ -239,7 +315,8 @@ class FrameStore:
                 "scale_map": None if scale_map_path is None else scale_map_path.name,
                 "offset_map": None if offset_map_path is None else offset_map_path.name,
             })
-        index = {"shape": list(self.shape), "frames": frames}
+        external_dirs = [str(path.resolve()) for path in self.storage_dirs if path.resolve() != self.directory.resolve()]
+        index = {"shape": list(self.shape), "storage_dirs": external_dirs, "frames": frames}
         out = self.directory / "index.json"
         write_json_atomic(out, index)
         return out
@@ -250,6 +327,12 @@ class FrameStore:
                 p.unlink()
             except OSError:
                 pass
+        for directory in self.storage_dirs:
+            if directory != self.directory:
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
 
 
 def registered_store_cleanup_plan(directory: Path) -> list[Path]:
@@ -265,25 +348,47 @@ def registered_store_cleanup_plan(directory: Path) -> list[Path]:
             if not isinstance(marker, dict):
                 raise ValueError("Invalid registered-store cleanup marker")
             names = marker["files"]
-            if marker.get("schema") != 1 or not isinstance(names, list):
+            schema = marker.get("schema")
+            if schema not in (1, 2) or not isinstance(names, list):
                 raise ValueError("Invalid registered-store cleanup marker")
-            if any(
-                not isinstance(name, str)
-                or name not in ("index.json", "registered_store.json")
-                and re.fullmatch(r"(?:reg|rej|weight|scale|offset)_\d{4}\.npy", name) is None
-                for name in names
-            ):
-                raise ValueError("Cleanup marker contains an unowned filename")
+            if schema == 1:
+                if any(
+                    not isinstance(name, str)
+                    or name not in ("index.json", "registered_store.json")
+                    and re.fullmatch(r"(?:reg|rej|weight|scale|offset)_\d{4}\.npy", name) is None
+                    for name in names
+                ):
+                    raise ValueError("Cleanup marker contains an unowned filename")
+                storage_dirs = []
+                paths = [root / name for name in names]
+            else:
+                raw_dirs = marker.get("storage_dirs")
+                if not isinstance(raw_dirs, list) or any(not isinstance(path, str) for path in raw_dirs):
+                    raise ValueError("Cleanup marker contains invalid storage directories")
+                raw_storage_dirs = [Path(path) for path in raw_dirs]
+                if any(path.is_symlink() for path in raw_storage_dirs):
+                    raise ValueError("Cleanup marker contains a symlinked storage directory")
+                storage_dirs = [path.resolve() for path in raw_storage_dirs]
+                if any(re.fullmatch(r"\.gpustacker_registered_[0-9a-f]{32}", path.name) is None for path in storage_dirs):
+                    raise ValueError("Cleanup marker contains an invalid storage directory")
+                paths = [Path(path) for path in names if isinstance(path, str)]
+                if len(paths) != len(names):
+                    raise ValueError("Cleanup marker contains an invalid artifact path")
         except (OSError, KeyError, TypeError, AttributeError, json.JSONDecodeError) as exc:
             raise ValueError(f"Cannot validate cleanup marker in {root}: {exc}") from exc
         validated = []
-        for path in [*(root / name for name in names), cleanup_marker]:
+        for path in [*paths, cleanup_marker]:
             if path.is_symlink():
                 raise ValueError(f"Registered-store artifact is a symlink: {path}")
             if not path.exists():
                 continue
             resolved = path.resolve(strict=True)
-            if not resolved.is_relative_to(root) or not resolved.is_file():
+            root_artifact = resolved.parent == root and (
+                resolved.name in ("index.json", "registered_store.json", "cleanup_pending.json")
+                or re.fullmatch(r"(?:reg|rej|weight|scale|offset)_\d{4}\.npy", resolved.name) is not None
+            )
+            external_artifact = any(resolved.parent == storage_dir and re.fullmatch(r"(?:reg|rej)_\d{4}\.npy", resolved.name) is not None for storage_dir in storage_dirs)
+            if not (root_artifact or external_artifact) or not resolved.is_file():
                 raise ValueError(f"Registered-store artifact is not a regular file inside its store: {path}")
             validated.append(resolved)
         return validated
@@ -293,7 +398,19 @@ def registered_store_cleanup_plan(directory: Path) -> list[Path]:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if not isinstance(manifest, dict) or manifest.get("schema") != 1 or manifest.get("stage") != "registered_before_stack":
             raise ValueError("Unsupported or incomplete registered-store manifest")
-        store = FrameStore.load_index(root, allow_missing=True)
+        raw_dirs = manifest.get("storage_dirs", [])
+        if not isinstance(raw_dirs, list) or any(not isinstance(path, str) for path in raw_dirs):
+            raise ValueError("Registered-store manifest has invalid storage directories")
+        storage_dirs = []
+        for value in raw_dirs:
+            path = Path(value)
+            if path.is_symlink() or re.fullmatch(r"\.gpustacker_registered_[0-9a-f]{32}", path.name) is None:
+                raise ValueError("Registered-store manifest has an invalid storage directory")
+            resolved = path.resolve(strict=True)
+            if not resolved.is_dir():
+                raise ValueError(f"Registered-frame storage directory is missing: {path}")
+            storage_dirs.append(resolved)
+        store = FrameStore.load_index(root, allow_missing=True, allowed_storage_dirs=storage_dirs)
         if manifest.get("index") != "index.json" or manifest.get("shape") != list(store.shape) or manifest.get("frame_count") != len(store):
             raise ValueError("Registered-store manifest does not match its index")
         index = json.loads((root / "index.json").read_text(encoding="utf-8"))
@@ -325,7 +442,12 @@ def registered_store_cleanup_plan(directory: Path) -> list[Path]:
         if not path.exists():
             continue
         resolved = path.resolve(strict=True)
-        if not resolved.is_relative_to(root) or not resolved.is_file():
+        root_artifact = resolved.parent == root and (
+            resolved.name in ("index.json", "registered_store.json", "cleanup_pending.json")
+            or re.fullmatch(r"(?:reg|rej|weight|scale|offset)_\d{4}\.npy", resolved.name) is not None
+        )
+        external_artifact = any(resolved.parent == storage_dir and re.fullmatch(r"(?:reg|rej)_\d{4}\.npy", resolved.name) is not None for storage_dir in storage_dirs)
+        if not (root_artifact or external_artifact) or not resolved.is_file():
             raise ValueError(f"Registered-store artifact is not a regular file inside its store: {path}")
         validated.append(resolved)
     return validated
@@ -340,8 +462,19 @@ def cleanup_registered_store(directory: Path) -> tuple[int, int]:
     cleanup_marker = root / "cleanup_pending.json"
     if cleanup_marker.is_symlink():
         raise ValueError(f"Registered-store cleanup marker is a symlink: {cleanup_marker}")
+    storage_dirs = []
     if not cleanup_marker.exists():
-        write_json_atomic(cleanup_marker, {"schema": 1, "files": [path.name for path in validated]})
+        manifest_path = root / "registered_store.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        storage_dirs = [str(Path(value).resolve()) for value in manifest.get("storage_dirs", [])]
+        write_json_atomic(cleanup_marker, {
+            "schema": 2,
+            "storage_dirs": storage_dirs,
+            "files": [str(path) for path in validated if path != cleanup_marker],
+        })
+    else:
+        marker = json.loads(cleanup_marker.read_text(encoding="utf-8"))
+        storage_dirs = marker.get("storage_dirs", []) if marker.get("schema") == 2 else []
     errors = []
     removed_bytes = 0
     removed_count = 0
@@ -359,6 +492,11 @@ def cleanup_registered_store(directory: Path) -> tuple[int, int]:
         cleanup_marker.unlink()
     except OSError as exc:
         raise OSError(f"Removed {removed_count} registered-store files ({removed_bytes} bytes), but cleanup marker remains: {exc}") from exc
+    for storage_dir in storage_dirs:
+        try:
+            Path(storage_dir).rmdir()
+        except OSError:
+            pass
     return removed_count, total_bytes
 
 
@@ -747,6 +885,8 @@ def _combine_stack_band(
     scales: torch.Tensor,
     weights: torch.Tensor | None,
     local_maps: LocalNormMaps | None = None,
+    output_start: int = 0,
+    output_stop: int | None = None,
 ) -> StackBandResult:
     n, channels, rows, width = x.shape
     height = store.shape[1]
@@ -774,6 +914,13 @@ def _combine_stack_band(
         band_weights = base_weights.view(n, 1, 1, 1) * torch.stack(spatial)
 
     combined = combine_full(x, settings, band_weights)
+    combined.image = combined.image[:, output_start:output_stop]
+    combined.valid = combined.valid[:, :, output_start:output_stop]
+    if combined.rej_low is not None:
+        combined.rej_low = combined.rej_low[:, :, output_start:output_stop]
+    if combined.rej_high is not None:
+        combined.rej_high = combined.rej_high[:, :, output_start:output_stop]
+    rows = combined.image.shape[1]
     image = combined.image.cpu().numpy()
     coverage = combined.valid[:, 0].sum(dim=0).to(torch.int32).cpu().numpy().astype(np.uint16)
     rejection_count = torch.zeros_like(combined.valid[0], dtype=torch.float32)
@@ -804,7 +951,7 @@ class BandReader:
     threads keeps an NVMe busy; strided memmap copies from one thread run at a fraction of that.
     """
 
-    def __init__(self, paths: list[Path], shape: tuple[int, int, int], workers: int = 8) -> None:
+    def __init__(self, paths: list[Path], shape: tuple[int, int, int], workers: int = 8, data_offsets: list[int] | None = None) -> None:
         channels, height, width = shape
         self.paths = [str(p) for p in paths]
         self.shape = shape
@@ -812,6 +959,11 @@ class BandReader:
         self.plane_bytes = height * self.row_bytes
         self.workers = max(1, workers)
         self.data_offsets: list[int] = []
+        if data_offsets is not None:
+            if len(data_offsets) != len(paths) or any(offset < 0 for offset in data_offsets):
+                raise ValueError("Registered-frame data offsets do not match the store")
+            self.data_offsets = list(data_offsets)
+            return
         for path in self.paths:
             array = np.load(path, mmap_mode="r", allow_pickle=False)
             if array.shape != shape or array.dtype != np.float32:
@@ -886,6 +1038,21 @@ def band_overhead(settings: StackSettings) -> float:
     return overhead
 
 
+def _stack_band_halo(settings: StackSettings) -> int:
+    if not settings.large_scale or settings.method in ("none", "median"):
+        return 0
+    return (settings.large_scale_box | 1) // 2 + settings.large_scale_grow
+
+
+def _stack_band_rows(store: FrameStore, backend: Backend, settings: StackSettings) -> int:
+    channels, height, width = store.shape
+    capacity = rows_per_band(len(store), width, channels, backend.budget_bytes, overhead=band_overhead(settings))
+    halo = _stack_band_halo(settings)
+    if halo and capacity < min(height, 2 * halo + 1):
+        raise ValueError("Insufficient device memory for large-scale rejection overlap; disable large-scale rejection or reduce the frame count")
+    return max(1, capacity - 2 * halo)
+
+
 def stack_store_band(
     store: FrameStore,
     backend: Backend,
@@ -895,6 +1062,7 @@ def stack_store_band(
     reject_masks: bool = False,
     frame_maps: list[np.memmap] | BandReader | None = None,
     host_data: np.ndarray | None = None,
+    cancel_cb: Callable[[], None] | None = None,
 ) -> StackBandResult:
     """Stack an absolute half-open row range with the same math as ``stack_store``."""
 
@@ -904,13 +1072,16 @@ def stack_store_band(
     channels, height, width = store.shape
     if row_start < 0 or row_stop <= row_start or row_stop > height:
         raise ValueError("Stack band row range is outside the registered store")
-    max_band = max(1, rows_per_band(n, width, channels, backend.budget_bytes, overhead=band_overhead(settings)))
+    max_band = _stack_band_rows(store, backend, settings)
+    halo = _stack_band_halo(settings)
+    data_start = max(0, row_start - halo)
+    data_stop = min(height, row_stop + halo)
     maps: list[np.memmap] | BandReader = []
     if host_data is None:
         maps = store.band_reader() if frame_maps is None else frame_maps
         if len(maps) != n:
             raise ValueError("Registered-frame map count does not match the store")
-    elif host_data.shape != (n, channels, row_stop - row_start, width) or host_data.dtype != np.float32:
+    elif host_data.shape != (n, channels, data_stop - data_start, width) or host_data.dtype != np.float32:
         raise ValueError("Pre-read stack band does not match the requested rows")
     offsets = torch.from_numpy(np.stack([norm_vec(norm.offset, channels) for norm in store.norms])).to(backend.device).view(n, channels, 1, 1)
     scales = torch.from_numpy(np.stack([norm_vec(norm.scale, channels) for norm in store.norms])).to(backend.device).view(n, channels, 1, 1)
@@ -923,23 +1094,30 @@ def stack_store_band(
     masks = np.empty((n, row_count, width), dtype=np.uint8) if reject_masks else None
     rejected_low = rejected_high = total_samples = 0
     for absolute_start in range(row_start, row_stop, max_band):
+        if cancel_cb is not None:
+            cancel_cb()
         absolute_stop = min(row_stop, absolute_start + max_band)
-        rows = absolute_stop - absolute_start
+        read_start = max(0, absolute_start - halo)
+        read_stop = min(height, absolute_stop + halo)
+        rows = read_stop - read_start
         if host_data is None:
             host = torch.empty((n, channels, rows, width), dtype=torch.float32, pin_memory=backend.is_cuda)
             host_np = host.numpy()
             if isinstance(maps, BandReader):
-                maps.read_into(absolute_start, absolute_stop, host_np)
+                maps.read_into(read_start, read_stop, host_np)
             else:
                 for index, frame in enumerate(maps):
-                    host_np[index] = frame[:, absolute_start:absolute_stop, :]
+                    host_np[index] = frame[:, read_start:read_stop, :]
         else:
-            offset = absolute_start - row_start
+            offset = read_start - data_start
             host = torch.from_numpy(host_data[:, :, offset : offset + rows, :]).clone()  # the band is normalised in place
         tensor = host.to(backend.device, non_blocking=backend.is_cuda)
-        result = _combine_stack_band(tensor, store, backend, settings, absolute_start, reject_masks, offsets, scales, weights, local_maps)
+        result = _combine_stack_band(
+            tensor, store, backend, settings, read_start, reject_masks, offsets, scales, weights, local_maps,
+            absolute_start - read_start, absolute_stop - read_start,
+        )
         local_start = absolute_start - row_start
-        local_stop = local_start + rows
+        local_stop = absolute_stop - row_start
         image[:, local_start:local_stop, :] = result.image
         coverage[local_start:local_stop, :] = result.coverage
         rejection[local_start:local_stop, :] = result.rejection
@@ -968,7 +1146,9 @@ def stack_store(store: FrameStore, backend: Backend, settings: StackSettings, pr
     if reject_masks:
         store.mask_paths = [p.with_name(p.name.replace("reg_", "rej_")) for p in store.paths]
         mask_maps = [np.lib.format.open_memmap(p, mode="w+", dtype=np.uint8, shape=(height, width)) for p in store.mask_paths]
-    band = rows_per_band(n, width, channels, backend.budget_bytes, overhead=band_overhead(settings))
+    band = _stack_band_rows(store, backend, settings)
+    halo = _stack_band_halo(settings)
+    buffer_rows = min(height, band + 2 * halo)
     bands = math.ceil(height / band)
     out = np.empty((channels, height, width), dtype=np.float32)
     coverage = np.empty((height, width), dtype=np.uint16)
@@ -980,13 +1160,13 @@ def stack_store(store: FrameStore, backend: Backend, settings: StackSettings, pr
     weights = torch.tensor([f.weight for f in store.norms], device=backend.device) if settings.use_weights else None
     local_maps = LocalNormMaps(store.norms, channels, backend.device)
 
-    host_buffers = [torch.empty((n, channels, band, width), dtype=torch.float32, pin_memory=backend.is_cuda)]
+    host_buffers = [torch.empty((n, channels, buffer_rows, width), dtype=torch.float32, pin_memory=backend.is_cuda)]
     if backend.is_cuda and bands > 1:
-        host_buffers.append(torch.empty((n, channels, band, width), dtype=torch.float32, pin_memory=True))
+        host_buffers.append(torch.empty((n, channels, buffer_rows, width), dtype=torch.float32, pin_memory=True))
     host_np_buffers = [buffer.numpy() for buffer in host_buffers]
 
     def stage_host_band(buffer_index: int, r0: int, r1: int) -> None:
-        reader.read_into(r0, r1, host_np_buffers[buffer_index])
+        reader.read_into(max(0, r0 - halo), min(height, r1 + halo), host_np_buffers[buffer_index])
 
     rej_low = rej_high = 0
     prefetch = ThreadPoolExecutor(max_workers=1) if len(host_buffers) > 1 else None
@@ -998,7 +1178,9 @@ def stack_store(store: FrameStore, backend: Backend, settings: StackSettings, pr
             buffer_index = bi % len(host_buffers)
             r0 = bi * band
             r1 = min(height, r0 + band)
-            rows = r1 - r0
+            read_start = max(0, r0 - halo)
+            read_stop = min(height, r1 + halo)
+            rows = read_stop - read_start
             if pending_stage is not None:
                 pending_stage.result()
                 pending_stage = None
@@ -1010,7 +1192,10 @@ def stack_store(store: FrameStore, backend: Backend, settings: StackSettings, pr
                 next_r0 = (bi + 1) * band
                 next_r1 = min(height, next_r0 + band)
                 pending_stage = prefetch.submit(stage_host_band, (bi + 1) % len(host_buffers), next_r0, next_r1)
-            band_result = _combine_stack_band(x, store, backend, settings, r0, reject_masks, offsets, scales, weights, local_maps)
+            band_result = _combine_stack_band(
+                x, store, backend, settings, read_start, reject_masks, offsets, scales, weights, local_maps,
+                r0 - read_start, r1 - read_start,
+            )
             out[:, r0:r1, :] = band_result.image
             coverage[r0:r1, :] = band_result.coverage
             rejection[r0:r1, :] = band_result.rejection

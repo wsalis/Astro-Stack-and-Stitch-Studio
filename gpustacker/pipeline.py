@@ -32,8 +32,8 @@ from .io import FrameMeta, load_frame, load_meta, save_fits
 from .mfdeconv import MFDeconvResult, MFDeconvSettings, run_mfdeconv
 from .normalization import LocalNormSettings, block_stats, fit_norm_maps, reference_block_stats
 from .platesolve import find_astap, solve_fits
-from .quality import WEIGHTING_CHOICES, FilterSettings, StarSet, aperture_flux, compute_weights, field_weight_factors, sample_field_grid, select_photometry_stars, transparency
-from .registration import Alignment, Interpolation, estimate_alignment, refine_alignment, source_coords_at, warp_to_reference
+from .quality import WEIGHTING_CHOICES, FilterSettings, StarSet, aperture_flux, compute_weights, field_weight_factors, relative_psfsw, sample_field_grid, select_photometry_stars, transparency
+from .registration import Alignment, Interpolation, estimate_alignment, reference_overlap_fraction, refine_alignment, source_coords_at, union_reference_grid, warp_to_reference
 from .stacking import FrameNorm, FrameStore, StackResult, StackSettings, estimate_norm, norm_vec, stack_store
 
 ProgressCallback = Callable[[float, str], None]
@@ -102,6 +102,7 @@ class PipelineSettings:
     debayer_method: Literal["vng", "bilinear"] = "vng"
     bayer_pattern: str | None = None
     reference: Path | None = None
+    full_field: bool = False
     detection_sigma: float = 5.0
     min_stars: int = 8
     weighting: Weighting = "psfsw"
@@ -121,6 +122,7 @@ class PipelineSettings:
     mfdeconv_frames: int = 12
     mfdeconv_blend: float = 0.3
     keep_registered: bool = False
+    registered_storage_dirs: list[Path] = field(default_factory=list)
     resume: bool = False
     device: Literal["auto", "cpu"] = "auto"
     vram_fraction: float = 0.75
@@ -167,6 +169,7 @@ class FrameInfo:
     store_index: int | None = None
     fwhm_count_grid: np.ndarray | None = None
     bright_star_rate: float | None = None
+    psfsw: float = float("nan")
 
     @property
     def flipped(self) -> bool | None:
@@ -285,6 +288,51 @@ def _solve_alignment(stars: Stars, ref_stars: Stars, refine: bool) -> Alignment:
     return align
 
 
+def preview_frame_filters(infos: list[FrameInfo], filters: FilterSettings) -> tuple[list[FrameInfo], dict]:
+    evaluated = [replace(info, rejected_reason=None if (info.rejected_reason or "").startswith("filter:") else info.rejected_reason) for info in infos]
+    usable = [info for info in evaluated if info.rejected_reason is None]
+    star_counts = [info.stars.total_detected for info in usable if info.stars is not None]
+    backgrounds = [info.background for info in usable if np.isfinite(info.background)]
+    fwhms = [info.fwhm for info in usable if np.isfinite(info.fwhm)]
+    groups: dict[float | None, list[FrameInfo]] = {}
+    for info in usable:
+        groups.setdefault(exposure_key(info.meta.exposure if info.meta is not None else None), []).append(info)
+    per_exposure = {}
+    if len(groups) > 1:
+        for key, members in groups.items():
+            if len(members) >= 3:
+                per_exposure[key] = {
+                    "frames": len(members),
+                    "median_stars": float(np.median([member.stars.total_detected for member in members])),
+                    "median_background": float(np.median([member.background for member in members])),
+                }
+    baseline = {
+        "enabled": filters.enabled,
+        "candidate_frames": len(usable),
+        "median_stars": float(np.median(star_counts)) if star_counts else None,
+        "median_background": float(np.median(backgrounds)) if backgrounds else None,
+        "median_fwhm_px": float(np.median(fwhms)) if fwhms else None,
+        "per_exposure": {("unknown" if key is None else f"{key:g}s"): value for key, value in per_exposure.items()} or None,
+    }
+    if not filters.enabled or len(usable) < 3:
+        return evaluated, baseline
+    for info in usable:
+        group = per_exposure.get(exposure_key(info.meta.exposure if info.meta is not None else None))
+        stars = group["median_stars"] if group else baseline["median_stars"]
+        sky = group["median_background"] if group else baseline["median_background"]
+        fwhm = baseline["median_fwhm_px"]
+        reasons = []
+        if filters.stars_min_ratio > 0 and stars is not None and info.stars.total_detected < filters.stars_min_ratio * stars:
+            reasons.append(f"stars {info.stars.total_detected} < {filters.stars_min_ratio:.0%} of median {stars:.0f}")
+        if filters.background_max_ratio > 0 and sky is not None and sky > 0 and info.background > filters.background_max_ratio * sky:
+            reasons.append(f"sky {info.background:.0f} > {filters.background_max_ratio:g}x median {sky:.0f}")
+        if filters.fwhm_max_ratio > 0 and fwhm is not None and np.isfinite(info.fwhm) and info.fwhm > filters.fwhm_max_ratio * fwhm:
+            reasons.append(f"FWHM {info.fwhm:.2f} > {filters.fwhm_max_ratio:g}x median {fwhm:.2f}")
+        if reasons:
+            info.rejected_reason = "filter: " + "; ".join(reasons)
+    return evaluated, baseline
+
+
 class StackingPipeline:
     def __init__(self, settings: PipelineSettings, status_cb: StatusCallback = _noop_status, progress_cb: ProgressCallback = _noop_progress) -> None:
         self.settings = settings
@@ -303,6 +351,7 @@ class StackingPipeline:
         self.cpu_workers = settings.workers if settings.workers > 0 else max(1, min(8, cores - 1))
         self.io_workers = int(min(4, max(1, self.cpu_workers)))
         self.phot: StarSet | None = None
+        self.output_origin = (0, 0)
         status_cb(f"Workers: {self.cpu_workers} detection process(es), {self.io_workers} loader thread(s)")
 
     def cancel(self) -> None:
@@ -469,54 +518,16 @@ class StackingPipeline:
         exposure group (falling back to the session median for groups too small to have one). FWHM does not.
         """
 
-        f = self.settings.filters
-        usable = [i for i in infos if i.rejected_reason is None]
-        star_counts = [i.stars.total_detected for i in usable if i.stars is not None]
-        background_values = [i.background for i in usable if np.isfinite(i.background)]
-        fwhm_values = [i.fwhm for i in usable if np.isfinite(i.fwhm)]
-        groups: dict[float | None, list[FrameInfo]] = {}
-        for i in usable:
-            groups.setdefault(exposure_key(i.meta.exposure if i.meta is not None else None), []).append(i)
-        per_exposure: dict[float | None, dict[str, float]] = {}
-        if len(groups) > 1:
-            for key, members in groups.items():
-                if len(members) >= 3:
-                    per_exposure[key] = {
-                        "frames": len(members),
-                        "median_stars": float(np.median([m.stars.total_detected for m in members])),
-                        "median_background": float(np.median([m.background for m in members])),
-                    }
-        self.filter_baselines["prefilters"] = {
-            "enabled": f.enabled,
-            "candidate_frames": len(usable),
-            "median_stars": float(np.median(star_counts)) if star_counts else None,
-            "median_background": float(np.median(background_values)) if background_values else None,
-            "median_fwhm_px": float(np.median(fwhm_values)) if fwhm_values else None,
-            "per_exposure": {("unknown" if k is None else f"{k:g}s"): v for k, v in per_exposure.items()} or None,
-        }
+        evaluated, baseline = preview_frame_filters(infos, self.settings.filters)
+        self.filter_baselines["prefilters"] = baseline
+        per_exposure = baseline["per_exposure"]
         if per_exposure:
-            self.status("Mixed exposures: star-count and sky filters use per-exposure medians: " + ", ".join(f"{'?' if k is None else f'{k:g}s'}: {v['frames']} frames, {v['median_stars']:.0f} stars, sky {v['median_background']:.0f}" for k, v in sorted(per_exposure.items(), key=lambda kv: (kv[0] is None, kv[0] or 0))))
-        if not f.enabled:
-            return
-        if len(usable) < 3:
-            return
-        med_stars = float(np.median([i.stars.total_detected for i in usable]))
-        med_bg = float(np.median([i.background for i in usable]))
-        med_fwhm = float(np.nanmedian([i.fwhm for i in usable if np.isfinite(i.fwhm)] or [np.nan]))
-        for i in usable:
-            group = per_exposure.get(exposure_key(i.meta.exposure if i.meta is not None else None))
-            g_stars = group["median_stars"] if group else med_stars
-            g_bg = group["median_background"] if group else med_bg
-            reasons = []
-            if f.stars_min_ratio > 0 and i.stars.total_detected < f.stars_min_ratio * g_stars:
-                reasons.append(f"stars {i.stars.total_detected} < {f.stars_min_ratio:.0%} of median {g_stars:.0f}")
-            if f.background_max_ratio > 0 and g_bg > 0 and i.background > f.background_max_ratio * g_bg:
-                reasons.append(f"sky {i.background:.0f} > {f.background_max_ratio:.1f}x median {g_bg:.0f}")
-            if f.fwhm_max_ratio > 0 and np.isfinite(med_fwhm) and np.isfinite(i.fwhm) and i.fwhm > f.fwhm_max_ratio * med_fwhm:
-                reasons.append(f"FWHM {i.fwhm:.2f} > {f.fwhm_max_ratio:.1f}x median {med_fwhm:.2f}")
-            if reasons:
-                i.rejected_reason = "filter: " + "; ".join(reasons)
-                self.status(f"Excluded {i.path.name}: {i.rejected_reason}")
+            self.status("Mixed exposures: star-count and sky filters use per-exposure medians: " + ", ".join(f"{key}: {value['frames']} frames, {value['median_stars']:.0f} stars, sky {value['median_background']:.0f}" for key, value in per_exposure.items()))
+        for info, result in zip(infos, evaluated):
+            if info.rejected_reason != result.rejected_reason:
+                info.rejected_reason = result.rejected_reason
+                if info.rejected_reason is not None:
+                    self.status(f"Excluded {info.path.name}: {info.rejected_reason}")
 
     def tilt_summary(self, infos: list[FrameInfo]) -> dict:
         """Session FWHM map in sensor coordinates: constant pattern (tilt / curvature) vs frame-to-frame scatter."""
@@ -617,8 +628,8 @@ class StackingPipeline:
         for info, factor in zip(usable, factors):
             if info.alignment is None or info.store_index is None:
                 continue
-            sx, sy = source_coords_at(info.alignment, target_x, target_y)
-            weight_map = sample_field_grid(factor, sx.cpu().numpy(), sy.cpu().numpy(), (height, width))
+            sx, sy = source_coords_at(info.alignment, target_x + self.output_origin[0], target_y + self.output_origin[1])
+            weight_map = sample_field_grid(factor, sx.cpu().numpy(), sy.cpu().numpy(), info.meta.shape)
             store.norms[info.store_index].weight_map = weight_map
             factor_ranges.append(factor[np.isfinite(factor)])
         if factor_ranges:
@@ -648,6 +659,45 @@ class StackingPipeline:
         note = f" ({unknown} frame(s) without transparency fell back to noise-only)" if mode.startswith("psfsw") and unknown else ""
         self.status(f"Weights ({mode}): min {w.min():.2f}, median {np.median(w):.2f}, max {w.max():.2f}{note}")
 
+    def measure_psfsw(self, infos: list[FrameInfo]) -> None:
+        usable = [info for info in infos if info.rejected_reason is None and info.store_index is not None]
+        scores = relative_psfsw(
+            np.array([info.noise for info in usable]), np.array([info.flux_ratio for info in usable]),
+            [exposure_key(info.meta.exposure) for info in usable],
+        )
+        for info, score in zip(usable, scores):
+            info.psfsw = float(score)
+        if self.settings.filters.psfsw_min_ratio > 0:
+            self.filter_baselines["psfsw"] = {
+                "enabled": self.settings.filters.enabled,
+                "threshold": self.settings.filters.psfsw_min_ratio,
+                "normalization": "median within each exposure group; at least 3 valid measurements",
+                "candidate_frames": len(usable), "measured_frames": int(np.isfinite(scores).sum()),
+            }
+
+    def apply_psfsw_filter(self, infos: list[FrameInfo], store: FrameStore) -> None:
+        settings = self.settings.filters
+        if not settings.enabled or settings.psfsw_min_ratio <= 0:
+            return
+        dropped = []
+        for info in infos:
+            if info.rejected_reason is None and info.store_index is not None and np.isfinite(info.psfsw) and info.psfsw < settings.psfsw_min_ratio:
+                info.rejected_reason = f"filter: PSFSW {info.psfsw:.4g} < {settings.psfsw_min_ratio:g} of exposure-group median"
+                self.status(f"Excluded {info.path.name}: {info.rejected_reason}")
+                dropped.append(info)
+        self._drop_filtered_frames(infos, store, dropped)
+
+    def _drop_filtered_frames(self, infos: list[FrameInfo], store: FrameStore, dropped: list[FrameInfo]) -> None:
+        for info in sorted(dropped, key=lambda item: -(item.store_index or 0)):
+            store_index = info.store_index
+            if store_index is None:
+                continue
+            store.drop(store_index)
+            for other in infos:
+                if other.store_index is not None and other.store_index > store_index:
+                    other.store_index -= 1
+            info.store_index = None
+
     def apply_transparency_filter(self, infos: list[FrameInfo], store: FrameStore) -> None:
         # transparency was measured against the reference; re-express it against the session median so a
         # hazy reference frame cannot make every other frame look "too bright"
@@ -676,39 +726,82 @@ class StackingPipeline:
                 f.rejected_reason = f"filter: transparency {f.transparency:.2f} < {thr:.2f}"
                 self.status(f"Excluded {f.path.name}: {f.rejected_reason}")
                 dropped.append(f)
-        for f in sorted(dropped, key=lambda d: -(d.store_index or 0)):
-            store.drop(f.store_index)  # type: ignore[arg-type]
-            for g in infos:
-                if g.store_index is not None and g.store_index > f.store_index:  # type: ignore[operator]
-                    g.store_index -= 1
-            f.store_index = None
+        self._drop_filtered_frames(infos, store, dropped)
 
     # ------------------------------------------------------------------ pass 2: register
 
     def register(self, infos: list[FrameInfo], reference_index: int, store: FrameStore) -> None:
         ref = infos[reference_index]
         usable = [f for f in infos if f.rejected_reason is None]
-        total = len(usable)
         order = [ref] + [f for f in usable if f.index != reference_index]
-        by_path = {f.path: f for f in order}
-        self.phot = select_photometry_stars(ref.stars, (store.shape[1], store.shape[2]), ref.fwhm)
+        align_ahead = max(4, 4 * self.cpu_workers)
+        ref.alignment = Alignment.identity()
+        self.output_origin = (0, 0)
+        if self.settings.full_field:
+            min_reference_overlap = 0.25
+            align_queue = [f for f in order if f.index != reference_index]
+            align_futures: dict[int, Future] = {}
+            align_next = 0
+            pool_state = {"broken": False}
+            with self._detection_pool() as align_pool:
+                def submit_alignments() -> None:
+                    nonlocal align_next
+                    while align_next < len(align_queue) and len(align_futures) < align_ahead:
+                        f = align_queue[align_next]
+                        align_next += 1
+                        executor = _InlineExecutor() if pool_state["broken"] else align_pool
+                        try:
+                            align_futures[f.index] = executor.submit(_solve_alignment, f.stars, ref.stars, self.settings.refine_registration)
+                        except BrokenProcessPool:
+                            pool_state["broken"] = True
+                            align_futures[f.index] = _InlineExecutor().submit(_solve_alignment, f.stars, ref.stars, self.settings.refine_registration)
+
+                submit_alignments()
+                for f in align_queue:
+                    try:
+                        f.alignment = align_futures.pop(f.index).result()
+                    except BrokenProcessPool:
+                        if not pool_state["broken"]:
+                            pool_state["broken"] = True
+                            self.status("Alignment worker pool failed; continuing in-process for the remaining frames")
+                        f.alignment = _solve_alignment(f.stars, ref.stars, self.settings.refine_registration)
+                    except Exception as exc:
+                        f.rejected_reason = f"alignment failed: {exc}"
+                        self.status(f"Skipping {f.path.name}: {f.rejected_reason}")
+                    submit_alignments()
+            self.status(f"Full-field minimum reference overlap: {min_reference_overlap:.0%}")
+            for f in align_queue:
+                if f.rejected_reason is None and f.alignment is not None:
+                    overlap = reference_overlap_fraction(f.alignment, f.meta.shape, ref.meta.shape)
+                    if overlap < min_reference_overlap:
+                        f.rejected_reason = f"only {overlap:.0%} overlaps reference (minimum {min_reference_overlap:.0%})"
+                        self.status(f"Skipping {f.path.name}: {f.rejected_reason}")
+            order = [f for f in order if f.rejected_reason is None]
+            grid, self.output_origin = union_reference_grid([(f.alignment, f.meta.shape) for f in order if f.alignment is not None])
+            store.shape = (store.shape[0], *grid)
+            self.status(f"Full-field canvas: {grid[1]}x{grid[0]} px, origin ({self.output_origin[0]}, {self.output_origin[1]})")
+        ref_height, ref_width = ref.meta.shape
+        self.phot = select_photometry_stars(ref.stars, (ref_height, ref_width), ref.fwhm)
+        if self.output_origin != (0, 0):
+            self.phot.x = self.phot.x - self.output_origin[0]
+            self.phot.y = self.phot.y - self.output_origin[1]
         self.status(f"Photometry on {len(self.phot)} reference stars (aperture r={self.phot.radius}px)")
         ref_norm: tuple[np.ndarray, np.ndarray] | None = None
         ref_flux_ch: list[np.ndarray] | None = None
         ref_exposure = exposure_key(ref.meta.exposure)
         writes: list[Future] = []
-        align_ahead = max(4, 4 * self.cpu_workers)
-        with ThreadPoolExecutor(self.io_workers) as loader, ThreadPoolExecutor(2) as writer, self._detection_pool() as align_pool:
-            # alignment is CPU work (astroalign) that used to serialise with the GPU warp; solve it ahead on the
-            # worker pool, a bounded window at a time, so the GPU loop only waits for an already-finished result
+        total = len(order)
+        by_path = {f.path: f for f in order}
+        alignment_pool = _InlineExecutor() if self.settings.full_field else self._detection_pool()
+        with ThreadPoolExecutor(self.io_workers) as loader, ThreadPoolExecutor(2) as writer, alignment_pool as align_pool:
             align_futures: dict[int, Future] = {}
-            align_queue = [f for f in order if f.index != reference_index]
+            align_queue = [] if self.settings.full_field else [f for f in order if f.index != reference_index]
             align_next = 0
             pool_state = {"broken": False}
 
-            def submit_alignments(limit: int) -> None:
+            def submit_alignments() -> None:
                 nonlocal align_next
-                while align_next < len(align_queue) and len(align_futures) < limit:
+                while align_next < len(align_queue) and len(align_futures) < align_ahead:
                     f = align_queue[align_next]
                     align_next += 1
                     executor = _InlineExecutor() if pool_state["broken"] else align_pool
@@ -719,31 +812,36 @@ class StackingPipeline:
                         align_futures[f.index] = _InlineExecutor().submit(_solve_alignment, f.stars, ref.stars, self.settings.refine_registration)
 
             def alignment_for(f: FrameInfo) -> Alignment:
-                submit_alignments(align_ahead)
-                fut = align_futures.pop(f.index)
+                submit_alignments()
                 try:
-                    return fut.result()
+                    return align_futures.pop(f.index).result()
                 except BrokenProcessPool:
                     if not pool_state["broken"]:
                         pool_state["broken"] = True
                         self.status("Alignment worker pool failed; continuing in-process for the remaining frames")
                     return _solve_alignment(f.stars, ref.stars, self.settings.refine_registration)
 
-            submit_alignments(align_ahead)
+            submit_alignments()
             for n, (path, data, meta) in enumerate(self._prefetch([f.path for f in order], loader)):
                 self._check_cancel()
                 info = by_path[path]
                 if info.index == reference_index:
                     info.alignment = Alignment.identity()
-                else:
+                elif not self.settings.full_field:
                     try:
                         info.alignment = alignment_for(info)
-                    except Exception as exc:  # astroalign raises several types on failure
+                    except Exception as exc:
                         info.rejected_reason = f"alignment failed: {exc}"
                         self.status(f"Skipping {info.path.name}: {info.rejected_reason}")
                         continue
                 tensor = self._calibrate_data(data, meta, path)
-                warped = warp_to_reference(tensor, info.alignment, mode=self.settings.interpolation)
+                warped = warp_to_reference(
+                    tensor,
+                    info.alignment,
+                    mode=self.settings.interpolation,
+                    output_shape=store.shape[1:],
+                    origin=self.output_origin,
+                )
                 lum = _luma_tensor(warped)
                 channels = warped.shape[0]
                 norms = [estimate_norm(warped[c]) for c in range(channels)]
@@ -815,7 +913,7 @@ class StackingPipeline:
         if s.weighting in weightings:
             weightings.remove(s.weighting)
         weightings.insert(0, s.weighting)
-        return {
+        settings = {
             "version": __version__,
             "lights": [str(path.resolve()) for path in s.lights],
             "output": str(s.output.resolve()),
@@ -838,6 +936,7 @@ class StackingPipeline:
             "refit_local_norm_per_weighting": s.refit_local_norm_per_weighting,
             "stack": asdict(s.stack),
             "autocrop": s.autocrop,
+            "full_field": s.full_field,
             "save_maps": s.save_maps,
             "plate_solve": s.plate_solve,
             "astap_path": str(s.astap_path.resolve()) if s.astap_path else None,
@@ -846,6 +945,9 @@ class StackingPipeline:
             "mfdeconv_frames": s.mfdeconv_frames,
             "mfdeconv_blend": s.mfdeconv_blend,
         }
+        if s.registered_storage_dirs:
+            settings["registered_storage_dirs"] = [str(path.expanduser().resolve()) for path in s.registered_storage_dirs]
+        return settings
 
     def _resume_input_paths(self) -> list[Path]:
         paths = list(self.settings.lights)
@@ -906,6 +1008,7 @@ class StackingPipeline:
             "weight": self._checkpoint_float(info.weight),
             "transparency": self._checkpoint_float(info.transparency),
             "flux_ratio": self._checkpoint_float(info.flux_ratio),
+            "psfsw": self._checkpoint_float(info.psfsw),
             "phot_stars": info.phot_stars,
             "flux_scaled": info.flux_scaled,
             "rejected_reason": info.rejected_reason,
@@ -916,7 +1019,7 @@ class StackingPipeline:
         if fingerprint_inputs(self._resume_input_paths()) != input_fingerprints:
             raise CheckpointError("An input file changed during the run; registered checkpoint was not committed")
         store.save_index()
-        write_json_atomic(work_dir / "resume_state.json", self._registered_state(infos, reference_index, tilt))
+        write_json_atomic(work_dir / "resume_state.json", self._registered_state(store, infos, reference_index, tilt))
         write_manifest(work_dir / "checkpoint.json", "registered_before_stack", self._resume_settings(), input_fingerprints, {
             "index": "index.json",
             "state": "resume_state.json",
@@ -926,7 +1029,7 @@ class StackingPipeline:
         if fingerprint_inputs(self._resume_input_paths()) != input_fingerprints:
             raise CheckpointError("An input file changed during the run; global-stack checkpoint was not committed")
         store.save_index()
-        write_json_atomic(work_dir / "resume_state.json", self._registered_state(infos, reference_index, tilt))
+        write_json_atomic(work_dir / "resume_state.json", self._registered_state(store, infos, reference_index, tilt))
         write_npy_atomic(work_dir / "global_stack.npy", image)
         write_manifest(work_dir / "checkpoint.json", "global_stack_before_local_norm", self._resume_settings(), input_fingerprints, {
             "index": "index.json",
@@ -940,7 +1043,7 @@ class StackingPipeline:
         if any(norm.scale_map is None or norm.offset_map is None for norm in store.norms):
             raise CheckpointError("Local-normalization maps are incomplete; checkpoint was not committed")
         store.save_index()
-        write_json_atomic(work_dir / "resume_state.json", self._registered_state(infos, reference_index, tilt))
+        write_json_atomic(work_dir / "resume_state.json", self._registered_state(store, infos, reference_index, tilt))
         write_npy_atomic(work_dir / "global_stack.npy", image)
         write_manifest(work_dir / "checkpoint.json", "local_norm_before_final_stack", self._resume_settings(), input_fingerprints, {
             "index": "index.json",
@@ -954,7 +1057,7 @@ class StackingPipeline:
         if result.coverage is None or result.rejection is None:
             raise CheckpointError("Stack maps are incomplete; master checkpoint was not committed")
         store.save_index()
-        write_json_atomic(work_dir / "resume_state.json", self._registered_state(infos, reference_index, tilt))
+        write_json_atomic(work_dir / "resume_state.json", self._registered_state(store, infos, reference_index, tilt))
         write_npy_atomic(work_dir / "master_stack.npy", result.image)
         write_npy_atomic(work_dir / "master_coverage.npy", result.coverage)
         write_npy_atomic(work_dir / "master_rejection.npy", result.rejection)
@@ -974,10 +1077,12 @@ class StackingPipeline:
             "stack_result": "stack_result.json",
         })
 
-    def _registered_state(self, infos: list[FrameInfo], reference_index: int, tilt: dict) -> dict:
+    def _registered_state(self, store: FrameStore, infos: list[FrameInfo], reference_index: int, tilt: dict) -> dict:
         return {
             "schema": 1,
             "reference_index": reference_index,
+            "output_origin": list(self.output_origin),
+            "storage_dirs": [str(path.resolve()) for path in store.storage_dirs if path.resolve() != store.directory.resolve()],
             "tilt": tilt,
             "frames": [self._serialize_frame_info(info) for info in infos],
             "cosmetic": {"hot": self.cosmetic_stats.hot, "cold": self.cosmetic_stats.cold, "frames_processed": self._cosmetic_frames},
@@ -996,7 +1101,8 @@ class StackingPipeline:
             "weighting": self.settings.weighting,
             "inputs": fingerprint_inputs(self.settings.lights),
             "index": "index.json",
-            **self._registered_state(infos, reference_index, tilt),
+            "storage_dirs": [str(path.resolve()) for path in store.storage_dirs if path.resolve() != work_dir.resolve()],
+            **self._registered_state(store, infos, reference_index, tilt),
         })
 
     def _restore_registered_state(self, work_dir: Path, state: dict, store: FrameStore, expected_paths: list[Path] | None = None) -> tuple[list[FrameInfo], int, dict]:
@@ -1005,9 +1111,19 @@ class StackingPipeline:
         if state.get("schema") != 1 or not isinstance(frames, list) or not frames or len(frames) != expected_count:
             raise CheckpointError("Registered store state is incomplete")
         try:
+            storage_dirs = state.get("storage_dirs", [])
+            expected_storage_dirs = [
+                str(path.resolve()) for path in store.storage_dirs if path.resolve() != store.directory.resolve()
+            ]
+            if storage_dirs != expected_storage_dirs:
+                raise CheckpointError("Registered store storage directories do not match its state")
             reference_index = int(state["reference_index"])
             if not 0 <= reference_index < expected_count:
                 raise CheckpointError("Registered store reference index is out of range")
+            origin = state.get("output_origin", [0, 0])
+            if not isinstance(origin, list) or len(origin) != 2 or any(type(value) is not int for value in origin):
+                raise CheckpointError("Registered store output origin is invalid")
+            self.output_origin = (origin[0], origin[1])
             infos = []
             referenced_store_indices = set()
             for index, item in enumerate(frames):
@@ -1073,6 +1189,7 @@ class StackingPipeline:
                     store_index=item["store_index"],
                     fwhm_count_grid=None if counts is None else np.asarray(counts, dtype=np.int32),
                     bright_star_rate=None if item["bright_star_rate"] is None else float(item["bright_star_rate"]),
+                    psfsw=float("nan") if item.get("psfsw") is None else float(item["psfsw"]),
                 ))
             for info in infos:
                 if info.store_index is not None:
@@ -1121,7 +1238,14 @@ class StackingPipeline:
             if not state_path.is_relative_to(work_dir.resolve()):
                 raise CheckpointError("Checkpoint state path escapes the work directory")
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            store = FrameStore.load_index(work_dir)
+            storage_dirs = state.get("storage_dirs", [])
+            if not isinstance(storage_dirs, list) or any(not isinstance(path, str) for path in storage_dirs):
+                raise CheckpointError("Checkpoint storage directories are invalid")
+            selected_roots = [Path(path).expanduser().resolve(strict=True) for path in self.settings.registered_storage_dirs]
+            resolved_storage_dirs = [Path(path).resolve(strict=True) for path in storage_dirs]
+            if any(not any(path.is_relative_to(root) for root in selected_roots) for path in resolved_storage_dirs):
+                raise CheckpointError("Checkpoint registered-frame directory is outside the selected drives")
+            store = FrameStore.load_index(work_dir, allowed_storage_dirs=resolved_storage_dirs)
             infos, reference_index, tilt = self._restore_registered_state(work_dir, state, store, self.settings.lights)
             global_image = None
             master_result = None
@@ -1199,7 +1323,12 @@ class StackingPipeline:
                 raise CheckpointError("Registered-store manifest is missing required artifacts")
             if len(manifest["inputs"]) != len(manifest.get("frames", [])):
                 raise CheckpointError("Registered-store input identities do not match its frame metadata")
-            store = FrameStore.load_index(directory)
+            storage_dirs = manifest.get("storage_dirs", [])
+            if not isinstance(storage_dirs, list) or any(not isinstance(path, str) for path in storage_dirs):
+                raise CheckpointError("Registered-store manifest has invalid storage directories")
+            store = FrameStore.load_index(directory, allowed_storage_dirs=[Path(path) for path in storage_dirs])
+            if self.settings.distributed_enabled and len(store.storage_dirs) > 1:
+                raise CheckpointError("Multi-drive registered stores cannot be used with experimental network workers")
             if list(store.shape) != manifest.get("shape") or len(store) != manifest.get("frame_count"):
                 raise CheckpointError("Registered-store manifest does not match its index")
             infos, reference_index, tilt = self._restore_registered_state(directory, manifest, store)
@@ -1234,6 +1363,7 @@ class StackingPipeline:
             settings.distributed_token,
             expected_store=store.directory,
             response_timeout=1200.0,
+            cancel_callback=cancel_cb,
         )
         if not capabilities.get("stack_task_execution_enabled"):
             raise WorkerProbeError("Worker capability probe succeeded, but stack-band execution is not enabled on that computer")
@@ -1247,7 +1377,7 @@ class StackingPipeline:
             pass_name=pass_name,
             reject_masks=reject_masks,
             vram_fraction=settings.distributed_vram_fraction,
-            rows_per_task=settings.distributed_rows_per_task,
+            rows_per_task=min(settings.distributed_rows_per_task, int(capabilities.get("stack_task_max_rows", settings.distributed_rows_per_task))),
             progress_callback=progress_cb,
             cancel_callback=cancel_cb,
         )
@@ -1273,8 +1403,14 @@ class StackingPipeline:
         from_registered_store = s.registered_dir is not None
         if not s.lights and not from_registered_store:
             raise ValueError("No light frames given")
+        if from_registered_store and s.registered_storage_dirs:
+            raise ValueError("Drive selection applies only when registering original light frames")
+        if s.distributed_enabled and s.registered_storage_dirs:
+            raise ValueError("Multi-drive registered storage is not supported with experimental network workers")
         if from_registered_store and (s.resume or s.drizzle.enabled):
             raise ValueError("Registered-store stacking does not support resume or drizzle")
+        if from_registered_store and s.filters.enabled and s.filters.psfsw_min_ratio > 0:
+            raise ValueError("PSFSW filtering requires the original light frames; retained stores reuse saved exclusions and weights")
         if s.distributed_enabled and (s.resume or len(set(s.weightings or [s.weighting])) > 1):
             raise ValueError("Experimental distributed stacking does not support resume or weighting variants")
         output_base = s.output
@@ -1323,6 +1459,7 @@ class StackingPipeline:
                         weight=1.0,
                         transparency=float("nan"),
                         flux_ratio=float("nan"),
+                        psfsw=float("nan"),
                         phot_stars=0,
                         flux_scaled=False,
                         rejected_reason=rejected,
@@ -1342,7 +1479,14 @@ class StackingPipeline:
                 probe, _ = self._load_calibrated(infos[ref_index].path)
                 shape = tuple(int(v) for v in probe.shape)
                 del probe
-            store = FrameStore(work_dir, shape)  # type: ignore[arg-type]
+            store = FrameStore(
+                work_dir,
+                shape,
+                storage_roots=s.registered_storage_dirs,
+                reserve_mask_bytes=shape[1] * shape[2] if s.drizzle.enabled or s.mfdeconv is not None else 0,
+            )  # type: ignore[arg-type]
+            if s.registered_storage_dirs:
+                self.status(f"Registered frames will be distributed across {len(store.storage_dirs)} drive(s)")
         completed = False
         try:
             if not resuming and not from_registered_store:
@@ -1351,9 +1495,11 @@ class StackingPipeline:
                 if len(store) == 0:
                     raise ValueError("No frames could be registered")
                 with self._stage("transparency + weights"):
+                    self.measure_psfsw(infos)
                     self.apply_transparency_filter(infos, store)
+                    self.apply_psfsw_filter(infos, store)
                     if len(store) == 0:
-                        raise ValueError("All frames were excluded by the transparency filter")
+                        raise ValueError("All frames were excluded by the post-registration filters")
                     self.compute_weights(infos, store)
                     flips = self._flip_summary(infos)
                     if s.resume:
@@ -1670,7 +1816,7 @@ class StackingPipeline:
                 mask = None
                 if store.mask_paths:
                     mask = torch.from_numpy(np.load(store.mask_paths[info.store_index]).astype(bool)).to(self.backend.device)
-                drizzle_frame(acc, tensor, info.alignment, store.norms[info.store_index], ref_offset, d, mask, pattern, (height, width))  # type: ignore[arg-type]
+                drizzle_frame(acc, tensor, info.alignment, store.norms[info.store_index], ref_offset, d, mask, pattern, (height, width), self.output_origin)  # type: ignore[arg-type]
                 del tensor, mask, data
                 self.progress(0.84 + 0.06 * (n + 1) / len(order), f"Drizzling {n + 1}/{len(order)}")
         image = acc.image(d.min_weight)
@@ -1750,6 +1896,7 @@ class StackingPipeline:
                     "background": round(f.background, 2),
                     "transparency": None if not np.isfinite(f.transparency) else round(f.transparency, 4),
                     "flux_ratio": None if not np.isfinite(f.flux_ratio) else round(f.flux_ratio, 4),
+                    "psfsw": None if not np.isfinite(f.psfsw) else round(f.psfsw, 6),
                     "phot_stars": f.phot_stars,
                     "flux_scaled": f.flux_scaled,
                     "weight": round(f.weight, 4) if f.rejected_reason is None else None,
@@ -1789,6 +1936,7 @@ class StackingPipeline:
                 "local_norm": asdict(s.local_norm),
                 "filters": asdict(s.filters),
                 "autocrop": s.autocrop,
+                "full_field": s.full_field,
                 "stack": asdict(s.stack),
                 "drizzle": asdict(s.drizzle),
             },

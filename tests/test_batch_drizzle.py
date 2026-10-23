@@ -33,6 +33,26 @@ def test_drizzle_flat_field_and_coverage(kernel):
     assert acc.weight_map()[8:-8, 8:-8].min() > 0
 
 
+def test_drizzle_places_frame_on_shifted_full_field_canvas():
+    origin = (-2, -3)
+    frame = torch.full((1, 4, 5), 100.0)
+    acc = new_accumulator(1, 10, 9, 2, torch.device("cpu"))
+    drizzle_frame(
+        acc,
+        frame,
+        Alignment.identity(),
+        FrameNorm(offset=0.0, scale=1.0),
+        0.0,
+        DrizzleSettings(scale=2, pixfrac=1.0),
+        ref_shape=(10, 9),
+        output_origin=origin,
+    )
+    image = acc.image(0.01)[0]
+    weights = acc.weight_map()
+    assert image[6:14, 4:14].min() == pytest.approx(100.0)
+    assert weights[6:14, 4:14].min() > 0
+
+
 @pytest.mark.parametrize("kernel", ["square", "point", "gaussian"])
 def test_drizzle_recovers_subpixel_detail(kernel):
     # a point source dithered by half pixels: drizzle at 2x should be sharper than the 1x mean

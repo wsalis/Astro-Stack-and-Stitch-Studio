@@ -21,7 +21,7 @@ from gpustacker.drizzle import DrizzleSettings
 from gpustacker.io import load_frame, load_meta
 from gpustacker.mfdeconv import MFDeconvSettings
 from gpustacker.normalization import LocalNormSettings
-from gpustacker.pipeline import FrameInfo, PipelineSettings, StackingPipeline, blend_mfdeconv, select_mfdeconv_indices
+from gpustacker.pipeline import FrameInfo, PipelineSettings, StackingPipeline, blend_mfdeconv, preview_frame_filters, select_mfdeconv_indices
 from gpustacker.quality import FilterSettings
 from gpustacker.registration import Alignment
 from gpustacker.stacking import FrameStore, StackResult, StackSettings
@@ -69,7 +69,7 @@ def test_distributed_pipeline_preflights_worker_and_routes_stack(monkeypatch, tm
 
     def fake_probe(host, port, token, **kwargs):
         calls["probe"] = (host, port, token, kwargs)
-        return {"stack_task_execution_enabled": True}
+        return {"stack_task_execution_enabled": True, "stack_task_max_rows": 2}
 
     def fake_distributed(store_arg, backend, stack_settings, host, port, token, **kwargs):
         calls["stack"] = (store_arg, host, port, token, kwargs)
@@ -85,6 +85,7 @@ def test_distributed_pipeline_preflights_worker_and_routes_stack(monkeypatch, tm
     assert calls["probe"][3]["expected_store"] == store.directory
     assert calls["stack"][1:4] == ("worker-host", 47861, settings.distributed_token)
     assert calls["stack"][4]["pass_name"] == "global"
+    assert calls["stack"][4]["rows_per_task"] == 2
 
 
 def test_distributed_pipeline_settings_require_worker_credentials(tmp_path):
@@ -295,6 +296,65 @@ def test_pipeline_uses_explicitly_selected_reference(light_dir, tmp_path):
     assert pipeline.choose_reference(infos) == 1
 
 
+def test_full_field_registration_expands_canvas_and_shifts_reference_coords(light_dir, tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import torch
+
+    import gpustacker.pipeline as pipeline_module
+    from gpustacker.quality import StarSet
+
+    lights = sorted(light_dir.glob("*.fit"))[:3]
+    metas = {path: load_meta(path) for path in lights}
+    reference_stars = Stars(*(np.empty(0, dtype=np.float32) for _ in range(6)), total_detected=20)
+    shifted_stars = Stars(*(np.empty(0, dtype=np.float32) for _ in range(6)), total_detected=20)
+    distant_stars = Stars(*(np.empty(0, dtype=np.float32) for _ in range(6)), total_detected=20)
+    infos = [
+        FrameInfo(index, path, metas[path], [reference_stars, shifted_stars, distant_stars][index], 2.0, 1.0, 10.0)
+        for index, path in enumerate(lights)
+    ]
+    height, width = metas[lights[0]].shape
+    channels = metas[lights[0]].channels
+    data = {path: np.full((channels, height, width), index + 1, dtype=np.float32) for index, path in enumerate(lights)}
+    settings = PipelineSettings(
+        lights=lights,
+        output=tmp_path / "full_field.fit",
+        full_field=True,
+        device="cpu",
+        cosmetic="off",
+        debayer="off",
+        local_norm=LocalNormSettings(enabled=False),
+        filters=FilterSettings(enabled=False),
+    )
+    pipeline = StackingPipeline(settings)
+    pipeline.status = lambda _message: None
+    monkeypatch.setattr(pipeline, "_detection_pool", lambda: ThreadPoolExecutor(max_workers=2))
+    monkeypatch.setattr(pipeline, "_prefetch", lambda paths, _loader: ((path, data[path], metas[path]) for path in paths))
+    monkeypatch.setattr(pipeline, "_calibrate_data", lambda image, *_args, **_kwargs: torch.from_numpy(image))
+    monkeypatch.setattr(pipeline_module, "select_photometry_stars", lambda *_args: StarSet(np.array([8], np.float32), np.array([8], np.float32), 2))
+    monkeypatch.setattr(pipeline_module, "aperture_flux", lambda *_args: np.ones(12, np.float32))
+
+    def solve(source, _reference, _refine):
+        if source is reference_stars:
+            return Alignment.identity()
+        if source is distant_stars:
+            return Alignment(np.array([[1, 0, width * 0.8], [0, 1, 0], [0, 0, 1]], dtype=np.float64), 20, 0.0, 1.0, (width * 0.8, 0.0))
+        return Alignment(np.array([[1, 0, -4], [0, 1, 2], [0, 0, 1]], dtype=np.float64), 20, 0.0, 1.0, (-4.0, 2.0))
+
+    monkeypatch.setattr(pipeline_module, "_solve_alignment", solve)
+    store = FrameStore(tmp_path / "registered", (channels, height, width))
+    pipeline.register(infos, 0, store)
+
+    assert store.shape == (channels, height + 2, width + 4)
+    assert pipeline.output_origin == (-4, 0)
+    assert len(store) == 2
+    assert infos[2].rejected_reason == "only 20% overlaps reference (minimum 25%)"
+    reference = np.load(store.paths[0])
+    shifted = np.load(store.paths[1])
+    np.testing.assert_allclose(reference[:, :height, 4 : width + 4], 1.0)
+    np.testing.assert_allclose(shifted[:, 2 : height + 2, :width], 2.0)
+
+
 def test_reference_preview_ppm_is_bounded_and_handles_nonfinite_data():
     image = np.zeros((3, 1600, 900), dtype=np.float32)
     image[:, 10, 10] = np.nan
@@ -359,6 +419,7 @@ def test_registered_checkpoint_round_trip_and_settings_validation(light_dir, tmp
         weighting="psfsw",
     )
     pipeline = StackingPipeline(settings)
+    pipeline.output_origin = (-2, 3)
     store = FrameStore(work_dir, (1, 4, 5))
     registered = np.arange(20, dtype=np.float32).reshape(1, 4, 5)
     store.add(light.name, registered)
@@ -372,6 +433,7 @@ def test_registered_checkpoint_round_trip_and_settings_validation(light_dir, tmp
     tilt = {"verdict": "test field"}
 
     pipeline._save_registered_checkpoint(work_dir, store, [info], 0, tilt, fingerprint_inputs([light]))
+    pipeline.output_origin = (0, 0)
     restored_store, restored_infos, reference_index, restored_tilt, stage, global_image, master_result = pipeline._restore_registered_checkpoint(work_dir, [light])
 
     np.testing.assert_array_equal(np.load(restored_store.paths[0]), registered)
@@ -380,6 +442,7 @@ def test_registered_checkpoint_round_trip_and_settings_validation(light_dir, tmp
     assert restored_infos[0].bright_star_rate == 5.5
     assert reference_index == 0
     assert restored_tilt == tilt
+    assert pipeline.output_origin == (-2, 3)
     assert stage == "registered_before_stack"
     assert global_image is None
     assert master_result is None
@@ -822,6 +885,39 @@ def test_pipeline_stacks_from_retained_registered_store(light_dir, tmp_path, mon
     assert (work_dir / "reg_0000.npy").exists()
 
 
+def test_retained_registered_store_round_trips_and_cleans_external_drive(light_dir, tmp_path):
+    from gpustacker.stacking import cleanup_registered_store
+
+    light = sorted(light_dir.glob("*.fit"))[0]
+    work_dir = tmp_path / "registered"
+    external_dir = tmp_path / f".gpustacker_registered_{'a' * 32}"
+    external_dir.mkdir()
+    note = external_dir / "keep.txt"
+    note.write_text("unowned", encoding="utf-8")
+    meta = load_meta(light)
+    shape = (meta.channels, *meta.shape)
+    store = FrameStore(work_dir, shape)
+    store.storage_dirs = [external_dir]
+    store._remaining_bytes = [10**9]
+    frame = np.ones(shape, dtype=np.float32)
+    store.add(light.name, frame)
+    stars = Stars(*(np.empty(0, dtype=np.float32) for _ in range(6)), total_detected=10)
+    info = FrameInfo(0, light, meta, stars, 2.0, 1.0, 10.0, alignment=Alignment.identity(), store_index=0)
+    StackingPipeline(PipelineSettings(lights=[light], output=tmp_path / "source.fit"))._save_registered_store_manifest(work_dir, store, [info], 0, {})
+
+    restored, _, _, _, _ = StackingPipeline(PipelineSettings(
+        lights=[], output=tmp_path / "restored.fit", registered_dir=work_dir,
+    ))._restore_registered_store(work_dir)
+    assert restored.paths == store.paths
+    assert json.loads((work_dir / "registered_store.json").read_text(encoding="utf-8"))["storage_dirs"] == [str(external_dir.resolve())]
+
+    removed_count, _ = cleanup_registered_store(work_dir)
+
+    assert removed_count >= 3
+    assert not store.paths[0].exists()
+    assert note.read_text(encoding="utf-8") == "unowned"
+
+
 def test_retained_registered_store_matches_ordinary_stack(light_dir, tmp_path):
     lights = sorted(light_dir.glob("*.fit"))[:2]
     work_dir = tmp_path / "retained-equivalence"
@@ -885,6 +981,12 @@ def test_mfdeconv_blend_cli_option():
     assert args.mf_blend == 0.25
 
 
+def test_full_field_cli_option(light_dir, tmp_path):
+    light = sorted(light_dir.glob("*.fit"))[0]
+    args = build_parser().parse_args(["stack", str(light), "-o", str(tmp_path / "out.fit"), "--full-field"])
+    assert settings_from_args(args).full_field
+
+
 def test_resume_cli_option(light_dir, tmp_path):
     light = sorted(light_dir.glob("*.fit"))[0]
     args = build_parser().parse_args(["stack", str(light), "-o", str(tmp_path / "out.fit"), "--resume"])
@@ -897,6 +999,17 @@ def test_registered_store_cli_option(tmp_path):
 
     assert settings_from_args(args).registered_dir == store_dir
     assert settings_from_args(args).lights == []
+
+
+def test_registered_drive_cli_option(tmp_path, monkeypatch):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    monkeypatch.setattr("gpustacker.cli._collect_lights", lambda _inputs: [tmp_path / "light.fit"])
+    args = build_parser().parse_args([
+        "stack", "light.fit", "-o", "out.fit", "--registered-drive", str(first), "--registered-drive", str(second),
+    ])
+
+    assert settings_from_args(args).registered_storage_dirs == [first, second]
 
 
 def test_drizzle_kernel_and_min_weight_cli_options():
@@ -1053,6 +1166,151 @@ def test_compare_regional_medians_and_rows():
     labels = [row[0] for row in _rows(result)]
     assert "FWHM top left [px]" in labels
     assert "Matched-star SNR top left (n=6)" in labels
+
+
+def _filter_test_frame(index, exposure=60.0, stars=100, background=100.0, fwhm=2.0, flux_ratio=1.0):
+    from gpustacker.io import FrameMeta
+
+    meta = FrameMeta(Path(f"filter_{index}.fit"), (4, 4), 1, exposure=exposure)
+    detected = Stars(*(np.empty(0, dtype=np.float32) for _ in range(6)), total_detected=stars)
+    return FrameInfo(index, meta.path, meta, detected, fwhm=fwhm, noise=1.0, background=background, flux_ratio=flux_ratio)
+
+
+def test_cli_filter_preset_allows_individual_overrides(light_dir, tmp_path):
+    args = build_parser().parse_args([
+        "stack", str(light_dir), "-o", str(tmp_path / "unused.fit"),
+        "--filter-preset", "selective", "--filter-fwhm", "1.6", "--filter-psfsw", "0.15",
+    ])
+    settings = settings_from_args(args)
+    assert settings.filters.stars_min_ratio == 0.8
+    assert settings.filters.fwhm_max_ratio == 1.6
+    assert settings.filters.psfsw_min_ratio == 0.15
+    defaults = settings_from_args(build_parser().parse_args(["stack", str(light_dir), "-o", str(tmp_path / "default.fit")]))
+    assert defaults.filters == FilterSettings()
+
+
+def test_gui_filter_preset_keeps_custom_fields_and_advanced_cutoff_editable():
+    import tkinter as tk
+
+    app = gui_module.GPUStackerApp.__new__(gui_module.GPUStackerApp)
+    root = tk.Tcl()
+    app._applying_filter_preset = False
+    app.filter_preset_var = tk.StringVar(master=root, value="Selective")
+    app._filter_preset_vars = {name: tk.DoubleVar(master=root, value=0) for name in ("transparency_min", "stars_min_ratio", "background_max_ratio", "fwhm_max_ratio")}
+    app.f_psfsw = tk.DoubleVar(master=root, value=0.15)
+    app._apply_filter_preset()
+    assert app._filter_preset_vars["stars_min_ratio"].get() == 0.8
+    assert app.f_psfsw.get() == 0.15
+    app._filter_preset_vars["fwhm_max_ratio"].set(1.6)
+    app._filter_fields_edited()
+    assert app.filter_preset_var.get() == "Selective (modified)"
+    app._filter_preset_vars["fwhm_max_ratio"].set(1.2)
+    app._filter_fields_edited()
+    assert app.filter_preset_var.get() == "Selective"
+
+
+def test_gui_filter_preview_counts_exposure_pending_metrics_and_hard_failures(monkeypatch):
+    import tkinter as tk
+    from dataclasses import replace
+
+    monkeypatch.setattr(gui_module.GPUStackerApp, "_load_settings", lambda self: None)
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        app = gui_module.GPUStackerApp(root)
+        app.filter_preset_var.set("Balanced")
+        app._apply_filter_preset()
+        app.f_psfsw.set(0.05)
+        app.filters_enabled_var.set(True)
+        infos = [_filter_test_frame(index) for index in range(6)]
+        infos[4].stars.total_detected = 20
+        app._analysis_cache = {str(info.path.resolve()): info for info in infos}
+        app._analysis_cache_signature = "preview-test"
+        app._show_filter_preview()
+        root.update_idletasks()
+        assert "Keep 5/6 frames; reject 1" in app.filter_summary_var.get()
+        assert "83%" in app.filter_summary_var.get()
+        assert "pending registration" in app.filter_pending_var.get()
+        assert app._filter_tree.item("0", "values")[6:8] == ("Pending", "Pending")
+        app._filter_measurements = {str(info.path.resolve()): replace(info, transparency=1.0, psfsw=1.0) for info in infos}
+        app._filter_measurements_signature = "preview-test"
+        app._filter_measurements[str(infos[0].path.resolve())].transparency = 0.2
+        app._filter_measurements[str(infos[0].path.resolve())].psfsw = 0.01
+        app._filter_measurements[str(infos[1].path.resolve())].rejected_reason = "registration failed"
+        with monkeypatch.context() as changes:
+            changes.setattr(Path, "resolve", lambda *_args, **_kwargs: pytest.fail("Live filter edits must not resolve paths"))
+            app._refresh_filter_preview()
+        assert "Keep 3/6 frames; reject 3" in app.filter_summary_var.get()
+        assert "50%" in app.filter_summary_var.get()
+        assert "transparency" in app._filter_preview_infos[0].rejected_reason
+        assert "PSFSW" in app._filter_preview_infos[0].rejected_reason
+        assert all(info.rejected_reason is None for info in infos)
+        app._sort_filter_preview("psfsw")
+        assert app._filter_tree.get_children()[0] == "0"
+        app.filters_enabled_var.set(False)
+        assert "Keep 5/6 frames; reject 1" in app.filter_summary_var.get()
+        app.f_stars.set("")
+        assert "valid non-negative" in app.filter_summary_var.get()
+        assert not app._filter_tree.get_children()
+        app.f_stars.set(0.6)
+        app._filter_measurements_signature = "different-inputs"
+        app._refresh_filter_preview()
+        assert "Keep 6/6 frames; reject 0" in app.filter_summary_var.get()
+        app._filter_preview_window.geometry("850x440")
+        root.update_idletasks()
+        assert len(app._filter_tree.get_children()) == 6
+        assert app._filter_tree.winfo_height() > 100
+    finally:
+        root.destroy()
+
+
+def test_psfsw_cutoff_cannot_be_silently_ignored_for_retained_store(tmp_path):
+    settings = PipelineSettings(lights=[], output=tmp_path / "unused.fit", device="cpu", registered_dir=tmp_path / "retained", filters=FilterSettings(psfsw_min_ratio=0.1))
+    with pytest.raises(ValueError, match="PSFSW filtering requires the original light frames"):
+        StackingPipeline(settings).run()
+
+
+def test_filter_preview_is_non_mutating_and_uses_fixed_baselines(tmp_path):
+    infos = [_filter_test_frame(index) for index in range(6)]
+    infos[4].stars.total_detected = 20
+    infos[4].background = 1000
+    infos[4].fwhm = 5
+    infos[5].rejected_reason = "too few stars"
+    settings = FilterSettings()
+    preview, baseline = preview_frame_filters(infos, settings)
+    assert baseline["candidate_frames"] == 5
+    assert all(info.rejected_reason is None for info in infos[:5])
+    assert all(token in preview[4].rejected_reason for token in ("stars", "sky", "FWHM"))
+    assert preview[5].rejected_reason == "too few stars"
+    relaxed, other_baseline = preview_frame_filters(preview, FilterSettings(stars_min_ratio=0, background_max_ratio=0, fwhm_max_ratio=0))
+    assert relaxed[4].rejected_reason is None
+    assert other_baseline == baseline
+    pipeline = StackingPipeline(PipelineSettings(lights=[], output=tmp_path / "unused.fit", device="cpu"))
+    pipeline.apply_prefilters(infos)
+    assert [info.rejected_reason for info in infos] == [info.rejected_reason for info in preview]
+
+
+@pytest.mark.parametrize("enabled,threshold,dropped", [(True, 0.05, [3, 7]), (False, 0.05, []), (True, 0.0, [])])
+def test_optional_psfsw_filter_is_exposure_aware_and_preserves_store_indices(tmp_path, enabled, threshold, dropped):
+    settings = PipelineSettings(lights=[], output=tmp_path / "unused.fit", device="cpu", filters=FilterSettings(enabled=enabled, psfsw_min_ratio=threshold))
+    pipeline = StackingPipeline(settings)
+    store = FrameStore(tmp_path / "registered", (1, 4, 4))
+    infos = []
+    for index, (exposure, signal) in enumerate([(60, 1), (60, 1), (60, 1), (60, 0.1), (20, 1 / 3), (20, 1 / 3), (20, 1 / 3), (20, 0.01), (20, np.nan), (30, 0.01)]):
+        info = _filter_test_frame(index, exposure=exposure, flux_ratio=signal)
+        info.store_index = index
+        store.add(info.path.name, np.ones(store.shape, dtype=np.float32))
+        infos.append(info)
+    pipeline.measure_psfsw(infos)
+    pipeline.apply_psfsw_filter(infos, store)
+    assert [info.index for info in infos if info.rejected_reason] == dropped
+    accepted = [info for info in infos if info.rejected_reason is None]
+    assert [info.store_index for info in accepted] == list(range(len(accepted)))
+    assert [info.path.name for info in accepted] == store.names
+    assert all(info.weight == 1.0 for info in accepted)
+    assert np.isnan(infos[8].psfsw) and np.isnan(infos[9].psfsw)
+    assert pipeline._serialize_frame_info(infos[0])["psfsw"] == pytest.approx(1.0)
+    assert pipeline._frame_rows(infos)[0]["psfsw"] == pytest.approx(1.0)
 
 
 def test_prefilters_use_per_exposure_medians_for_stars_and_sky(tmp_path):

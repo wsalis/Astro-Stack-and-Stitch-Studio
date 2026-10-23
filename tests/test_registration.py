@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from gpustacker.detection import build_star_psf, choose_psf_size, detect_stars
-from gpustacker.registration import estimate_alignment, warp_to_reference
+from gpustacker.registration import Alignment, estimate_alignment, reference_overlap_fraction, union_reference_grid, warp_to_reference
 
 
 def test_detects_most_stars(scene):
@@ -42,6 +43,37 @@ def test_alignment_recovers_shift_and_warp(scene):
     diff = (warped[inner] - torch.from_numpy(image)[None][inner]).abs()
     assert torch.nanmedian(diff) < 2.0
     assert torch.isnan(warped).any()  # uncovered border is NaN
+
+
+def test_union_grid_includes_shifted_frame_outside_reference():
+    reference = Alignment.identity()
+    shifted = Alignment(
+        np.array([[1.0, 0.0, -4.0], [0.0, 1.0, 3.0], [0.0, 0.0, 1.0]]),
+        0,
+        0.0,
+        1.0,
+        (-4.0, 3.0),
+    )
+    shape, origin = union_reference_grid([(reference, (4, 5)), (shifted, (4, 5))])
+    assert shape == (7, 9)
+    assert origin == (-4, 0)
+
+    image = torch.arange(20, dtype=torch.float32).reshape(1, 4, 5)
+    warped = warp_to_reference(image, shifted, output_shape=shape, origin=origin)
+    assert torch.allclose(warped[:, 3:7, :5], image, atol=1e-5)
+    assert torch.isnan(warped[:, :3]).all()
+
+
+def test_reference_overlap_fraction_measures_shifted_footprint():
+    shifted = Alignment(
+        np.array([[1.0, 0.0, 80.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+        0,
+        0.0,
+        1.0,
+        (80.0, 0.0),
+    )
+
+    assert reference_overlap_fraction(shifted, (100, 100), (100, 100)) == 0.2
 
 
 def test_lanczos_keeps_star_sharpness_and_blocks_dark_halos():
@@ -94,6 +126,24 @@ def _warp_lanczos_reference(image: torch.Tensor, sx: torch.Tensor, sy: torch.Ten
             wsum += w
             floor = torch.minimum(floor, vals)
     return torch.maximum(acc / wsum.clamp_min(1e-6), floor)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("tile_rows", [1, 128])
+def test_lanczos_nonfinite_coordinates_are_missing_data(device, tile_rows):
+    from gpustacker.registration import _warp_lanczos
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    image = torch.arange(48, dtype=torch.float32, device=device).reshape(3, 4, 4)
+    sx = torch.tensor([[float("nan"), float("inf"), -float("inf"), 1.0], [1.0, 1.0, 1.0, 2.0]], device=device)
+    sy = torch.tensor([[1.0, 1.0, 1.0, 1.0], [float("nan"), float("inf"), -float("inf"), 2.0]], device=device)
+
+    actual = _warp_lanczos(image, sx, sy, tile_rows=tile_rows)
+
+    assert torch.isnan(actual[:, :, :3]).all()
+    torch.testing.assert_close(actual[:, 0, 3], image[:, 1, 1])
+    torch.testing.assert_close(actual[:, 1, 3], image[:, 2, 2])
 
 
 def test_lanczos_tiled_matches_reference():

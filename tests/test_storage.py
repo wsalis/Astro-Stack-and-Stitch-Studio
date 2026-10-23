@@ -9,6 +9,7 @@ from gpustacker.io import save_fits
 from gpustacker.normalization import LocalNormSettings
 from gpustacker.pipeline import PipelineSettings
 from gpustacker.storage import estimate_stack_disk_space
+from gpustacker.stacking import FrameStore
 
 
 def test_estimate_stack_disk_space_includes_scratch_masks_and_outputs(tmp_path):
@@ -105,3 +106,60 @@ def test_estimate_stack_disk_space_checks_scratch_and_output_volumes(tmp_path, m
     assert set(volumes) == {tmp_path.anchor, output.anchor}
     assert volumes[output.anchor] == (2 * 3 * 4, 100_000)
     assert volumes[tmp_path.anchor][0] == estimate.working_bytes
+
+
+def test_frame_store_distributes_frames_and_respects_capacity(tmp_path, monkeypatch):
+    import gpustacker.stacking as stacking
+
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    monkeypatch.setattr(stacking, "_storage_volume_id", lambda path: path.name)
+
+    def fake_disk_usage(path):
+        free = 8_192 if Path(path).parent.name == "first" else 12_288
+        return SimpleNamespace(free=free)
+
+    monkeypatch.setattr(stacking.shutil, "disk_usage", fake_disk_usage)
+    store = FrameStore(tmp_path / "work", (1, 2, 2), storage_roots=[first, second])
+    frame = np.ones((1, 2, 2), dtype=np.float32)
+
+    for index in range(5):
+        store.add(f"frame-{index}.fit", frame)
+
+    assert [sum(path.parent.parent == drive for path in store.paths) for drive in (first, second)] == [2, 3]
+    with np.testing.assert_raises_regex(OSError, "No selected registered-frame drive has space"):
+        store.add("frame-over-capacity.fit", frame)
+
+
+def test_estimate_stack_disk_space_distributes_registered_frames_across_volumes(tmp_path, monkeypatch):
+    import gpustacker.storage as storage
+
+    light = save_fits(tmp_path / "light.fit", np.zeros((1, 2, 3), dtype=np.float32))
+    first = tmp_path / "first-drive"
+    second = tmp_path / "second-drive"
+    first.mkdir()
+    second.mkdir()
+    settings = PipelineSettings(
+        lights=[light] * 4,
+        output=tmp_path / "master.fit",
+        debayer="off",
+        registered_storage_dirs=[first, second],
+    )
+
+    def fake_volume(path):
+        return (Path("Q:\\") if path.name == first.name else Path("R:\\"), path.name)
+
+    def fake_disk_usage(path):
+        free = 10_000 if Path(path).name in (first.name, second.name) else 1_000_000
+        return SimpleNamespace(free=free)
+
+    monkeypatch.setattr(storage, "_storage_volume", fake_volume)
+    monkeypatch.setattr(storage.shutil, "disk_usage", fake_disk_usage)
+    estimate = estimate_stack_disk_space(settings, [settings.output], tmp_path)
+    volumes = {volume: (required, free) for volume, required, free in estimate.volume_usage}
+
+    assert volumes[Path("Q:\\")][0] == 8_192
+    assert volumes[Path("R:\\")][0] == 8_192
+    assert volumes[Path("C:\\")][0] == 24

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import traceback
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -162,7 +163,7 @@ def run_batch(settings, groups: list[FrameGroup], output_dir: Path, name_templat
             results.append((group, result.output, None))
             pipeline_results.append(result)
         except Exception as exc:  # keep going with the remaining groups
-            status_cb(f"Group failed: {type(exc).__name__}: {exc}")
+            status_cb(f"Group failed: {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
             results.append((group, None, f"{type(exc).__name__}: {exc}"))
             pipeline_results.append(None)
     done = sum(1 for _, p, _ in results if p)

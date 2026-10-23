@@ -29,15 +29,16 @@ from .help_text import HELP_SECTIONS
 from .io import discover_frames, is_gpustacker_output
 from .mfdeconv import MFDECONV_PRESETS, MFDeconvSettings
 from .normalization import LocalNormSettings
-from .pipeline import FrameInfo, PipelineResult, PipelineSettings, StackingPipeline, weighting_output_path
-from .quality import WEIGHTING_CHOICES, FilterSettings
+from .pipeline import FrameInfo, PipelineResult, PipelineSettings, StackingPipeline, preview_frame_filters, weighting_output_path
+from .quality import FILTER_PRESETS, WEIGHTING_CHOICES, FilterSettings, filter_preset
+from .runlog import RunLog
 from .storage import DiskSpaceEstimate, estimate_stack_disk_space, format_bytes
 from .stacking import StackSettings, cleanup_registered_store, registered_store_cleanup_plan
 
 IMAGE_TYPES = [("Astro images", "*.fit *.fits *.fts *.xisf"), ("All files", "*.*")]
 SETTINGS_PATH = Path.home() / ".gpustacker" / "gui_settings.json"
 _AUTO_REFERENCE = "Automatic (sharpest eligible frame)"
-_TRANSIENT_VARS = {"count_var", "status_var", "reference_display_var", "reference_stats_var", "reference_choice_status_var", "distributed_token_var"}
+_TRANSIENT_VARS = {"count_var", "status_var", "reference_display_var", "reference_stats_var", "reference_choice_status_var", "distributed_token_var", "filter_summary_var", "filter_pending_var", "filter_reason_var"}
 
 
 def format_duration(seconds: float) -> str:
@@ -246,6 +247,11 @@ class GPUStackerApp:
         self._preview_candidate_path: Path | None = None
         self._preview_window: tk.Toplevel | None = None
         self._preview_photo: tk.PhotoImage | None = None
+        self._filter_preview_window: tk.Toplevel | None = None
+        self._applying_filter_preset = False
+        self._analysis_for_filters = False
+        self._filter_measurements: dict[str, FrameInfo] | None = None
+        self._filter_measurements_signature: str | None = None
         self.events: queue.Queue = queue.Queue()
         self.pipeline: StackingPipeline | None = None
         self.worker: threading.Thread | None = None
@@ -366,6 +372,12 @@ class GPUStackerApp:
         ttk.Button(registered, text="Browse…", command=self._choose_registered_store).grid(row=1, column=2, padx=(6, 0), pady=(3, 0))
         self.cleanup_registered_button = ttk.Button(registered, text="Clean up…", command=self._cleanup_registered_store)
         self.cleanup_registered_button.grid(row=2, column=2, sticky="e", pady=(3, 0))
+        self.frame_storage_dirs_var = tk.StringVar(value="")
+        ttk.Button(registered, text="Add frame drive…", command=self._add_frame_storage_drive).grid(row=2, column=0, sticky="w", pady=(3, 0))
+        self.frame_storage_list = tk.Listbox(registered, height=2, bg=DARK_FIELD, fg=DARK_TEXT, highlightthickness=1, highlightbackground=DARK_BORDER, relief="flat", activestyle="none")
+        self.frame_storage_list.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+        ttk.Button(registered, text="Remove", command=self._remove_frame_storage_drive).grid(row=3, column=2, sticky="e", padx=(6, 0), pady=(3, 0))
+        self.frame_storage_dirs_var.trace_add("write", lambda *_: self._refresh_frame_storage_list())
         self.reference_choice_status_var = tk.StringVar(value="Run reference: automatic")
         ttk.Label(reference, textvariable=self.reference_choice_status_var, foreground="#9aa3b2").grid(row=3, column=0, columnspan=3, sticky="w")
 
@@ -508,20 +520,37 @@ class GPUStackerApp:
         ttk.Checkbutton(stack, text="Filters", variable=self.filters_enabled_var).grid(row=4, column=0, sticky="w", pady=2)
         row = ttk.Frame(stack)
         row.grid(row=4, column=1, columnspan=2, sticky="ew")
+        row.columnconfigure(1, weight=1)
+        row.columnconfigure(3, weight=1)
+        self.filter_preset_var = tk.StringVar(value="Balanced")
+        self.filter_preset_choice = ttk.Combobox(row, textvariable=self.filter_preset_var, values=(*FILTER_PRESETS, "Custom"), state="readonly", width=21)
+        self.filter_preset_choice.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self.filter_preset_choice.bind("<<ComboboxSelected>>", lambda _event: self._apply_filter_preset())
+        self.filter_preview_button = ttk.Button(row, text="Preview filters...", command=self._preview_filters)
+        self.filter_preview_button.grid(row=0, column=2, columnspan=2, sticky="e", pady=(0, 4))
         self.f_transp = tk.DoubleVar(value=0.6)
         self.f_stars = tk.DoubleVar(value=0.6)
         self.f_bg = tk.DoubleVar(value=2.0)
         self.f_fwhm = tk.DoubleVar(value=1.4)
+        self.f_psfsw = tk.DoubleVar(value=0.0)
+        self._filter_preset_vars = {
+            "transparency_min": self.f_transp, "stars_min_ratio": self.f_stars,
+            "background_max_ratio": self.f_bg, "fwhm_max_ratio": self.f_fwhm,
+        }
         self.filter_controls = []
-        for label, var, lo, hi, step in (("transp <", self.f_transp, 0, 1, 0.05), (" stars <", self.f_stars, 0, 1, 0.05), (" sky >", self.f_bg, 0, 10, 0.1), (" FWHM >", self.f_fwhm, 0, 5, 0.1)):
+        for index, (label, var, hi, step) in enumerate((("Transparency min", self.f_transp, 1, 0.05), ("Stars min", self.f_stars, 1, 0.05), ("Sky max", self.f_bg, 10, 0.1), ("FWHM max", self.f_fwhm, 5, 0.1), ("PSFSW min (advanced)", self.f_psfsw, 5, 0.05))):
+            field_row, field_column = 1 + index // 2, 2 * (index % 2)
             text = ttk.Label(row, text=label)
-            spin = ttk.Spinbox(row, textvariable=var, from_=lo, to=hi, increment=step, width=5)
-            text.pack(side="left")
-            spin.pack(side="left")
+            spin = ttk.Spinbox(row, textvariable=var, from_=0, to=hi, increment=step, width=6)
+            text.grid(row=field_row, column=field_column, sticky="w", padx=(0, 4), pady=2)
+            spin.grid(row=field_row, column=field_column + 1, sticky="w", padx=(0, 10), pady=2)
             self.filter_controls.extend((text, spin))
-        note = ttk.Label(row, text=" (x median; 0 = off)", foreground="#9aa3b2")
-        note.pack(side="left")
+            var.trace_add("write", self._filter_fields_edited)
+        note = ttk.Label(row, text="x median; 0 = off", foreground="#9aa3b2")
+        note.grid(row=3, column=2, columnspan=2, sticky="w")
         self.filter_controls.append(note)
+        self.filter_summary_var = tk.StringVar(value="Analysis pending")
+        ttk.Label(row, textvariable=self.filter_summary_var, wraplength=440).grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
         self.filters_enabled_var.trace_add("write", lambda *_: self._update_filter_controls())
         self._update_filter_controls()
 
@@ -542,6 +571,8 @@ class GPUStackerApp:
         ttk.Label(row, text="autocrop").pack(side="left")
         self.autocrop_var = tk.StringVar(value="off")
         ttk.Combobox(row, textvariable=self.autocrop_var, values=["off", "100%", "95%", "90%", "80%"], width=6, state="readonly").pack(side="left", padx=(2, 8))
+        self.full_field_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="Full field", variable=self.full_field_var).pack(side="left", padx=(0, 8))
         self.maps_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row, text="Coverage/rejection maps", variable=self.maps_var).pack(side="left")
         self.keep_var = tk.BooleanVar(value=False)
@@ -706,7 +737,12 @@ class GPUStackerApp:
         if self._analysis_cache is not None:
             metrics = self._reference_metrics
             if metrics is None:
-                metrics = rank_reference_infos(list(self._analysis_cache.values()))
+                try:
+                    filters = self._filter_settings()
+                except (ValueError, tk.TclError):
+                    return
+                evaluated, _ = preview_frame_filters(list(self._analysis_cache.values()), filters)
+                metrics = rank_reference_infos(evaluated)
         output_text = self.output_var.get() if hasattr(self, "output_var") else ""
         if metrics is None and output_text:
             metrics = rank_reference_frames(self.lights, Path(output_text).with_suffix(".frames.csv"))
@@ -907,8 +943,12 @@ class GPUStackerApp:
     def _invalidate_analysis_cache(self) -> None:
         self._analysis_cache = None
         self._analysis_cache_signature = None
+        self._filter_measurements = None
+        self._filter_measurements_signature = None
         self._reference_metrics = None
         self._reference_choices_dirty = True
+        if hasattr(self, "filter_summary_var"):
+            self._refresh_filter_preview()
 
     def _reference_analysis_settings_changed(self, *_args) -> None:
         self._invalidate_analysis_cache()
@@ -939,7 +979,7 @@ class GPUStackerApp:
         }
         return json.dumps(values, sort_keys=True)
 
-    def _rank_references(self) -> None:
+    def _rank_references(self, for_filters: bool = False) -> None:
         try:
             settings = self._settings()
         except (ValueError, tk.TclError) as exc:
@@ -949,9 +989,11 @@ class GPUStackerApp:
         self.run_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
         self._ranking = True
+        self._analysis_for_filters = for_filters
+        self.filter_preview_button.configure(state="disabled")
         self._cancel_requested = False
         self.progress["value"] = 0
-        self.status_var.set("Analyzing frames for reference ranking…")
+        self.status_var.set("Analyzing frames for filter preview..." if for_filters else "Analyzing frames for reference ranking...")
         signature = self._analysis_signature(settings)
         self.worker = threading.Thread(target=self._rank_worker, args=(settings, signature), daemon=True)
         self.worker.start()
@@ -963,7 +1005,6 @@ class GPUStackerApp:
             pipeline = StackingPipeline(settings, status, progress)
             self.pipeline = pipeline
             infos = pipeline.analyse()
-            pipeline.apply_prefilters(infos)
             self.events.put(("ranked", (infos, signature)))
         except Exception as exc:
             self.events.put(("rank_error", f"{type(exc).__name__}: {exc}"))
@@ -985,6 +1026,7 @@ class GPUStackerApp:
 
     def _settings(self) -> PipelineSettings:
         registered_dir = Path(self.registered_dir_var.get()) if self.registered_dir_var.get().strip() else None
+        registered_storage_dirs = [Path(value) for value in self.frame_storage_dirs_var.get().splitlines() if value.strip()]
         distributed_enabled = bool(self.distributed_enabled_var.get())
         if not self.lights and registered_dir is None:
             raise ValueError("Add at least two light frames")
@@ -996,6 +1038,10 @@ class GPUStackerApp:
             raise ValueError("Experimental multi-system stacking supports one weighting method per run")
         if registered_dir is not None and (self.resume_var.get() or self.drizzle_var.get() != "off"):
             raise ValueError("Registered-store stacking does not support resume or drizzle")
+        if registered_dir is not None and registered_storage_dirs:
+            raise ValueError("Drive selection applies only when registering original light frames")
+        if distributed_enabled and registered_storage_dirs:
+            raise ValueError("Multi-drive registered storage is not supported with experimental network workers")
         opt = lambda v: Path(v) if v.strip() else None  # noqa: E731
         mf = None
         if self.mf_enable.get():
@@ -1027,12 +1073,13 @@ class GPUStackerApp:
             detection_sigma=float(self.det_sigma.get()),
             weighting=weightings[0],  # type: ignore[arg-type]
             weightings=weightings,  # type: ignore[arg-type]
-            filters=FilterSettings(enabled=bool(self.filters_enabled_var.get()), transparency_min=float(self.f_transp.get()), stars_min_ratio=float(self.f_stars.get()), background_max_ratio=float(self.f_bg.get()), fwhm_max_ratio=float(self.f_fwhm.get())),
+            filters=self._filter_settings(),
             interpolation=self.interp_var.get(),  # type: ignore[arg-type]
             refine_registration=bool(self.refine_var.get()),
             local_norm=LocalNormSettings(enabled=bool(self.local_norm_var.get())),
             refit_local_norm_per_weighting=self.variant_norm_var.get() == "Refit per method",
             autocrop=0.0 if self.autocrop_var.get() == "off" else float(self.autocrop_var.get().rstrip("%")) / 100.0,
+            full_field=bool(self.full_field_var.get()),
             save_maps=bool(self.maps_var.get()),
             plate_solve=bool(self.solve_var.get()),
             drizzle=DrizzleSettings(enabled=self.drizzle_var.get() != "off", scale=int(self.drizzle_var.get().rstrip("x")) if self.drizzle_var.get() != "off" else 2, kernel=self.drizzle_kernel_var.get(), pixfrac=float(self.pixfrac_var.get()), min_weight=float(self.drizzle_min_weight_var.get()), cfa=bool(self.cfa_drizzle_var.get())),
@@ -1051,6 +1098,7 @@ class GPUStackerApp:
             mfdeconv_frames=int(self.mf_frames.get()),
             mfdeconv_blend=float(self.mf_blend.get()),
             keep_registered=bool(self.keep_var.get()),
+            registered_storage_dirs=registered_storage_dirs,
             distributed_enabled=distributed_enabled,
             distributed_host=self.distributed_host_var.get().strip(),
             distributed_port=int(self.distributed_port_var.get()),
@@ -1079,6 +1127,206 @@ class GPUStackerApp:
         state = "normal" if self.filters_enabled_var.get() else "disabled"
         for control in self.filter_controls:
             control.configure(state=state)
+        self.filter_preset_choice.configure(state="readonly" if self.filters_enabled_var.get() else "disabled")
+        self._filter_fields_edited()
+
+    def _filter_settings(self) -> FilterSettings:
+        return FilterSettings(
+            enabled=bool(self.filters_enabled_var.get()), transparency_min=float(self.f_transp.get()),
+            stars_min_ratio=float(self.f_stars.get()), background_max_ratio=float(self.f_bg.get()),
+            fwhm_max_ratio=float(self.f_fwhm.get()), psfsw_min_ratio=float(self.f_psfsw.get()),
+        )
+
+    def _apply_filter_preset(self) -> None:
+        name = self.filter_preset_var.get()
+        if name not in FILTER_PRESETS:
+            return
+        settings = filter_preset(name)
+        self._applying_filter_preset = True
+        try:
+            for key, variable in self._filter_preset_vars.items():
+                variable.set(getattr(settings, key))
+        finally:
+            self._applying_filter_preset = False
+        self._filter_fields_edited()
+
+    def _filter_fields_edited(self, *_args) -> None:
+        if self._applying_filter_preset:
+            return
+        name = self.filter_preset_var.get().removesuffix(" (modified)")
+        if name in FILTER_PRESETS:
+            preset = filter_preset(name)
+            try:
+                matches = all(abs(float(variable.get()) - getattr(preset, key)) < 1e-9 for key, variable in self._filter_preset_vars.items())
+            except (ValueError, tk.TclError):
+                matches = False
+            self.filter_preset_var.set(name if matches else f"{name} (modified)")
+        if hasattr(self, "filter_summary_var") and hasattr(self, "_refresh_filter_preview"):
+            self._reference_metrics = None
+            self._reference_choices_dirty = True
+            self._refresh_filter_preview()
+
+    def _preview_filters(self) -> None:
+        if self.batch_var.get():
+            messagebox.showinfo(APP_NAME, "Filter preview requires a single stacking group. Batch presets are applied separately to each group.", parent=self.root)
+            return
+        if self.registered_dir_var.get().strip():
+            messagebox.showinfo(APP_NAME, "Filter analysis requires the original light frames, not a retained registered store.", parent=self.root)
+            return
+        try:
+            settings = self._settings()
+        except (ValueError, tk.TclError) as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self.root)
+            return
+        if self._filter_measurements_signature != self._analysis_signature(settings):
+            self._filter_measurements = None
+        if self._analysis_cache is not None and self._analysis_signature(settings) == self._analysis_cache_signature:
+            self._show_filter_preview()
+        else:
+            self._rank_references(for_filters=True)
+
+    def _show_filter_preview(self) -> None:
+        if self._filter_preview_window is not None and self._filter_preview_window.winfo_exists():
+            self._filter_preview_window.lift()
+            self._refresh_filter_preview()
+            return
+        window = tk.Toplevel(self.root)
+        self._filter_preview_window = window
+        window.title(f"{APP_NAME} - Frame filter preview")
+        window.geometry("1140x620")
+        window.minsize(850, 440)
+        configure_dark_theme(window)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(3, weight=1)
+        controls = ttk.Frame(window, padding=10)
+        controls.grid(row=0, column=0, sticky="ew")
+        choice = ttk.Combobox(controls, textvariable=self.filter_preset_var, values=(*FILTER_PRESETS, "Custom"), state="readonly", width=21)
+        choice.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        choice.bind("<<ComboboxSelected>>", lambda _event: self._apply_filter_preset())
+        ttk.Checkbutton(controls, text="Filters enabled", variable=self.filters_enabled_var).grid(row=0, column=2, columnspan=2, sticky="w")
+        for column, (label, variable) in enumerate((("Stars min", self.f_stars), ("Sky max", self.f_bg), ("FWHM max", self.f_fwhm), ("Transparency min", self.f_transp), ("PSFSW min", self.f_psfsw))):
+            ttk.Label(controls, text=label).grid(row=1, column=2 * column, sticky="w", padx=(0, 4))
+            ttk.Spinbox(controls, textvariable=variable, from_=0, to=10, increment=0.05, width=6).grid(row=1, column=2 * column + 1, sticky="w", padx=(0, 12))
+        summary_label = ttk.Label(window, textvariable=self.filter_summary_var, wraplength=800)
+        summary_label.grid(row=1, column=0, sticky="w", padx=10)
+        self.filter_pending_var = tk.StringVar()
+        pending_label = ttk.Label(window, textvariable=self.filter_pending_var, wraplength=800)
+        pending_label.grid(row=2, column=0, sticky="w", padx=10, pady=(3, 8))
+        body = ttk.Frame(window, padding=(10, 0, 10, 0))
+        body.grid(row=3, column=0, sticky="nsew")
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+        columns = ("file", "decision", "exposure", "stars", "sky", "fwhm", "transparency", "psfsw", "reason")
+        self._filter_tree = ttk.Treeview(body, columns=columns, show="headings", selectmode="browse")
+        for column, title, width in zip(columns, ("Frame", "Decision", "Exposure (s)", "Stars", "Sky", "FWHM (px)", "Transparency", "Relative PSFSW", "Reasons"), (250, 85, 85, 65, 85, 85, 100, 110, 420)):
+            self._filter_tree.heading(column, text=title, command=lambda key=column: self._sort_filter_preview(key))
+            self._filter_tree.column(column, width=width, minwidth=55, stretch=column in ("file", "reason"))
+        self._filter_tree.grid(row=0, column=0, sticky="nsew")
+        vertical = ttk.Scrollbar(body, orient="vertical", command=self._filter_tree.yview)
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal = ttk.Scrollbar(body, orient="horizontal", command=self._filter_tree.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self._filter_tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        self._filter_sort = "file"
+        self._filter_reverse = False
+        self.filter_reason_var = tk.StringVar()
+        reason_label = ttk.Label(window, textvariable=self.filter_reason_var, wraplength=800)
+        reason_label.grid(row=4, column=0, sticky="w", padx=10, pady=8)
+        def resize_labels(event):
+            if event.widget == window:
+                for label in (summary_label, pending_label, reason_label):
+                    label.configure(wraplength=max(200, event.width - 24))
+        window.bind("<Configure>", resize_labels)
+        self._filter_tree.bind("<<TreeviewSelect>>", self._filter_selection_changed)
+        self._refresh_filter_preview()
+
+    def _sort_filter_preview(self, column: str) -> None:
+        self._filter_reverse = not self._filter_reverse if column == self._filter_sort else False
+        self._filter_sort = column
+        self._refresh_filter_preview()
+
+    def _filter_selection_changed(self, *_args) -> None:
+        selected = self._filter_tree.selection()
+        if selected:
+            info = self._filter_preview_infos[int(selected[0])]
+            self.filter_reason_var.set(f"{info.path.name}: {info.rejected_reason or 'Keep'}")
+
+    def _refresh_filter_preview(self) -> None:
+        cache = getattr(self, "_analysis_cache", None)
+        window = getattr(self, "_filter_preview_window", None)
+        tree = self._filter_tree if window is not None and window.winfo_exists() else None
+        if not cache:
+            self.filter_summary_var.set("Analysis pending")
+            if tree is not None:
+                tree.delete(*tree.get_children())
+            return
+        try:
+            settings = self._filter_settings()
+        except (ValueError, tk.TclError):
+            self.filter_summary_var.set("Enter valid non-negative filter thresholds")
+            if tree is not None:
+                tree.delete(*tree.get_children())
+            return
+        evaluated, _ = preview_frame_filters(list(cache.values()), settings)
+        measurements = (getattr(self, "_filter_measurements", None) or {}) if getattr(self, "_filter_measurements_signature", None) == self._analysis_cache_signature else {}
+        for key, info in zip(cache, evaluated):
+            measured = measurements.get(key)
+            if measured is None:
+                continue
+            info.transparency = measured.transparency
+            info.psfsw = measured.psfsw
+            if measured.rejected_reason and not measured.rejected_reason.startswith("filter:"):
+                info.rejected_reason = measured.rejected_reason
+            if settings.enabled and (info.rejected_reason is None or info.rejected_reason.startswith("filter:")):
+                reasons = [info.rejected_reason.removeprefix("filter: ")] if info.rejected_reason else []
+                if settings.transparency_min > 0 and np.isfinite(info.transparency) and info.transparency < settings.transparency_min:
+                    reasons.append(f"transparency {info.transparency:.3g} < {settings.transparency_min:g}")
+                if settings.psfsw_min_ratio > 0 and np.isfinite(info.psfsw) and info.psfsw < settings.psfsw_min_ratio:
+                    reasons.append(f"PSFSW {info.psfsw:.4g} < {settings.psfsw_min_ratio:g} of exposure-group median")
+                if reasons:
+                    info.rejected_reason = "filter: " + "; ".join(reasons)
+        self._filter_preview_infos = evaluated
+        kept = [info for info in evaluated if info.rejected_reason is None]
+        total_exposure = sum(info.meta.exposure for info in evaluated if info.meta.exposure is not None and math.isfinite(info.meta.exposure) and info.meta.exposure > 0)
+        kept_exposure = sum(info.meta.exposure for info in kept if info.meta.exposure is not None and math.isfinite(info.meta.exposure) and info.meta.exposure > 0)
+        exposure_text = f"{format_duration(kept_exposure)} / {format_duration(total_exposure)} known exposure ({kept_exposure / total_exposure:.0%})" if total_exposure > 0 else "Exposure unknown"
+        self.filter_summary_var.set(f"Keep {len(kept)}/{len(evaluated)} frames; reject {len(evaluated) - len(kept)}. {exposure_text}")
+        if tree is None:
+            return
+        pending = ["Last-run measurements"] if measurements else []
+        if settings.enabled and settings.transparency_min > 0:
+            unknown = sum(not np.isfinite(info.transparency) for info in evaluated)
+            pending.append(f"Transparency: {unknown} pending/unknown" if measurements else "Transparency: pending registration")
+        if settings.enabled and settings.psfsw_min_ratio > 0:
+            unknown = sum(not np.isfinite(info.psfsw) for info in evaluated)
+            pending.append(f"PSFSW: {unknown} pending/unknown" if measurements else "PSFSW: pending registration")
+        self.filter_pending_var.set("; ".join(pending) or "Late quality filters off")
+        selected = tree.selection()
+        tree.delete(*tree.get_children())
+
+        def sort_key(item):
+            info = item[1]
+            values = {
+                "file": str(info.path).casefold(), "decision": bool(info.rejected_reason),
+                "exposure": info.meta.exposure or 0, "stars": info.stars.total_detected,
+                "sky": info.background, "fwhm": info.fwhm,
+                "transparency": info.transparency, "psfsw": getattr(info, "psfsw", float("nan")),
+                "reason": info.rejected_reason or "",
+            }
+            value = values[self._filter_sort]
+            return math.inf if isinstance(value, (int, float)) and not math.isfinite(value) else value
+
+        def number(value, missing="Unknown"):
+            return f"{value:.3g}" if value is not None and math.isfinite(value) else missing
+
+        for index, info in sorted(enumerate(evaluated), key=sort_key, reverse=self._filter_reverse):
+            tree.insert("", "end", iid=str(index), values=(
+                info.path.name, "Reject" if info.rejected_reason else "Keep", number(info.meta.exposure),
+                info.stars.total_detected, number(info.background), number(info.fwhm),
+                number(info.transparency, "Unknown" if measurements else "Pending"), number(info.psfsw, "Unknown" if measurements else "Pending"), info.rejected_reason or "",
+            ))
+        if selected and tree.exists(selected[0]):
+            tree.selection_set(selected)
 
     def _choose_weightings(self) -> None:
         popup = tk.Toplevel(self.root)
@@ -1222,6 +1470,8 @@ class GPUStackerApp:
                 )
         except Exception:
             disk_estimate = None
+        if settings.full_field:
+            notes.append("Full-field scratch use may exceed this estimate because the aligned canvas size is known only during registration.")
         if not self._confirm_stack(planned, notes, disk_estimate):
             return
         self._save_settings()
@@ -1233,8 +1483,29 @@ class GPUStackerApp:
         self.worker.start()
 
     def _work(self, settings: PipelineSettings, batch_groups: list[FrameGroup] | None = None, batch_output_dir: Path | None = None) -> None:
-        status = lambda m: self.events.put(("log", m))  # noqa: E731
-        progress = lambda f, m: self.events.put(("progress", (f, m)))  # noqa: E731
+        log_path = settings.output.with_suffix(".log")
+        if batch_groups is not None and batch_output_dir is not None:
+            log_path = batch_output_dir / "gpustacker_batch.log"
+        try:
+            run_log = RunLog(log_path)
+        except OSError as exc:
+            run_log = None
+            self.events.put(("log", f"Could not create run log {log_path}: {exc}"))
+
+        def status(message: str) -> None:
+            if run_log is not None:
+                run_log.write(message)
+            self.events.put(("log", message))
+
+        def progress(fraction: float, message: str) -> None:
+            if run_log is not None:
+                run_log.write(f"[{fraction:.0%}] {message}")
+            self.events.put(("progress", (fraction, message)))
+
+        if run_log is not None:
+            run_log.write(f"GPUStacker {__version__}")
+            run_log.write(f"Output: {settings.output}")
+            self.events.put(("log", f"Run log: {log_path}"))
         try:
             if batch_groups is not None:
                 if batch_output_dir is None:
@@ -1256,27 +1527,69 @@ class GPUStackerApp:
                         lines.append(f"  {label}: 0/{len(group.lights)} frames — FAILED: {err}")
                     else:
                         lines.append(f"  {label}: {integration_summary(res, len(group.lights))}")
+                if run_log is not None:
+                    for line in lines:
+                        run_log.write(line)
                 self.events.put(("done", (f"Batch finished: {done}/{len(batch.outputs)} group(s) -> {out_dir}", out_dir, lines)))
             else:
                 self.pipeline = StackingPipeline(settings, status, progress)
                 result = self.pipeline.run()
+                if settings.registered_dir is None:
+                    self.events.put(("filter_measurements", (result.frames, self._analysis_signature(settings))))
                 lines = [integration_summary(result, len(result.frames) if settings.registered_dir is not None else len(settings.lights)), f"Master: {result.output.name}"]
                 for label, path in (("Drizzle", result.drizzle_output), ("MFDeconv", result.mfdeconv_output)):
                     if path is not None:
                         lines.append(f"{label}: {path.name}")
+                if run_log is not None:
+                    for line in lines:
+                        run_log.write(line)
                 self.events.put(("done", (f"Finished in {result.seconds:.1f}s -> {result.output}", result.output.parent, lines)))
         except RuntimeError as exc:
             if str(exc) == "Cancelled":
+                if run_log is not None:
+                    run_log.write("Run cancelled")
                 self.events.put(("cancelled", None))
             else:
+                if run_log is not None:
+                    run_log.write_exception("Run failed", exc)
                 self.events.put(("error", f"{type(exc).__name__}: {exc}"))
         except Exception as exc:  # surface everything in the GUI log
+            if run_log is not None:
+                run_log.write_exception("Run failed", exc)
             self.events.put(("error", f"{type(exc).__name__}: {exc}"))
+        finally:
+            if run_log is not None:
+                run_log.close()
 
     def _choose_registered_store(self) -> None:
         chosen = filedialog.askdirectory(title="Choose retained registered store")
         if chosen:
             self.registered_dir_var.set(chosen)
+
+    def _add_frame_storage_drive(self) -> None:
+        chosen = filedialog.askdirectory(title="Choose a folder on a drive for registered frames")
+        if not chosen:
+            return
+        selected = [Path(value) for value in self.frame_storage_dirs_var.get().splitlines() if value.strip()]
+        path = Path(chosen).resolve()
+        if path not in selected:
+            selected.append(path)
+            self.frame_storage_dirs_var.set("\n".join(str(value) for value in selected))
+
+    def _remove_frame_storage_drive(self) -> None:
+        selected = list(self.frame_storage_list.curselection())
+        if not selected:
+            return
+        paths = self.frame_storage_dirs_var.get().splitlines()
+        del paths[selected[0]]
+        self.frame_storage_dirs_var.set("\n".join(paths))
+
+    def _refresh_frame_storage_list(self) -> None:
+        if not hasattr(self, "frame_storage_list"):
+            return
+        self.frame_storage_list.delete(0, tk.END)
+        for path in self.frame_storage_dirs_var.get().splitlines():
+            self.frame_storage_list.insert(tk.END, path)
 
     def _cleanup_registered_store(self) -> None:
         if self._run_active:
@@ -1407,12 +1720,21 @@ class GPUStackerApp:
                     infos, signature = payload
                     self._analysis_cache = {str(info.path.resolve()): info for info in infos}
                     self._analysis_cache_signature = signature
-                    self._reference_metrics = rank_reference_infos(infos)
+                    self._reference_metrics = None
                     self._reference_choices_dirty = True
                     self._ranking = False
                     self._set_running(False)
                     self._refresh_reference_choices()
-                    self.status_var.set("Reference ranking ready")
+                    self._refresh_filter_preview()
+                    if self._analysis_for_filters:
+                        self._show_filter_preview()
+                    self.status_var.set("Filter analysis ready" if self._analysis_for_filters else "Reference ranking ready")
+                    self._analysis_for_filters = False
+                elif kind == "filter_measurements":
+                    infos, signature = payload
+                    self._filter_measurements = {str(info.path.resolve()): info for info in infos}
+                    self._filter_measurements_signature = signature
+                    self._refresh_filter_preview()
                 elif kind == "rank_error":
                     self._ranking = False
                     self._set_running(False)
@@ -1454,6 +1776,7 @@ class GPUStackerApp:
         self.run_btn.configure(state="disabled" if active else "normal")
         self.rank_reference_button.configure(state="disabled" if active else "normal")
         self.preview_reference_button.configure(state="disabled" if active else "normal")
+        self.filter_preview_button.configure(state="disabled" if active else "normal")
         self.cleanup_registered_button.configure(state="disabled" if active else "normal")
         self.cancel_btn.configure(state="normal" if active else "disabled")
         if running:

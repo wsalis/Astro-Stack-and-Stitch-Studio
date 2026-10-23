@@ -182,9 +182,31 @@ workers
     ),
     (
         "Frame filters",
-        """The Filters checkbox enables or disables all frame exclusion filters. The CLI equivalent is
+        """The Filters checkbox enables or disables quality-based frame exclusion. Read and registration
+      failures still exclude unusable frames. The CLI equivalent is
       --no-filters. When enabled, thresholds are multiples of the session median; 0 disables that individual
       filter. Excluded frames are listed in the log with the reason and in <name>.frames.csv.
+
+      Lenient, Balanced, and Selective are editable starting points, not automatic rejection quotas.
+      Their values are provisional; inspect your data before choosing tighter thresholds.
+               Transparency min   Stars min   Sky max   FWHM max
+      Lenient                0.40           0.35       3.0        1.8
+      Balanced               0.60           0.60       2.0        1.4
+      Selective              0.80           0.80       1.5        1.2
+      Balanced preserves the previous defaults. Editing a value marks the preset modified. Presets
+      do not change weighting, pixel rejection, or the optional advanced PSFSW cutoff.
+
+      Preview filters analyzes a single stacking group and reuses those measurements as thresholds
+      change. The sortable table shows measured values, all applicable reasons, unique rejected-frame
+      counts, and retained known exposure. Analysis decisions share the pipeline's evaluator.
+      Transparency and PSFSW remain pending until registration; after a completed run their measured
+      values can be inspected here. They describe that run, not a new registration. Frames excluded
+      before registration remain unmeasured. Changing early filters may change late-stage baselines
+      on the next run, so those preview decisions are estimates. Batch runs evaluate each group
+      separately; cross-group preview and retained-store re-filtering are not supported.
+
+      CLI: --filter-preset lenient|balanced|selective supplies starting values. Explicit
+      --filter-transparency, --filter-stars, --filter-background, and --filter-fwhm override them.
 
       Mixed exposures (e.g. Seestar 20 s / 30 s / 60 s subs in one folder) are handled: transparency is
       corrected for exposure before filtering, star-count and sky medians are taken per exposure group,
@@ -202,7 +224,15 @@ sky >  (default 2.0)
   dawn).
 FWHM >  (default 1.4)
   Exclude frames whose star FWHM exceeds this multiple of the median (poor seeing, wind, focus
-  drift).""",
+  drift).
+PSFSW min (advanced; default 0 = off)
+  Optional post-registration cutoff, independent of the chosen stacking weights. Compares unclipped
+  (raw stellar flux ratio / noise)^2 against the median within the same exposure group. At least
+  three valid measurements are required per group; unknown or sparse measurements are not rejected.
+  This avoids penalizing short exposures simply because they contain less signal. The CSV/JSON
+  psfsw column records the relative score separately from weight. CLI: --filter-psfsw 0.1.
+  With this cutoff off, existing weighting behavior is unchanged. Retained registered stores reuse
+  previous exclusions and weights; a new PSFSW cutoff requires original light frames.""",
     ),
     (
         "Registration",
@@ -235,13 +265,21 @@ chosen file.""",
   coverage/rejection maps, the drizzle output (scaled) and the deconvolved image, and recorded in
   the header as CROPX0 / CROPY0 / CROPDPTH. The log reports pixels trimmed per side.
 
+Full field
+  Use the union of aligned frame footprints as the output canvas instead of limiting it to the
+  reference frame. Frames with less than 25% overlap with the reference are skipped to limit
+  outlier-driven canvas growth. This can increase scratch-disk use; autocrop can trim low-coverage
+  edges.
+
 Coverage/rejection maps
   Save <name>_coverage.fit (frames per pixel) and <name>_rejection.fit (rejected sample fraction
   per pixel). Useful to see trails that were removed and where dithering left thin edges.
 
 Keep registered frames
-  Keep the work folder with the registered .npy frames instead of deleting it after the run.
-  Needed for diagnostics; costs disk space (frames x width x height x 4 bytes x channels).
+  Keep the registered .npy frames instead of deleting them after the run. Add folders on separate
+  drives with Add frame drive to distribute whole frames by available space. The store manifest
+  keeps their locations for later stacking; cleanup removes only the files owned by that store.
+  Costs disk space (frames x width x height x 4 bytes x channels). CLI: repeat --registered-drive.
 
 Plate solve (ASTAP)
   After each master, drizzle and deconvolved image is saved, solve it with ASTAP (auto-detected;
@@ -342,6 +380,8 @@ PSF size is automatic: a star PSF is built on a wide stamp and trimmed where the
                            rows top to bottom, pre-registration).
 <name>.report.json         everything above plus timings, settings and the session "fwhm_map"
                            (tilt check: constant pattern vs frame-to-frame scatter).
+<name>.log                 timestamped run status, progress, and exception traceback; appended per run.
+                           Batch runs use gpustacker_batch.log in the output folder.
 
 Log lines worth reading:
   "Weights (...): min/median/max"   - a very wide range means a few frames dominate.

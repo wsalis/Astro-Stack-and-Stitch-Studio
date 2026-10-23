@@ -78,6 +78,28 @@ class FilterSettings:
     background_max_ratio: float = 2.0  # sky level vs session median
     fwhm_max_ratio: float = 1.4  # FWHM vs session median
     enabled: bool = True
+    psfsw_min_ratio: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name in ("transparency_min", "stars_min_ratio", "background_max_ratio", "fwhm_max_ratio", "psfsw_min_ratio"):
+            value = getattr(self, name)
+            if not np.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+
+
+FILTER_PRESETS = {
+    "Lenient": (0.4, 0.35, 3.0, 1.8),
+    "Balanced": (0.6, 0.6, 2.0, 1.4),
+    "Selective": (0.8, 0.8, 1.5, 1.2),
+}
+
+
+def filter_preset(name: str) -> FilterSettings:
+    transparency_min, stars_min_ratio, background_max_ratio, fwhm_max_ratio = FILTER_PRESETS[name]
+    return FilterSettings(
+        transparency_min=transparency_min, stars_min_ratio=stars_min_ratio,
+        background_max_ratio=background_max_ratio, fwhm_max_ratio=fwhm_max_ratio,
+    )
 
 
 @dataclass
@@ -158,6 +180,29 @@ def transparency(flux: np.ndarray, ref_flux: np.ndarray, min_stars: int = 12) ->
     if n < min_stars:
         return float("nan"), n
     return float(np.median(flux[ok] / ref_flux[ok])), n
+
+
+def relative_psfsw(noise: np.ndarray, flux_ratio: np.ndarray, exposures: list[float | None]) -> np.ndarray:
+    noise = np.asarray(noise, dtype=np.float64)
+    flux_ratio = np.asarray(flux_ratio, dtype=np.float64)
+    if noise.shape != flux_ratio.shape or noise.ndim != 1 or len(exposures) != noise.size:
+        raise ValueError("PSFSW measurements and exposure groups must have matching lengths")
+    valid = np.isfinite(noise) & (noise > 0) & np.isfinite(flux_ratio) & (flux_ratio > 0)
+    raw = np.full(noise.shape, np.nan)
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        raw[valid] = np.square(flux_ratio[valid] / noise[valid])
+    result = np.full(noise.shape, np.nan)
+    groups: dict[float | None, list[int]] = {}
+    for index, exposure in enumerate(exposures):
+        groups.setdefault(exposure, []).append(index)
+    for indices in groups.values():
+        samples = raw[indices]
+        finite = samples[np.isfinite(samples) & (samples > 0)]
+        if finite.size < 3:
+            continue
+        median = np.median(finite)
+        result[indices] = np.where(np.isfinite(samples) & (samples > 0), samples / median, np.nan)
+    return result
 
 
 def compute_weights(mode: str, noise: np.ndarray, fwhm: np.ndarray, transp: np.ndarray) -> np.ndarray:

@@ -9,6 +9,7 @@ import os
 import platform
 import re
 import secrets
+import select
 import socket
 import socketserver
 import tempfile
@@ -16,22 +17,25 @@ import threading
 import time
 import uuid
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+import psutil
 import torch
 
 from . import __version__
 from .backend import select_backend
-from .stacking import FrameStore, StackBandResult, StackResult, StackSettings, read_store_band, stack_store_band
+from .stacking import FrameStore, StackBandResult, StackResult, StackSettings, _stack_band_halo, band_overhead, read_store_band, stack_store_band
 
 WORKER_PROTOCOL_VERSION = 1
 MAX_WORKER_MESSAGE_BYTES = 16 * 1024
 WORKER_PROBE_SAMPLE_FRAMES = 32
 WORKER_TASKS_IN_FLIGHT = 2
+MAX_WORKER_PREFETCH_BYTES = 1024 * 1024 * 1024
+WORKER_TASK_TIMEOUT_SECONDS = 300.0
 
 
 class WorkerProbeError(RuntimeError):
@@ -267,6 +271,15 @@ def _load_probe_store(directory: Path) -> FrameStore:
     return store
 
 
+def _worker_memory_budget() -> int:
+    return max(1, min(MAX_WORKER_PREFETCH_BYTES, int(psutil.virtual_memory().available) // 8))
+
+
+def _worker_task_rows(store: FrameStore, budget: int) -> int:
+    channels, _, width = store.shape
+    return max(1, budget // (len(store) * channels * width * np.dtype(np.float32).itemsize))
+
+
 def worker_capabilities(directory: Path, rows: int = 8) -> dict[str, Any]:
     """Inspect the configured store and local worker capabilities without scheduling work."""
 
@@ -307,6 +320,7 @@ def worker_capabilities(directory: Path, rows: int = 8) -> dict[str, Any]:
         "store_path_is_unc": str(directory).startswith("\\\\"),
         "stack_band_task_protocol": 1,
         "stack_task_execution_enabled": False,
+        "stack_task_max_rows": _worker_task_rows(store, _worker_memory_budget()),
         "store_shape": list(benchmark.shape),
         "store_frame_count": benchmark.frame_count,
         "store_metadata_sha256": _store_metadata_fingerprint(store_path),
@@ -330,37 +344,69 @@ def _execute_stack_band_task(
     store_cache: dict[str, Any],
     read_lock: threading.Lock,
     gpu_lock: threading.Lock,
+    cancel_callback: Callable[[], None] | None = None,
 ) -> WorkerTaskAcknowledgement:
+    if status_callback is not None:
+        status_callback(f"Received {task.pass_name} stack task rows {task.row_start}:{task.row_stop}; waiting for store access.")
     store_path = directory.resolve(strict=True)
     with read_lock:
+        if cancel_callback is not None:
+            cancel_callback()
         current_fingerprint = _store_metadata_fingerprint(store_path)
         if current_fingerprint != task.store_fingerprint:
             raise WorkerProbeError("Registered-store fingerprint changed before task execution")
         if store_cache.get("fingerprint") != current_fingerprint:
+            if status_callback is not None:
+                status_callback("Loading registered-store index and normalization maps; shared-storage access may take time.")
             store_cache["store"] = FrameStore.load_index(store_path)
+            if status_callback is not None:
+                status_callback(f"Preparing band readers for {len(store_cache['store'])} registered frames.")
             store_cache["maps"] = store_cache["store"].band_reader()
             store_cache["fingerprint"] = current_fingerprint
         store = store_cache["store"]
+        frame_maps = store_cache["maps"]
         if task.row_stop > store.shape[1]:
             raise WorkerProbeError("Stack-band range exceeds registered-store height")
-        if status_callback is not None:
-            status_callback(f"Reading {task.pass_name} stack band rows {task.row_start}:{task.row_stop}.")
-        host_data = read_store_band(store_cache["maps"], store.shape, task.row_start, task.row_stop)
+        settings = StackSettings(**task.stack_settings)
+        halo = _stack_band_halo(settings)
+        read_start = max(0, task.row_start - halo)
+        read_stop = min(store.shape[1], task.row_stop + halo)
+        memory_budget = _worker_memory_budget()
+        input_bytes = len(store) * store.shape[0] * (read_stop - read_start) * store.shape[2] * 4
+        output_bytes = (task.row_stop - task.row_start) * store.shape[2] * (store.shape[0] * 4 + 6 + (len(store) if task.reject_masks else 0))
+        if output_bytes > memory_budget:
+            raise WorkerProbeError("Task result exceeds the worker RAM budget; reduce rows per task")
+        host_data = None
+        if input_bytes <= memory_budget:
+            if status_callback is not None:
+                status_callback(f"Reading {task.pass_name} stack band rows {task.row_start}:{task.row_stop}.")
+            host_data = read_store_band(frame_maps, store.shape, read_start, read_stop)
     with gpu_lock:
+        if cancel_callback is not None:
+            cancel_callback()
         backend = select_backend(vram_fraction=float(task.vram_fraction))
+        memory_budget = min(memory_budget, _worker_memory_budget())
+        bytes_per_row = len(store) * store.shape[0] * store.shape[2] * 4
+        if bytes_per_row > memory_budget:
+            raise WorkerProbeError("One stack row exceeds the worker RAM budget")
+        backend = replace(backend, budget_bytes=min(backend.budget_bytes, int(memory_budget * band_overhead(settings))))
         if status_callback is not None:
             status_callback(f"Executing {task.pass_name} stack band rows {task.row_start}:{task.row_stop} on {backend.name}.")
         result = _stack_worker_band_with_memory_retry(
             store,
             backend,
-            StackSettings(**task.stack_settings),
+            settings,
             task.row_start,
             task.row_stop,
             task.reject_masks,
             host_data,
             status_callback,
+            frame_maps,
+            cancel_callback,
         )
     del host_data
+    if cancel_callback is not None:
+        cancel_callback()
     artifact_dir = store_path / "gpustacker_tasks" / task.run_id
     artifact_dir.mkdir(parents=True, exist_ok=True)
     artifact = artifact_dir / f"{task.task_id}.npz"
@@ -382,6 +428,8 @@ def _execute_stack_band_task(
             )
             stream.flush()
             os.fsync(stream.fileno())
+        if cancel_callback is not None:
+            cancel_callback()
         os.replace(temporary, artifact)
     finally:
         if temporary is not None:
@@ -402,11 +450,16 @@ def _stack_worker_band_with_memory_retry(
     row_start: int,
     row_stop: int,
     reject_masks: bool,
-    host_data: np.ndarray,
+    host_data: np.ndarray | None,
     status_callback: Callable[[str], None] | None,
+    frame_maps=None,
+    cancel_callback: Callable[[], None] | None = None,
 ) -> StackBandResult:
     try:
-        return stack_store_band(store, backend, settings, row_start, row_stop, reject_masks, host_data=host_data)
+        return stack_store_band(
+            store, backend, settings, row_start, row_stop, reject_masks,
+            frame_maps=frame_maps, host_data=host_data, cancel_cb=cancel_callback,
+        )
     except torch.cuda.OutOfMemoryError:
         if settings.large_scale or row_stop - row_start <= 1:
             raise
@@ -417,10 +470,12 @@ def _stack_worker_band_with_memory_retry(
     if status_callback is not None:
         status_callback(f"CUDA memory limit reached; retrying rows {row_start}:{row_stop} as smaller bands.")
     upper = _stack_worker_band_with_memory_retry(
-        store, backend, settings, row_start, middle, reject_masks, host_data[:, :, :split], status_callback,
+        store, backend, settings, row_start, middle, reject_masks,
+        None if host_data is None else host_data[:, :, :split], status_callback, frame_maps, cancel_callback,
     )
     lower = _stack_worker_band_with_memory_retry(
-        store, backend, settings, middle, row_stop, reject_masks, host_data[:, :, split:], status_callback,
+        store, backend, settings, middle, row_stop, reject_masks,
+        None if host_data is None else host_data[:, :, split:], status_callback, frame_maps, cancel_callback,
     )
     masks = None
     if upper.rejection_masks is not None and lower.rejection_masks is not None:
@@ -454,6 +509,11 @@ def create_worker_server(
         daemon_threads = True
 
     class Handler(socketserver.StreamRequestHandler):
+        def check_connection(self) -> None:
+            readable, _, _ = select.select([self.request], [], [], 0)
+            if readable and not self.request.recv(1, socket.MSG_PEEK):
+                raise ConnectionAbortedError("Coordinator disconnected before task completion")
+
         def handle(self) -> None:
             self.request.settimeout(10.0)
             raw_request = self.rfile.readline(MAX_WORKER_MESSAGE_BYTES + 1)
@@ -478,7 +538,7 @@ def create_worker_server(
                     if not enable_task_execution:
                         acknowledgement = WorkerTaskAcknowledgement(task.task_id, "rejected", "execution_disabled", "Stack-band execution is disabled on this worker pending opt-in and output-equivalence validation.")
                     else:
-                        acknowledgement = _execute_stack_band_task(directory, task, status_callback, store_cache, read_lock, gpu_lock)
+                        acknowledgement = _execute_stack_band_task(directory, task, status_callback, store_cache, read_lock, gpu_lock, self.check_connection)
                     response = {"nonce": nonce, **asdict(acknowledgement)}
                     response["signature"] = _message_signature(token, nonce.encode("ascii") + _canonical_json(response))
                     if status_callback is not None:
@@ -531,6 +591,7 @@ def probe_worker(
     expected_store: Path | None = None,
     require_cuda: bool = False,
     response_timeout: float | None = None,
+    cancel_callback: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Authenticate to a worker and verify its signed capability response."""
 
@@ -544,13 +605,12 @@ def probe_worker(
         connection = socket.create_connection((host, port), timeout=timeout)
     except OSError as exc:
         raise WorkerProbeError(f"Could not connect to worker {host}:{port}: {exc}") from exc
+    response_wait = timeout if response_timeout is None else response_timeout
     try:
         with connection:
-            response_wait = timeout if response_timeout is None else response_timeout
             connection.settimeout(response_wait)
             connection.sendall(_canonical_json(request) + b"\n")
-            with connection.makefile("rb") as stream:
-                raw_response = stream.readline(MAX_WORKER_MESSAGE_BYTES + 1)
+            raw_response = _read_worker_response(connection, response_wait, cancel_callback)
         if len(raw_response) > MAX_WORKER_MESSAGE_BYTES or not raw_response.endswith(b"\n"):
             raise WorkerProbeError("Worker returned an invalid response size")
         response = json.loads(raw_response)
@@ -603,12 +663,34 @@ def probe_worker(
     return capabilities
 
 
+def _read_worker_response(connection: socket.socket, timeout: float, cancel_callback: Callable[[], None] | None) -> bytes:
+    deadline = time.monotonic() + timeout
+    response = bytearray()
+    while len(response) <= MAX_WORKER_MESSAGE_BYTES and not response.endswith(b"\n"):
+        if cancel_callback is not None:
+            cancel_callback()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout("Worker response deadline exceeded")
+        connection.settimeout(min(0.25, remaining))
+        try:
+            chunk = connection.recv(min(4096, MAX_WORKER_MESSAGE_BYTES + 1 - len(response)))
+        except socket.timeout:
+            continue
+        if not chunk:
+            break
+        response.extend(chunk)
+    return bytes(response)
+
+
 def send_stack_band_task(
     host: str,
     port: int,
     token: str,
     task: StackBandTask,
-    timeout: float = 6 * 60 * 60,
+    timeout: float = WORKER_TASK_TIMEOUT_SECONDS,
+    *,
+    cancel_callback: Callable[[], None] | None = None,
 ) -> WorkerTaskAcknowledgement:
     """Send a signed stack-band envelope and verify the worker's signed acknowledgement."""
 
@@ -625,8 +707,7 @@ def send_stack_band_task(
         with socket.create_connection((host, port), timeout=min(timeout, 5.0)) as connection:
             connection.settimeout(timeout)
             connection.sendall(_canonical_json(request) + b"\n")
-            with connection.makefile("rb") as stream:
-                raw_response = stream.readline(MAX_WORKER_MESSAGE_BYTES + 1)
+            raw_response = _read_worker_response(connection, timeout, cancel_callback)
         if len(raw_response) > MAX_WORKER_MESSAGE_BYTES or not raw_response.endswith(b"\n"):
             raise WorkerProbeError("Worker returned an invalid task acknowledgement size")
         response = json.loads(raw_response)
@@ -675,11 +756,14 @@ def stack_store_distributed(
     rows_per_task: int = 64,
     progress_callback: Callable[[float, str], None] | None = None,
     cancel_callback: Callable[[], None] | None = None,
+    task_timeout: float = WORKER_TASK_TIMEOUT_SECONDS,
 ) -> StackResult:
     """Dynamically assign row bands to this computer and an authenticated worker."""
 
     if not 1 <= rows_per_task <= 4096:
         raise ValueError("Distributed task band height must be between 1 and 4096 rows")
+    if not 0 < task_timeout < float("inf"):
+        raise ValueError("Worker task timeout must be finite and positive")
     channels, height, width = store.shape
     settings_document = asdict(settings)
     settings_fingerprint = hashlib.sha256(_canonical_json(settings_document)).hexdigest()
@@ -705,6 +789,7 @@ def stack_store_distributed(
     retry_locally: deque[StackBandTask] = deque()
     completed_rows = 0
     lock = threading.Lock()
+    stopped = threading.Event()
     frame_maps = store.band_reader()
     remote_enabled = True
     image = np.empty((channels, height, width), dtype=np.float32)
@@ -743,18 +828,25 @@ def stack_store_distributed(
         if progress_callback is not None:
             progress_callback(done / height, f"Distributed stack: {done}/{height} rows complete ({source})")
 
-    def compute_local(task: StackBandTask) -> None:
+    def check_cancel() -> None:
         if cancel_callback is not None:
             cancel_callback()
-        result = stack_store_band(store, backend, settings, task.row_start, task.row_stop, reject_masks, frame_maps)
+        if stopped.is_set():
+            raise RuntimeError("Distributed stacking stopped")
+
+    def compute_local(task: StackBandTask) -> None:
+        check_cancel()
+        result = stack_store_band(store, backend, settings, task.row_start, task.row_stop, reject_masks, frame_maps, cancel_cb=check_cancel)
         record(task, result, result.rejected_low, result.rejected_high, "this computer")
 
     def compute_remote(task: StackBandTask) -> bool:
         nonlocal remote_enabled
         try:
-            if cancel_callback is not None:
-                cancel_callback()
-            acknowledgement = send_stack_band_task(host, port, token, task)
+            check_cancel()
+            if progress_callback is not None:
+                progress_callback(completed_rows / height, f"Sending {task.pass_name} stack band rows {task.row_start}:{task.row_stop} to worker {host}:{port}")
+            acknowledgement = send_stack_band_task(host, port, token, task, timeout=task_timeout, cancel_callback=check_cancel)
+            check_cancel()
             if acknowledgement.status != "accepted" or acknowledgement.artifact_path is None or acknowledgement.artifact_sha256 is None:
                 remote_enabled = False
                 if progress_callback is not None:
@@ -770,6 +862,7 @@ def stack_store_distributed(
             digest_builder = hashlib.sha256()
             with artifact.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    check_cancel()
                     digest_builder.update(chunk)
             digest = digest_builder.hexdigest()
             if not hmac.compare_digest(digest, acknowledgement.artifact_sha256):
@@ -785,7 +878,7 @@ def stack_store_distributed(
                     raise WorkerProbeError("Worker result artifact has invalid band dimensions")
                 if not np.isfinite(image).all() or not np.isfinite(rejection).all():
                     raise WorkerProbeError("Worker result artifact contains non-finite values")
-                if reject_masks and masks.shape != (len(store), expected_rows, width):
+                if reject_masks and (masks is None or masks.shape != (len(store), expected_rows, width)):
                     raise WorkerProbeError("Worker result rejection masks have invalid dimensions")
                 low = int(data["rejected_low"])
                 high = int(data["rejected_high"])
@@ -821,11 +914,18 @@ def stack_store_distributed(
                 return
             compute_local(task)
 
+    def run_loop(callback, *args) -> None:
+        try:
+            callback(*args)
+        except Exception:
+            stopped.set()
+            raise
+
     initial_remote_tasks = [next_task(local=False) for _ in range(WORKER_TASKS_IN_FLIGHT)]
     with ThreadPoolExecutor(max_workers=WORKER_TASKS_IN_FLIGHT + 1, thread_name_prefix="gpustacker-distributed") as executor:
-        futures = [executor.submit(remote_loop, task) for task in initial_remote_tasks if task is not None]
-        futures.append(executor.submit(local_loop))
-        for future in futures:
+        futures = [executor.submit(run_loop, remote_loop, task) for task in initial_remote_tasks if task is not None]
+        futures.append(executor.submit(run_loop, local_loop))
+        for future in as_completed(futures):
             future.result()
     # A worker failure can requeue a band after the local loop has already drained the queue.
     while retry_locally:

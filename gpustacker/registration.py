@@ -160,6 +160,64 @@ def reference_coords(alignment: Alignment, xs: torch.Tensor, ys: torch.Tensor) -
     return rx.float(), ry.float()
 
 
+def union_reference_grid(frames: list[tuple[Alignment, tuple[int, int]]]) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Return (height, width) and (x, y) origin for the union of aligned frame footprints."""
+
+    all_x: list[np.ndarray] = []
+    all_y: list[np.ndarray] = []
+    for alignment, (height, width) in frames:
+        edge_x = np.linspace(0, width - 1, 65, dtype=np.float64)
+        edge_y = np.linspace(0, height - 1, 65, dtype=np.float64)
+        xs = np.concatenate([edge_x, edge_x, np.zeros_like(edge_y), np.full_like(edge_y, width - 1)])
+        ys = np.concatenate([np.zeros_like(edge_x), np.full_like(edge_x, height - 1), edge_y, edge_y])
+        if alignment.forward_poly is not None:
+            mapped = _poly_design(xs, ys) @ alignment.forward_poly.T
+            rx, ry = mapped[:, 0], mapped[:, 1]
+        else:
+            points = np.column_stack([xs, ys, np.ones_like(xs)]) @ alignment.matrix.T
+            rx, ry = points[:, 0] / points[:, 2], points[:, 1] / points[:, 2]
+        all_x.append(rx)
+        all_y.append(ry)
+    if not all_x:
+        raise ValueError("Cannot build an output grid without frames")
+    min_x = int(np.floor(min(float(values.min()) for values in all_x)))
+    min_y = int(np.floor(min(float(values.min()) for values in all_y)))
+    max_x = int(np.ceil(max(float(values.max()) for values in all_x)))
+    max_y = int(np.ceil(max(float(values.max()) for values in all_y)))
+    return (max_y - min_y + 1, max_x - min_x + 1), (min_x, min_y)
+
+
+def reference_overlap_fraction(
+    alignment: Alignment,
+    source_shape: tuple[int, int],
+    reference_shape: tuple[int, int],
+    samples: int = 65,
+) -> float:
+    """Estimate the fraction of a source frame that overlaps the reference footprint."""
+
+    source_height, source_width = source_shape
+    reference_height, reference_width = reference_shape
+    xs, ys = np.meshgrid(
+        np.linspace(0, source_width - 1, samples),
+        np.linspace(0, source_height - 1, samples),
+    )
+    flat_x, flat_y = xs.ravel(), ys.ravel()
+    if alignment.forward_poly is not None:
+        mapped = _poly_design(flat_x, flat_y) @ alignment.forward_poly.T
+        reference_x, reference_y = mapped[:, 0], mapped[:, 1]
+    else:
+        points = np.column_stack([flat_x, flat_y, np.ones_like(flat_x)]) @ alignment.matrix.T
+        reference_x = points[:, 0] / points[:, 2]
+        reference_y = points[:, 1] / points[:, 2]
+    inside = (
+        (reference_x >= 0)
+        & (reference_x <= reference_width - 1)
+        & (reference_y >= 0)
+        & (reference_y <= reference_height - 1)
+    )
+    return float(inside.mean())
+
+
 def _lanczos_weights(t: torch.Tensor, a: int = 3) -> torch.Tensor:
     pi_t = torch.pi * t
     core = (a * torch.sin(pi_t) * torch.sin(pi_t / a)) / (pi_t * pi_t + 1e-30)
@@ -185,6 +243,9 @@ def _warp_lanczos(image: torch.Tensor, sx: torch.Tensor, sy: torch.Tensor, a: in
     for r0 in range(0, out_h, tile_rows):
         r1 = min(out_h, r0 + tile_rows)
         tsx, tsy = sx[r0:r1], sy[r0:r1]
+        finite = torch.isfinite(tsx) & torch.isfinite(tsy)
+        tsx = torch.nan_to_num(tsx, nan=0.0, posinf=0.0, neginf=0.0)
+        tsy = torch.nan_to_num(tsy, nan=0.0, posinf=0.0, neginf=0.0)
         rows = r1 - r0
         x0 = torch.floor(tsx)
         y0 = torch.floor(tsy)
@@ -202,17 +263,29 @@ def _warp_lanczos(image: torch.Tensor, sx: torch.Tensor, sy: torch.Tensor, a: in
                 torch.minimum(floor, vals, out=floor)
         wsum = wy.sum(dim=0) * wx.sum(dim=0)  # sum over the 2a x 2a taps factorises
         acc.div_(wsum.clamp_min_(1e-6))
-        out[:, r0:r1] = torch.maximum(acc, floor)
+        out[:, r0:r1] = torch.where(finite.unsqueeze(0), torch.maximum(acc, floor), float("nan"))
     return out
 
 
-def warp_to_reference(image: torch.Tensor, alignment: Alignment, mode: str = "lanczos3") -> torch.Tensor:
-    """Warp a (C, H, W) tensor onto the reference grid; uncovered pixels become NaN."""
+def warp_to_reference(
+    image: torch.Tensor,
+    alignment: Alignment,
+    mode: str = "lanczos3",
+    output_shape: tuple[int, int] | None = None,
+    origin: tuple[int, int] = (0, 0),
+) -> torch.Tensor:
+    """Warp a (C, H, W) tensor onto a reference-aligned grid; uncovered pixels become NaN."""
 
     channels, height, width = image.shape
-    if alignment.inverse_poly is None and np.allclose(alignment.matrix, np.eye(3)):
+    out_height, out_width = output_shape or (height, width)
+    if alignment.inverse_poly is None and np.allclose(alignment.matrix, np.eye(3)) and origin == (0, 0) and (out_height, out_width) == (height, width):
         return image
-    sx, sy = source_coords(alignment, height, width, image.device)
+    ys, xs = torch.meshgrid(
+        torch.arange(out_height, device=image.device, dtype=torch.float32) + origin[1],
+        torch.arange(out_width, device=image.device, dtype=torch.float32) + origin[0],
+        indexing="ij",
+    )
+    sx, sy = source_coords_at(alignment, xs, ys)
     inside = (sx >= 0) & (sx <= width - 1) & (sy >= 0) & (sy <= height - 1)
     if mode == "lanczos3":
         warped = _warp_lanczos(image, sx, sy, 3)

@@ -8,13 +8,28 @@ from gpustacker.backend import select_backend
 from gpustacker.detection import Stars, detect_stars, fwhm_grid, fwhm_grid_with_counts
 from gpustacker.diagnostics import crop_box_for, effective_frames, full_depth_box, stack_noise
 from gpustacker.normalization import LocalNormSettings, block_stats, fit_norm_maps
-from gpustacker.quality import FilterSettings, StarSet, aperture_flux, compute_weights, field_weight_factors, sample_field_grid, select_photometry_stars, transparency
+from gpustacker.quality import FILTER_PRESETS, FilterSettings, StarSet, aperture_flux, compute_weights, field_weight_factors, filter_preset, relative_psfsw, sample_field_grid, select_photometry_stars, transparency
 from gpustacker.registration import Alignment, estimate_alignment, refine_alignment, warp_to_reference
 from gpustacker.stacking import FrameNorm, FrameStore, StackSettings, combine_full, combine_tensor, stack_store
 from gpustacker.tilt import build_map, describe, frame_scatter, session_median
 
 
 # ----------------------------------------------------------------------------- autocrop
+
+
+def test_filter_presets_are_editable_and_balanced_preserves_defaults():
+    assert filter_preset("Balanced") == FilterSettings()
+    selected = filter_preset("Selective")
+    selected.fwhm_max_ratio = 1.6
+    assert filter_preset("Selective").fwhm_max_ratio == 1.2
+    for name in FILTER_PRESETS:
+        assert filter_preset(name).psfsw_min_ratio == 0
+
+
+@pytest.mark.parametrize("value", [-0.1, float("nan"), float("inf")])
+def test_filter_thresholds_require_finite_nonnegative_values(value):
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        FilterSettings(psfsw_min_ratio=value)
 
 
 def test_full_depth_box_finds_inner_rectangle():
@@ -132,6 +147,20 @@ def test_aperture_flux_tracks_transparency():
     f_cloud = aperture_flux(torch.from_numpy(cloudy), phot)
     t, n = transparency(f_cloud, f_ref, min_stars=10)
     assert n >= 10 and abs(t - 0.5) < 0.08
+
+
+def test_relative_psfsw_compares_within_exposure_groups_without_weight_clipping():
+    noise = np.ones(8)
+    flux = np.array([1, 1, 1, 0.1, 1 / 3, 1 / 3, 1 / 3, 0.01])
+    scores = relative_psfsw(noise, flux, [60.0] * 4 + [20.0] * 4)
+    np.testing.assert_allclose(scores[:4], [1, 1, 1, 0.01])
+    np.testing.assert_allclose(scores[4:], [1, 1, 1, 0.0009])
+
+
+def test_relative_psfsw_leaves_sparse_or_invalid_measurements_unknown():
+    scores = relative_psfsw(np.array([1, 1, 1, 0, 1, 1]), np.array([1, 1, 1, 1, np.nan, 1]), [60.0] * 5 + [20.0])
+    np.testing.assert_array_equal(scores[:3], 1)
+    assert np.isnan(scores[3:]).all()
 
 
 def test_psfsw_ranks_cloudy_and_moonlit_frames_low():

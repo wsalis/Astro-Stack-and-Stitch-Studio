@@ -9,6 +9,11 @@ from pathlib import Path
 from .io import SUPPORTED_SUFFIXES, load_meta
 
 
+def _storage_volume(path: Path) -> tuple[Path, int]:
+    volume = Path(path.anchor) if path.anchor else path
+    return volume, path.stat().st_dev
+
+
 @dataclass(frozen=True)
 class DiskSpaceEstimate:
     working_bytes: int
@@ -56,6 +61,7 @@ def estimate_stack_disk_space(
     scale = settings.drizzle.scale
 
     details: list[tuple[str, int, int]] = []
+    group_storage: list[tuple[int, int, int, int]] = []
     output_volume_bytes: dict[Path, int] = {}
     for label, lights, planned_outputs in groups:
         profiles = []
@@ -73,8 +79,10 @@ def estimate_stack_disk_space(
         drizzle_channels = 3 if cfa_drizzle else channels
         master_bytes = pixels * channels * 4
         frame_count = scratch_frames if group_inputs is None and scratch_frames is not None else len(lights)
-        rejection_masks = pixels * frame_count if settings.drizzle.enabled or settings.mfdeconv is not None else 0
-        group_working = frame_count * master_bytes + rejection_masks
+        mask_bytes = pixels if settings.drizzle.enabled or settings.mfdeconv is not None else 0
+        rejection_masks = mask_bytes * frame_count
+        registered_bytes = frame_count * master_bytes + rejection_masks
+        checkpoint_arrays = 0
         if settings.resume:
             two_pass = settings.local_norm.enabled and frame_count >= 3
             checkpoint_masters = 3 if two_pass else 2  # first/final checkpoint plus atomic staging copy
@@ -86,7 +94,8 @@ def estimate_stack_disk_space(
                     for frame_height, frame_width, _, _ in profiles
                 )
                 checkpoint_arrays += frame_count * channels * map_pixels * 2 * 4
-            group_working += checkpoint_arrays
+        group_working = registered_bytes + checkpoint_arrays
+        group_storage.append((frame_count, master_bytes, mask_bytes, checkpoint_arrays))
         group_output = 0
         for output in planned_outputs:
             stem = output.stem.lower()
@@ -116,9 +125,56 @@ def estimate_stack_disk_space(
     usage = shutil.disk_usage(directory)
     volume = Path(directory.anchor) if directory.anchor else directory
     required_by_volume = dict(output_volume_bytes)
-    required_by_volume[volume] = required_by_volume.get(volume, 0) + working_bytes
     volume_usage = []
     free_by_volume = {volume: int(usage.free)}
+
+    if settings.registered_storage_dirs:
+        drive_free: dict[Path, int] = {}
+        drive_devices = set()
+        for storage_root in settings.registered_storage_dirs:
+            drive_dir = storage_root.expanduser()
+            while not drive_dir.exists() and drive_dir != drive_dir.parent:
+                drive_dir = drive_dir.parent
+            drive_volume, device = _storage_volume(drive_dir)
+            if device in drive_devices:
+                continue
+            drive_devices.add(device)
+            drive_free[drive_volume] = int(shutil.disk_usage(drive_dir).free)
+            free_by_volume[drive_volume] = drive_free[drive_volume]
+
+        if not drive_free:
+            raise ValueError("No usable registered-frame drives were selected")
+        remaining = dict(drive_free)
+        registered_required = {drive: 0 for drive in drive_free}
+        checkpoint_required = 0
+
+        def allocated_bytes(value: int) -> int:
+            return ((value + 256 + 4095) // 4096) * 4096
+
+        for frame_count, master_bytes, mask_bytes, checkpoint_bytes in group_storage:
+            group_remaining = remaining if settings.keep_registered else dict(drive_free)
+            group_initial = dict(group_remaining)
+            per_frame = allocated_bytes(master_bytes) + allocated_bytes(mask_bytes) if mask_bytes else allocated_bytes(master_bytes)
+            for _ in range(frame_count):
+                candidates = [drive for drive, free in group_remaining.items() if free >= per_frame]
+                drive = max(candidates or list(group_remaining), key=lambda candidate: group_remaining[candidate])
+                group_remaining[drive] -= per_frame
+            for drive in drive_free:
+                used = group_initial[drive] - group_remaining[drive]
+                if settings.keep_registered:
+                    remaining[drive] = group_remaining[drive]
+                else:
+                    registered_required[drive] = max(registered_required[drive], used)
+            checkpoint_required = checkpoint_required + checkpoint_bytes if settings.keep_registered else max(checkpoint_required, checkpoint_bytes)
+
+        if settings.keep_registered:
+            registered_required = {drive: drive_free[drive] - remaining[drive] for drive in drive_free}
+        for drive, required in registered_required.items():
+            required_by_volume[drive] = required_by_volume.get(drive, 0) + required
+        required_by_volume[volume] = required_by_volume.get(volume, 0) + checkpoint_required
+    else:
+        required_by_volume[volume] = required_by_volume.get(volume, 0) + working_bytes
+
     for output_volume in output_volume_bytes:
         if output_volume not in free_by_volume:
             output_dir = next(output.expanduser().parent for _, _, paths in groups for output in paths if output.expanduser().parent.anchor == output_volume.anchor)
