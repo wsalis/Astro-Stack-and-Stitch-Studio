@@ -21,16 +21,19 @@ def _shift_alignment(dx: float, dy: float) -> Alignment:
 
 
 @pytest.mark.parametrize("kernel", ["square", "point", "gaussian"])
-def test_drizzle_flat_field_and_coverage(kernel):
-    acc = new_accumulator(1, 32, 32, 2, torch.device("cpu"))
+@pytest.mark.parametrize("scale", [2, 4, 5])
+def test_drizzle_flat_field_and_coverage(kernel, scale):
+    acc = new_accumulator(1, 32, 32, scale, torch.device("cpu"))
     frame = torch.full((1, 32, 32), 100.0)
-    for dx, dy in [(0, 0), (0.5, 0), (0, 0.5), (0.5, 0.5)]:
-        drizzle_frame(acc, frame, _shift_alignment(dx, dy), FrameNorm(offset=100.0, scale=1.0, weight=1.0), 100.0, DrizzleSettings(scale=2, kernel=kernel, pixfrac=0.8))
+    shifts = [(sx / scale, sy / scale) for sx in range(scale) for sy in range(scale)]
+    for dx, dy in shifts:
+        drizzle_frame(acc, frame, _shift_alignment(dx, dy), FrameNorm(offset=100.0, scale=1.0, weight=1.0), 100.0, DrizzleSettings(scale=scale, kernel=kernel, pixfrac=0.8))
     img = acc.image(0.05)
-    inner = img[0, 8:-8, 8:-8]
-    assert img.shape == (1, 64, 64)
+    border = 4 * scale
+    inner = img[0, border:-border, border:-border]
+    assert img.shape == (1, 32 * scale, 32 * scale)
     assert abs(inner.mean() - 100) < 1e-3 and inner.std() < 1e-3
-    assert acc.weight_map()[8:-8, 8:-8].min() > 0
+    assert acc.weight_map()[border:-border, border:-border].min() > 0
 
 
 def test_drizzle_places_frame_on_shifted_full_field_canvas():

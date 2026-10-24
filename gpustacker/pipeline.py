@@ -27,7 +27,7 @@ from .cosmetic import CosmeticSettings, CosmeticStats, cosmetic_correct
 from .debayer import debayer
 from .detection import Stars, analyse_frame, fwhm_grid, fwhm_grid_with_counts
 from .diagnostics import apply_box, crop_box_for, effective_frames, stack_noise, write_frames_csv
-from .drizzle import DrizzleAccumulator, DrizzleSettings, drizzle_frame, new_accumulator
+from .drizzle import DrizzleAccumulator, DrizzleSettings, drizzle_frame, estimate_accumulator_bytes, new_accumulator
 from .io import FrameMeta, load_frame, load_meta, save_fits
 from .mfdeconv import MFDeconvResult, MFDeconvSettings, run_mfdeconv
 from .normalization import LocalNormSettings, block_stats, fit_norm_maps, reference_block_stats
@@ -126,7 +126,7 @@ class PipelineSettings:
     resume: bool = False
     device: Literal["auto", "cpu"] = "auto"
     vram_fraction: float = 0.75
-    workers: int = 0  # CPU worker processes for star detection; 0 = all cores but one
+    workers: int = 0  # CPU worker processes for star detection; 0 = auto, max 8
     registered_dir: Path | None = None
     distributed_enabled: bool = False
     distributed_host: str = ""
@@ -288,6 +288,41 @@ def _solve_alignment(stars: Stars, ref_stars: Stars, refine: bool) -> Alignment:
     return align
 
 
+def _quality_setup(meta: FrameMeta) -> tuple[str, float] | None:
+    header = meta.header
+    camera = " ".join(str(header.get("INSTRUME") or header.get("CAMERA") or "").split()).casefold()
+    if not camera or camera in ("unknown", "none", "n/a"):
+        return None
+
+    def positive(*keys: str) -> float | None:
+        for key in keys:
+            try:
+                value = float(header[key])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if np.isfinite(value) and value > 0:
+                return value
+        return None
+
+    scale = positive("PIXSCALE", "SECPIX")
+    if scale is None:
+        focal = _focal_length_mm(header)
+        pixel = positive("XPIXSZ")
+        pixel_y = positive("YPIXSZ") or pixel
+        bin_x = positive("XBINNING") if "XBINNING" in header else 1.0
+        bin_y = positive("YBINNING") if "YBINNING" in header else 1.0
+        if focal is None or pixel is None or pixel_y is None or bin_x != 1 or bin_y != 1 or not np.isclose(pixel, pixel_y, rtol=0.01):
+            return None
+        scale = 206.264806 * pixel / focal
+    scale = round(scale, 3)
+    if scale <= 0:
+        return None
+    gain = meta.gain if meta.gain is not None and np.isfinite(meta.gain) else None
+    height, width = meta.shape
+    label = f"{camera}; {scale:g} arcsec/px; {width}x{height}; {meta.channels}ch; filter={(meta.filter_name or 'unknown').casefold()}; gain={gain}"
+    return label, scale
+
+
 def preview_frame_filters(infos: list[FrameInfo], filters: FilterSettings) -> tuple[list[FrameInfo], dict]:
     evaluated = [replace(info, rejected_reason=None if (info.rejected_reason or "").startswith("filter:") else info.rejected_reason) for info in infos]
     usable = [info for info in evaluated if info.rejected_reason is None]
@@ -314,6 +349,32 @@ def preview_frame_filters(infos: list[FrameInfo], filters: FilterSettings) -> tu
         "median_fwhm_px": float(np.median(fwhms)) if fwhms else None,
         "per_exposure": {("unknown" if key is None else f"{key:g}s"): value for key, value in per_exposure.items()} or None,
     }
+    setups = {info.index: _quality_setup(info.meta) if info.meta is not None else None for info in usable}
+    mixed = filters.camera_aware and bool(setups) and all(setup is not None for setup in setups.values()) and len({setup[0] for setup in setups.values() if setup is not None}) > 1
+    per_setup: dict[tuple[str, float | None], dict] = {}
+    angular_fwhms = []
+    if mixed:
+        setup_groups: dict[tuple[str, float | None], list[FrameInfo]] = {}
+        for info in usable:
+            setup = setups[info.index]
+            if setup is None:
+                continue
+            setup_groups.setdefault((setup[0], exposure_key(info.meta.exposure)), []).append(info)
+            if np.isfinite(info.fwhm) and info.fwhm > 0:
+                angular_fwhms.append(info.fwhm * setup[1])
+        for key, members in setup_groups.items():
+            skies = [member.background for member in members if np.isfinite(member.background)]
+            per_setup[key] = {
+                "frames": len(members),
+                "median_stars": float(np.median([member.stars.total_detected for member in members])) if len(members) >= 3 else None,
+                "median_background": float(np.median(skies)) if len(members) >= 3 and len(skies) >= 3 else None,
+            }
+    baseline["mixed_setups"] = {
+        "active": mixed,
+        "reason": "mixed known setups" if mixed else ("disabled" if not filters.camera_aware else "legacy comparisons: homogeneous or incomplete camera/scale metadata"),
+        "median_fwhm_arcsec": float(np.median(angular_fwhms)) if angular_fwhms else None,
+        "cohorts": [{"setup": key[0], "exposure": key[1], **value} for key, value in per_setup.items()],
+    }
     if not filters.enabled or len(usable) < 3:
         return evaluated, baseline
     for info in usable:
@@ -321,13 +382,26 @@ def preview_frame_filters(infos: list[FrameInfo], filters: FilterSettings) -> tu
         stars = group["median_stars"] if group else baseline["median_stars"]
         sky = group["median_background"] if group else baseline["median_background"]
         fwhm = baseline["median_fwhm_px"]
+        measured_fwhm = info.fwhm
+        fwhm_unit = "px"
+        setup = setups[info.index]
+        if mixed and setup is not None:
+            cohort = per_setup[(setup[0], exposure_key(info.meta.exposure))]
+            stars = cohort["median_stars"]
+            sky = cohort["median_background"]
+            fwhm = baseline["mixed_setups"]["median_fwhm_arcsec"]
+            measured_fwhm *= setup[1]
+            fwhm_unit = "arcsec"
         reasons = []
         if filters.stars_min_ratio > 0 and stars is not None and info.stars.total_detected < filters.stars_min_ratio * stars:
             reasons.append(f"stars {info.stars.total_detected} < {filters.stars_min_ratio:.0%} of median {stars:.0f}")
         if filters.background_max_ratio > 0 and sky is not None and sky > 0 and info.background > filters.background_max_ratio * sky:
             reasons.append(f"sky {info.background:.0f} > {filters.background_max_ratio:g}x median {sky:.0f}")
-        if filters.fwhm_max_ratio > 0 and fwhm is not None and np.isfinite(info.fwhm) and info.fwhm > filters.fwhm_max_ratio * fwhm:
-            reasons.append(f"FWHM {info.fwhm:.2f} > {filters.fwhm_max_ratio:g}x median {fwhm:.2f}")
+        if filters.fwhm_max_ratio > 0 and fwhm is not None and np.isfinite(measured_fwhm) and measured_fwhm > filters.fwhm_max_ratio * fwhm:
+            if mixed:
+                reasons.append(f"FWHM {measured_fwhm:.2f} {fwhm_unit} > {filters.fwhm_max_ratio:g}x median {fwhm:.2f} {fwhm_unit}")
+            else:
+                reasons.append(f"FWHM {info.fwhm:.2f} > {filters.fwhm_max_ratio:g}x median {fwhm:.2f}")
         if reasons:
             info.rejected_reason = "filter: " + "; ".join(reasons)
     return evaluated, baseline
@@ -347,8 +421,15 @@ class StackingPipeline:
         self.timings: dict[str, float] = {}
         self._cancel = False
         cores = os.cpu_count() or 2
-        # beyond ~8 workers detection already outruns the GPU main thread, and large pools are flaky on Windows
-        self.cpu_workers = settings.workers if settings.workers > 0 else max(1, min(8, cores - 1))
+        # Beyond ~8 workers detection already outruns the GPU main thread, and large pools are flaky on Windows.
+        worker_limit = max(1, min(8, cores - 1))
+        requested_workers = settings.workers if settings.workers > 0 else worker_limit
+        self.cpu_workers = min(requested_workers, worker_limit)
+        if requested_workers > self.cpu_workers:
+            status_cb(
+                f"Requested {requested_workers} detection workers; capped at {self.cpu_workers} "
+                "to limit process memory use"
+            )
         self.io_workers = int(min(4, max(1, self.cpu_workers)))
         self.phot: StarSet | None = None
         self.output_origin = (0, 0)
@@ -488,8 +569,9 @@ class StackingPipeline:
                     del tensor, lum_t, data
                     try:
                         fut = executor.submit(*args)
-                    except BrokenProcessPool:
+                    except (BrokenProcessPool, OSError) as exc:
                         state["broken"] = True
+                        self.status(f"Detection worker pool could not accept work ({exc}); continuing in-process")
                         if slot >= 0:
                             args = (analyse_frame, ring.view(slot).copy(), self.settings.detection_sigma)
                         fut = inline.submit(*args)
@@ -512,17 +594,20 @@ class StackingPipeline:
     # ------------------------------------------------------------------ filters / reference / weights
 
     def apply_prefilters(self, infos: list[FrameInfo]) -> None:
-        """Star-count, background and FWHM filters (relative to the session median).
-
-        Star counts and sky level scale with exposure, so with mixed exposures their medians are taken per
-        exposure group (falling back to the session median for groups too small to have one). FWHM does not.
-        """
+        """Apply exposure-aware filters, using setup cohorts and angular FWHM for known mixed setups."""
 
         evaluated, baseline = preview_frame_filters(infos, self.settings.filters)
         self.filter_baselines["prefilters"] = baseline
         per_exposure = baseline["per_exposure"]
         if per_exposure:
             self.status("Mixed exposures: star-count and sky filters use per-exposure medians: " + ", ".join(f"{key}: {value['frames']} frames, {value['median_stars']:.0f} stars, sky {value['median_background']:.0f}" for key, value in per_exposure.items()))
+        mixed = baseline["mixed_setups"]
+        if self.settings.filters.enabled:
+            self.status(f"Camera/optics-aware prefilters: {mixed['reason']}")
+            if mixed["active"]:
+                self.status(f"Mixed setup baselines: {len(mixed['cohorts'])} setup/exposure cohorts; session FWHM median {mixed['median_fwhm_arcsec']} arcsec")
+                if any(cohort["frames"] < 3 for cohort in mixed["cohorts"]):
+                    self.status("Mixed setup cohorts with fewer than 3 frames skip relative star-count/sky checks; the session angular-FWHM check still applies")
         for info, result in zip(infos, evaluated):
             if info.rejected_reason != result.rejected_reason:
                 info.rejected_reason = result.rejected_reason
@@ -1364,6 +1449,7 @@ class StackingPipeline:
             expected_store=store.directory,
             response_timeout=1200.0,
             cancel_callback=cancel_cb,
+            readiness_only=True,
         )
         if not capabilities.get("stack_task_execution_enabled"):
             raise WorkerProbeError("Worker capability probe succeeded, but stack-band execution is not enabled on that computer")
@@ -1801,7 +1887,18 @@ class StackingPipeline:
         by_store = {f.store_index: f for f in infos if f.store_index is not None and f.rejected_reason is None}
         order = [by_store[i] for i in range(len(store)) if i in by_store]
         use_cfa = d.cfa and any(self._cfa_pattern_for(f.meta) for f in order)
-        acc = new_accumulator(3 if use_cfa else channels, height, width, d.scale, self.backend.device)
+        drizzle_channels = 3 if use_cfa else channels
+        accumulator_bytes = estimate_accumulator_bytes(drizzle_channels, height, width, d.scale)
+        available_bytes = min(self.backend.budget_bytes, self.backend.free_bytes())
+        estimated_peak_bytes = accumulator_bytes * 3
+        if estimated_peak_bytes > available_bytes:
+            self.status(
+                "WARNING: drizzle accumulator/finalization may need about "
+                f"{estimated_peak_bytes / 2**30:.1f} GiB (backend budget "
+                f"{available_bytes / 2**30:.1f} GiB; excludes frame working buffers). "
+                "This scale may run out of memory."
+            )
+        acc = new_accumulator(drizzle_channels, height, width, d.scale, self.backend.device)
         ref_offset = store.norms[0].offset
         mode = "Bayer-drizzle (raw CFA)" if use_cfa else "drizzle"
         self.status(f"{mode}: scale {d.scale}x, pixfrac {d.pixfrac}, {len(order)} frames")
@@ -1879,6 +1976,7 @@ class StackingPipeline:
         rows = []
         for f in infos:
             a = f.alignment
+            setup = _quality_setup(f.meta)
             rows.append(
                 {
                     "index": f.index,
@@ -1887,6 +1985,10 @@ class StackingPipeline:
                     "stacked": f.store_index is not None and f.rejected_reason is None,
                     "exposure_s": f.meta.exposure,
                     "focal_length_mm": _focal_length_mm(f.meta.header),
+                    "camera": f.meta.header.get("INSTRUME") or f.meta.header.get("CAMERA") or None,
+                    "quality_setup": None if setup is None else setup[0],
+                    "pixel_scale_arcsec": None if setup is None else setup[1],
+                    "fwhm_arcsec": None if setup is None or not np.isfinite(f.fwhm) else round(f.fwhm * setup[1], 3),
                     "stars": f.stars.total_detected,
                     "bright_star_rate": f.bright_star_rate if f.bright_star_rate is not None else (_bright_star_flux(f) / f.meta.exposure if f.meta.exposure and f.meta.exposure > 0 else None),
                     "fwhm_px": None if not np.isfinite(f.fwhm) else round(f.fwhm, 3),
@@ -1972,6 +2074,8 @@ class StackingPipeline:
                 "rejected_low_high": "Per-pixel channel samples rejected by the stack combiner; not per-frame counts.",
                 "rejection_fraction": "(rejected_low + rejected_high) / total registered channel-pixel samples.",
                 "effective_frames": "(sum of frame weights)^2 / sum of squared frame weights.",
+                "quality_setup": "Camera, angular pixel scale, dimensions, channels, filter and gain; unknown without reliable camera/scale metadata.",
+                "fwhm_arcsec": "Pre-registration FWHM in pixels times the metadata-derived angular pixel scale; not a change to stack weights.",
             },
             "products": product_statuses or {"master": {"status": "complete", "path": str(s.output)}},
             "excluded": {"count": len(excluded), "frames": [{"file": f.path.name, "reason": f.rejected_reason} for f in excluded]},

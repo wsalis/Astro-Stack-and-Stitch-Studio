@@ -101,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--no-solve", action="store_true", help="Do not plate solve the outputs with ASTAP")
     st.add_argument("--astap", type=Path, help="Path to astap_cli/astap executable (default: auto-detect)")
     dz = st.add_argument_group("drizzle")
-    dz.add_argument("--drizzle", type=int, default=0, help="Also produce a drizzle integration at this scale (2 or 3; 0 = off)")
+    dz.add_argument("--drizzle", type=int, default=0, help="Also produce a drizzle integration at this scale (5 is experimental and memory-intensive; 0 = off)")
     dz.add_argument("--drizzle-kernel", choices=["square", "point", "gaussian"], default="square")
     dz.add_argument("--pixfrac", type=float, default=0.8)
     dz.add_argument("--drizzle-min-weight", type=float, default=0.05, help="Minimum drizzle weight relative to the map median")
@@ -109,6 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
     fl = st.add_argument_group("frame filters (0 disables)")
     fl.add_argument("--filter-preset", choices=[name.lower() for name in FILTER_PRESETS], default="balanced", help="Starting thresholds; individual --filter-* arguments override the preset")
     fl.add_argument("--no-filters", action="store_true", help="Disable all frame exclusion filters")
+    fl.add_argument("--no-camera-aware-filters", action="store_true", help="Use legacy prefilters instead of setup/exposure cohorts and angular FWHM for known mixed setups")
     fl.add_argument("--filter-transparency", type=float, default=None, help="Minimum exposure-corrected transparency relative to the session median")
     fl.add_argument("--filter-stars", type=float, default=None, help="Exclude frames with star count below this fraction of the median")
     fl.add_argument("--filter-background", type=float, default=None, help="Exclude frames with sky above this multiple of the median")
@@ -120,7 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--work-dir", type=Path)
     st.add_argument("--cpu", action="store_true", help="Force CPU backend")
     st.add_argument("--vram-fraction", type=float, default=0.75)
-    st.add_argument("--workers", type=int, default=0, help="CPU worker processes for star detection (0 = cores-1)")
+    st.add_argument("--workers", type=int, default=0, help="CPU worker processes for star detection (0 = auto; maximum 8)")
 
     sb = sub.add_parser("store-benchmark", help="Validate and measure bounded reads from a registered store or network share")
     sb.add_argument("registered_dir", type=Path, help="Registered store directory (use its UNC path on a remote worker)")
@@ -257,6 +258,7 @@ def settings_from_args(args: argparse.Namespace) -> PipelineSettings:
             background_max_ratio=preset.background_max_ratio if args.filter_background is None else args.filter_background,
             fwhm_max_ratio=preset.fwhm_max_ratio if args.filter_fwhm is None else args.filter_fwhm,
             psfsw_min_ratio=args.filter_psfsw,
+            camera_aware=not args.no_camera_aware_filters,
         ),
         interpolation=args.interp,
         refine_registration=not args.no_refine,

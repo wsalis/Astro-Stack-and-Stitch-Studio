@@ -10,6 +10,7 @@
 ## Next-Version Parking Lot
 
 - [ ] **Camera-aware mixed-model quality and calibration.** Keep good frames from different Seestar models in one master while evaluating each frame fairly across sensor differences. Current batch grouping produces separate masters; that is not a substitute for mixed-model quality handling.
+	- Implemented conservatively (2026-10-23): default-on, metadata-gated prefilters use setup/exposure star-count and sky baselines plus session-wide angular FWHM. Homogeneous/incomplete-metadata inputs keep legacy decisions; GUI/CLI opt-out, sparse-cohort handling, setup logs and camera/scale/angular-FWHM report fields are covered by regression tests, including homogeneous end-to-end output parity. This does not change late transparency/PSFSW filters, reference choice, weights, normalization or calibration. Real mixed-model validation, metadata overrides and remaining items below are still open.
 	- Identify camera model from reliable FITS metadata, with an explicit user override when headers are missing or inconsistent. Preserve unknown identity rather than guessing.
 	- Normalize sharpness comparisons by angular pixel scale where metadata permits; establish star-count and sky baselines within model/exposure cohorts so resolution and sensitivity differences do not skew rejection.
 	- Review weighting across models so raw signal scale or sensor gain does not systematically favor one camera. Consider selecting calibration masters per camera when dimensions/sensor characteristics differ.

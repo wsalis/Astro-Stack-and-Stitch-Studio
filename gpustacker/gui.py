@@ -514,7 +514,7 @@ class GPUStackerApp:
         ttk.Checkbutton(row, text="Force CPU", variable=self.cpu_var).pack(side="left", padx=(8, 0))
         ttk.Label(row, text=" workers").pack(side="left")
         self.workers_var = tk.IntVar(value=0)
-        ttk.Spinbox(row, textvariable=self.workers_var, from_=0, to=64, width=4).pack(side="left")
+        ttk.Spinbox(row, textvariable=self.workers_var, from_=0, to=8, width=4).pack(side="left")
 
         self.filters_enabled_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(stack, text="Filters", variable=self.filters_enabled_var).grid(row=4, column=0, sticky="w", pady=2)
@@ -549,8 +549,13 @@ class GPUStackerApp:
         note = ttk.Label(row, text="x median; 0 = off", foreground="#9aa3b2")
         note.grid(row=3, column=2, columnspan=2, sticky="w")
         self.filter_controls.append(note)
+        self.camera_aware_filters_var = tk.BooleanVar(value=True)
+        camera_aware = ttk.Checkbutton(row, text="Camera/optics-aware", variable=self.camera_aware_filters_var)
+        camera_aware.grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self.filter_controls.append(camera_aware)
+        self.camera_aware_filters_var.trace_add("write", self._filter_fields_edited)
         self.filter_summary_var = tk.StringVar(value="Analysis pending")
-        ttk.Label(row, textvariable=self.filter_summary_var, wraplength=440).grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        ttk.Label(row, textvariable=self.filter_summary_var, wraplength=440).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 0))
         self.filters_enabled_var.trace_add("write", lambda *_: self._update_filter_controls())
         self._update_filter_controls()
 
@@ -592,7 +597,7 @@ class GPUStackerApp:
         row = ttk.Frame(drizzle_controls)
         row.pack(anchor="w")
         self.drizzle_var = tk.StringVar(value="off")
-        ttk.Combobox(row, textvariable=self.drizzle_var, values=["off", "2x", "3x"], width=5, state="readonly").pack(side="left")
+        ttk.Combobox(row, textvariable=self.drizzle_var, values=["off", "2x", "3x", "4x", "5x"], width=5, state="readonly").pack(side="left")
         ttk.Label(row, text=" kernel").pack(side="left")
         self.drizzle_kernel_var = tk.StringVar(value="square")
         ttk.Combobox(row, textvariable=self.drizzle_kernel_var, values=["square", "point", "gaussian"], width=9, state="readonly").pack(side="left")
@@ -664,7 +669,7 @@ class GPUStackerApp:
             variable=self.distributed_remember_token_var,
             state="normal" if os.name == "nt" else "disabled",
         ).grid(row=3, column=1, sticky="w", padx=4, pady=(3, 0))
-        ttk.Label(distributed, text="Rows per task").grid(row=4, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(distributed, text="Remote rows per task").grid(row=4, column=0, sticky="w", pady=(4, 0))
         self.distributed_rows_var = tk.IntVar(value=64)
         ttk.Spinbox(distributed, textvariable=self.distributed_rows_var, from_=1, to=4096, width=8).grid(row=4, column=1, sticky="w", padx=4, pady=(4, 0))
         ttk.Label(distributed, text="The worker must be enabled in Multi-system setup. Both computers need the same registered-store folder.", foreground="#9aa3b2", wraplength=510).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 0))
@@ -1135,6 +1140,7 @@ class GPUStackerApp:
             enabled=bool(self.filters_enabled_var.get()), transparency_min=float(self.f_transp.get()),
             stars_min_ratio=float(self.f_stars.get()), background_max_ratio=float(self.f_bg.get()),
             fwhm_max_ratio=float(self.f_fwhm.get()), psfsw_min_ratio=float(self.f_psfsw.get()),
+            camera_aware=bool(self.camera_aware_filters_var.get()),
         )
 
     def _apply_filter_preset(self) -> None:
@@ -1204,6 +1210,7 @@ class GPUStackerApp:
         choice.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
         choice.bind("<<ComboboxSelected>>", lambda _event: self._apply_filter_preset())
         ttk.Checkbutton(controls, text="Filters enabled", variable=self.filters_enabled_var).grid(row=0, column=2, columnspan=2, sticky="w")
+        ttk.Checkbutton(controls, text="Camera/optics-aware", variable=self.camera_aware_filters_var).grid(row=0, column=4, columnspan=4, sticky="w")
         for column, (label, variable) in enumerate((("Stars min", self.f_stars), ("Sky max", self.f_bg), ("FWHM max", self.f_fwhm), ("Transparency min", self.f_transp), ("PSFSW min", self.f_psfsw))):
             ttk.Label(controls, text=label).grid(row=1, column=2 * column, sticky="w", padx=(0, 4))
             ttk.Spinbox(controls, textvariable=variable, from_=0, to=10, increment=0.05, width=6).grid(row=1, column=2 * column + 1, sticky="w", padx=(0, 12))
@@ -1267,7 +1274,7 @@ class GPUStackerApp:
             if tree is not None:
                 tree.delete(*tree.get_children())
             return
-        evaluated, _ = preview_frame_filters(list(cache.values()), settings)
+        evaluated, baseline = preview_frame_filters(list(cache.values()), settings)
         measurements = (getattr(self, "_filter_measurements", None) or {}) if getattr(self, "_filter_measurements_signature", None) == self._analysis_cache_signature else {}
         for key, info in zip(cache, evaluated):
             measured = measurements.get(key)
@@ -1290,7 +1297,10 @@ class GPUStackerApp:
         total_exposure = sum(info.meta.exposure for info in evaluated if info.meta.exposure is not None and math.isfinite(info.meta.exposure) and info.meta.exposure > 0)
         kept_exposure = sum(info.meta.exposure for info in kept if info.meta.exposure is not None and math.isfinite(info.meta.exposure) and info.meta.exposure > 0)
         exposure_text = f"{format_duration(kept_exposure)} / {format_duration(total_exposure)} known exposure ({kept_exposure / total_exposure:.0%})" if total_exposure > 0 else "Exposure unknown"
-        self.filter_summary_var.set(f"Keep {len(kept)}/{len(evaluated)} frames; reject {len(evaluated) - len(kept)}. {exposure_text}")
+        setup_text = ""
+        if settings.enabled and settings.camera_aware:
+            setup_text = " Camera/optics-aware: active." if baseline["mixed_setups"]["active"] else " Camera/optics-aware: legacy comparisons."
+        self.filter_summary_var.set(f"Keep {len(kept)}/{len(evaluated)} frames; reject {len(evaluated) - len(kept)}. {exposure_text}{setup_text}")
         if tree is None:
             return
         pending = ["Last-run measurements"] if measurements else []

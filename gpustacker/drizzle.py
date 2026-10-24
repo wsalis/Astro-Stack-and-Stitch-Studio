@@ -70,6 +70,12 @@ def new_accumulator(channels: int, height: int, width: int, scale: int, device: 
     )
 
 
+def estimate_accumulator_bytes(channels: int, height: int, width: int, scale: int) -> int:
+    """Bytes for the float32 numerator and denominator arrays."""
+
+    return 2 * channels * height * width * scale * scale * 4
+
+
 def _subsample_offsets(settings: DrizzleSettings, device: torch.device) -> torch.Tensor:
     k = settings.subsamples if settings.subsamples > 0 else int(max(2, math.ceil(settings.pixfrac * settings.scale) + 1))
     # centres of k x k cells inside the pixfrac-shrunk drop, in source-pixel units

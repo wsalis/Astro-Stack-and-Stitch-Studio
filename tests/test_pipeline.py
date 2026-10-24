@@ -17,7 +17,7 @@ from gpustacker.gui import planned_output_files, rank_reference_frames, referenc
 from gpustacker.cli import build_parser, main, settings_from_args
 from gpustacker.checkpoint import CheckpointError, fingerprint_inputs
 from gpustacker.detection import Stars
-from gpustacker.drizzle import DrizzleSettings
+from gpustacker.drizzle import DrizzleSettings, estimate_accumulator_bytes
 from gpustacker.io import load_frame, load_meta
 from gpustacker.mfdeconv import MFDeconvSettings
 from gpustacker.normalization import LocalNormSettings
@@ -53,6 +53,49 @@ def test_mfdeconv_blend_endpoints_and_fraction():
         PipelineSettings(lights=[], output=Path("unused.fit"), mfdeconv_blend=1.2)
 
 
+def test_detection_workers_are_capped_to_limit_process_memory(monkeypatch, tmp_path):
+    import gpustacker.pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "select_backend", lambda *_args: SimpleNamespace(device="cpu"))
+    monkeypatch.setattr(pipeline_module, "load_masters", lambda *_args: None)
+    messages = []
+    settings = PipelineSettings(lights=[], output=tmp_path / "workers.fit", workers=26)
+
+    pipeline = StackingPipeline(settings, messages.append)
+
+    assert pipeline.cpu_workers == 8
+    assert any("Requested 26 detection workers; capped at 8" in message for message in messages)
+
+
+def test_analysis_falls_back_when_windows_cannot_start_detection_worker(light_dir, tmp_path, monkeypatch):
+    class FailingPool:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def submit(self, *_args):
+            raise OSError(1455, "The paging file is too small for this operation to complete")
+
+    settings = PipelineSettings(
+        lights=sorted(light_dir.glob("*.fit"))[:3],
+        output=tmp_path / "fallback.fit",
+        device="cpu",
+        workers=2,
+        cosmetic="off",
+        debayer="off",
+    )
+    messages = []
+    pipeline = StackingPipeline(settings, messages.append)
+    monkeypatch.setattr(pipeline, "_detection_pool", FailingPool)
+
+    infos = pipeline.analyse()
+
+    assert len(infos) == 3
+    assert any("paging file is too small" in message and "in-process" in message for message in messages)
+
+
 def test_distributed_pipeline_preflights_worker_and_routes_stack(monkeypatch, tmp_path):
     settings = PipelineSettings(
         lights=[],
@@ -83,6 +126,7 @@ def test_distributed_pipeline_preflights_worker_and_routes_stack(monkeypatch, tm
     assert actual is expected
     assert calls["probe"][0:3] == ("worker-host", 47861, settings.distributed_token)
     assert calls["probe"][3]["expected_store"] == store.directory
+    assert calls["probe"][3]["readiness_only"] is True
     assert calls["stack"][1:4] == ("worker-host", 47861, settings.distributed_token)
     assert calls["stack"][4]["pass_name"] == "global"
     assert calls["stack"][4]["rows_per_task"] == 2
@@ -1012,13 +1056,20 @@ def test_registered_drive_cli_option(tmp_path, monkeypatch):
     assert settings_from_args(args).registered_storage_dirs == [first, second]
 
 
-def test_drizzle_kernel_and_min_weight_cli_options():
+@pytest.mark.parametrize("scale", [4, 5])
+def test_drizzle_kernel_and_min_weight_cli_options(scale):
     args = build_parser().parse_args([
-        "stack", "light.fit", "-o", "out.fit", "--drizzle", "2",
+        "stack", "light.fit", "-o", "out.fit", "--registered-dir", "store", "--drizzle", str(scale),
         "--drizzle-kernel", "gaussian", "--drizzle-min-weight", "0.1",
     ])
+    assert settings_from_args(args).drizzle.scale == scale
     assert args.drizzle_kernel == "gaussian"
     assert args.drizzle_min_weight == 0.1
+
+
+def test_drizzle_accumulator_memory_estimate_scales_quadratically():
+    assert estimate_accumulator_bytes(3, 10, 20, 4) == 3 * 10 * 20 * 4**2 * 2 * 4
+    assert estimate_accumulator_bytes(3, 10, 20, 5) == estimate_accumulator_bytes(3, 10, 20, 4) * 25 / 16
 
 
 def test_planned_output_files_match_enabled_products(tmp_path):
@@ -1187,6 +1238,11 @@ def test_cli_filter_preset_allows_individual_overrides(light_dir, tmp_path):
     assert settings.filters.psfsw_min_ratio == 0.15
     defaults = settings_from_args(build_parser().parse_args(["stack", str(light_dir), "-o", str(tmp_path / "default.fit")]))
     assert defaults.filters == FilterSettings()
+    legacy = settings_from_args(build_parser().parse_args([
+        "stack", str(light_dir), "-o", str(tmp_path / "legacy.fit"), "--no-camera-aware-filters",
+    ]))
+    assert legacy.filters.camera_aware is False
+    assert defaults.filters.camera_aware is True
 
 
 def test_gui_filter_preset_keeps_custom_fields_and_advanced_cutoff_editable():
@@ -1224,6 +1280,11 @@ def test_gui_filter_preview_counts_exposure_pending_metrics_and_hard_failures(mo
         app.filters_enabled_var.set(True)
         infos = [_filter_test_frame(index) for index in range(6)]
         infos[4].stars.total_detected = 20
+        assert app._filter_settings().camera_aware is True
+        assert "camera_aware_filters_var" in app._setting_vars()
+        app.camera_aware_filters_var.set(False)
+        assert app._filter_settings().camera_aware is False
+        app.camera_aware_filters_var.set(True)
         app._analysis_cache = {str(info.path.resolve()): info for info in infos}
         app._analysis_cache_signature = "preview-test"
         app._show_filter_preview()
@@ -1260,6 +1321,16 @@ def test_gui_filter_preview_counts_exposure_pending_metrics_and_hard_failures(mo
         root.update_idletasks()
         assert len(app._filter_tree.get_children()) == 6
         assert app._filter_tree.winfo_height() > 100
+        mixed = [_filter_test_frame(index, stars=500 if index < 3 else 50, fwhm=2 if index < 3 else 4) for index in range(6)]
+        for info in mixed:
+            info.meta.header = {"INSTRUME": "Camera A" if info.index < 3 else "Camera B", "PIXSCALE": 2.0 if info.index < 3 else 1.0}
+        app._analysis_cache = {str(info.path.resolve()): info for info in mixed}
+        app._analysis_cache_signature = "mixed-preview"
+        app.filters_enabled_var.set(True)
+        assert "Keep 6/6" in app.filter_summary_var.get()
+        assert "Camera/optics-aware: active" in app.filter_summary_var.get()
+        app.camera_aware_filters_var.set(False)
+        assert "Keep 3/6" in app.filter_summary_var.get()
     finally:
         root.destroy()
 
@@ -1334,6 +1405,183 @@ def test_prefilters_use_per_exposure_medians_for_stars_and_sky(tmp_path):
     per_exposure = pipeline.filter_baselines["prefilters"]["per_exposure"]
     assert set(per_exposure) == {"60s", "20s"}
     assert per_exposure["20s"]["frames"] == 5
+
+
+def test_mixed_setup_prefilters_use_camera_baselines_and_angular_fwhm():
+    infos = [_filter_test_frame(index, stars=1000, fwhm=2.0) for index in range(8)]
+    for info in infos:
+        info.meta.header = {"INSTRUME": "Wide camera", "PIXSCALE": 2.0, "FOCALLEN": 250.0}
+    for index in range(8, 12):
+        info = _filter_test_frame(index, stars=100, background=300.0, fwhm=4.0)
+        info.meta.header = {"INSTRUME": "Narrow camera", "PIXSCALE": 1.0, "FOCALLEN": 500.0}
+        infos.append(info)
+    infos[-1].fwhm = 10.0
+
+    preview, baseline = preview_frame_filters(infos, FilterSettings())
+
+    assert all(info.rejected_reason is None for info in preview[:-1])
+    assert "FWHM" in preview[-1].rejected_reason
+    assert "arcsec" in preview[-1].rejected_reason
+    assert baseline["mixed_setups"]["active"] is True
+    assert baseline["mixed_setups"]["median_fwhm_arcsec"] == pytest.approx(4.0)
+    assert all(info.rejected_reason is None for info in infos)
+
+
+@pytest.mark.parametrize("metadata", ["homogeneous", "unknown", "incomplete"])
+def test_camera_aware_prefilters_preserve_legacy_decisions_without_known_mixed_setups(metadata):
+    infos = [_filter_test_frame(index, exposure=60 if index < 4 else 20) for index in range(8)]
+    infos[2].stars.total_detected = 10
+    infos[3].background = 1000
+    infos[4].fwhm = 8
+    infos[-1].rejected_reason = "alignment failed"
+    for info in infos:
+        if metadata != "unknown":
+            info.meta.header = {"INSTRUME": "Camera A", "PIXSCALE": 2.0}
+    if metadata == "incomplete":
+        infos[1].meta.header = {"INSTRUME": "Camera B", "PIXSCALE": 1.0}
+        infos[5].meta.header = {}
+
+    automatic, baseline = preview_frame_filters(infos, FilterSettings())
+    legacy, _ = preview_frame_filters(infos, FilterSettings(camera_aware=False))
+
+    assert [info.rejected_reason for info in automatic] == [info.rejected_reason for info in legacy]
+    assert baseline["mixed_setups"]["active"] is False
+    assert automatic[-1].rejected_reason == "alignment failed"
+    assert all(info.weight == 1.0 for info in automatic)
+
+
+@pytest.mark.parametrize("stars_threshold,sky_threshold,fwhm_threshold", [(0.6, 2.0, 1.4), (0.0, 0.0, 0.0)])
+def test_mixed_setup_prefilters_keep_session_sharpness_gate_and_zero_disables(stars_threshold, sky_threshold, fwhm_threshold):
+    infos = [_filter_test_frame(index, stars=1000) for index in range(8)]
+    for info in infos:
+        info.meta.header = {"INSTRUME": "Camera A", "PIXSCALE": 2.0}
+    for index in range(8, 12):
+        info = _filter_test_frame(index, stars=100, background=300, fwhm=10)
+        info.meta.header = {"INSTRUME": "Camera B", "PIXSCALE": 1.0}
+        infos.append(info)
+    infos[7].stars.total_detected = 10
+    infos[7].background = 1000
+    infos.append(_filter_test_frame(12))
+    infos[-1].rejected_reason = "only 2 stars"
+
+    preview, _ = preview_frame_filters(infos, FilterSettings(
+        stars_min_ratio=stars_threshold, background_max_ratio=sky_threshold, fwhm_max_ratio=fwhm_threshold,
+    ))
+
+    assert all(info.rejected_reason is None for info in preview[:7])
+    assert all(bool(info.rejected_reason) == bool(fwhm_threshold) for info in preview[8:12])
+    if stars_threshold:
+        assert "stars" in preview[7].rejected_reason and "sky" in preview[7].rejected_reason
+        assert all("arcsec" in info.rejected_reason for info in preview[8:12])
+    else:
+        assert preview[7].rejected_reason is None
+    assert preview[-1].rejected_reason == "only 2 stars"
+
+
+@pytest.mark.parametrize("fwhm,rejected", [(4.0, False), (10.0, True)])
+def test_sparse_mixed_setup_does_not_borrow_other_camera_star_or_sky_baselines(fwhm, rejected):
+    infos = [_filter_test_frame(index, stars=1000) for index in range(4)]
+    for info in infos:
+        info.meta.header = {"INSTRUME": "Camera A", "PIXSCALE": 2.0}
+    sparse = _filter_test_frame(4, stars=20, background=1000, fwhm=fwhm)
+    sparse.meta.header = {"INSTRUME": "Camera B", "PIXSCALE": 1.0}
+    infos.append(sparse)
+
+    preview, baseline = preview_frame_filters(infos, FilterSettings())
+
+    assert bool(preview[-1].rejected_reason) is rejected
+    cohort = baseline["mixed_setups"]["cohorts"][-1]
+    assert cohort["frames"] == 1
+    assert cohort["median_stars"] is None and cohort["median_background"] is None
+    if rejected:
+        assert "FWHM" in preview[-1].rejected_reason
+
+
+@pytest.mark.parametrize("header,expected", [
+    ({"INSTRUME": "Camera", "PIXSCALE": "1.55"}, 1.55),
+    ({"CAMERA": "Camera", "SECPIX": 2.0}, 2.0),
+    ({"INSTRUME": "Camera", "XPIXSZ": 2.0, "YPIXSZ": 2.0, "FOCALLEN": 400.0}, 1.031),
+    ({"INSTRUME": "Camera", "XPIXSZ": 2.0, "FOCALLEN": 400.0, "XBINNING": 2}, None),
+    ({"INSTRUME": "Camera", "XPIXSZ": 2.0, "FOCALLEN": 400.0, "XBINNING": "invalid"}, None),
+    ({"INSTRUME": "Camera", "XPIXSZ": 2.0, "FOCALLEN": 400.0, "YBINNING": 0}, None),
+    ({"INSTRUME": "Camera", "XPIXSZ": 2.0, "YPIXSZ": 3.0, "FOCALLEN": 400.0}, None),
+    ({"INSTRUME": "Camera", "PIXSCALE": 1.5, "XBINNING": 2}, 1.5),
+    ({"INSTRUME": "Camera", "PIXSCALE": float("nan")}, None),
+    ({"INSTRUME": "Camera", "PIXSCALE": float("inf")}, None),
+    ({"INSTRUME": "Camera", "PIXSCALE": -1}, None),
+    ({"INSTRUME": "Camera", "PIXSCALE": "invalid"}, None),
+    ({"INSTRUME": "unknown", "PIXSCALE": 1}, None),
+    ({"PIXSCALE": 1}, None),
+])
+def test_quality_setup_requires_reliable_camera_and_scale_metadata(header, expected):
+    from gpustacker.pipeline import _quality_setup
+
+    info = _filter_test_frame(0)
+    info.meta.header = header
+    setup = _quality_setup(info.meta)
+    if expected is None:
+        assert setup is None
+    else:
+        assert setup[1] == pytest.approx(expected)
+
+
+def test_mixed_setup_prefilters_opt_out_and_report_metadata(tmp_path):
+    infos = [_filter_test_frame(index, stars=1000) for index in range(8)]
+    for info in infos:
+        info.meta.header = {"INSTRUME": "Camera A", "PIXSCALE": 2.0}
+    for index in range(8, 12):
+        info = _filter_test_frame(index, stars=100, background=300, fwhm=4)
+        info.meta.header = {"INSTRUME": "Camera B", "PIXSCALE": 1.0}
+        infos.append(info)
+    legacy, baseline = preview_frame_filters(infos, FilterSettings(camera_aware=False))
+    assert baseline["mixed_setups"]["active"] is False
+    assert all(info.rejected_reason for info in legacy[8:])
+
+    messages = []
+    pipeline = StackingPipeline(PipelineSettings(lights=[], output=tmp_path / "unused.fit", device="cpu"), messages.append)
+    pipeline.apply_prefilters(infos)
+    preview, baseline = preview_frame_filters(infos, FilterSettings())
+    assert [info.rejected_reason for info in infos] == [info.rejected_reason for info in preview]
+    assert pipeline.filter_baselines["prefilters"] == baseline
+    assert any("mixed known setups" in message for message in messages)
+    row = pipeline._frame_rows(infos)[-1]
+    assert row["camera"] == "Camera B"
+    assert row["pixel_scale_arcsec"] == 1.0
+    assert row["fwhm_arcsec"] == 4.0
+    assert "camera b" in row["quality_setup"]
+
+
+def test_homogeneous_camera_aware_stack_matches_legacy(light_dir, tmp_path, monkeypatch):
+    from astropy.io import fits
+
+    lights = sorted(light_dir.glob("*.fit"))
+    for path in lights:
+        with fits.open(path, mode="update") as hdul:
+            hdul[0].header["INSTRUME"] = "Single camera"
+            hdul[0].header["XPIXSZ"] = 3.76
+            hdul[0].header["FOCALLEN"] = 500.0
+    results = []
+    for camera_aware in (False, True):
+        settings = PipelineSettings(
+            lights=lights, output=tmp_path / f"single_{camera_aware}.fit", device="cpu", workers=1,
+            filters=FilterSettings(camera_aware=camera_aware), local_norm=LocalNormSettings(enabled=False),
+        )
+        if results:
+            settings.analysis_cache = {str(info.path.resolve()): info for info in results[0].frames}
+            alignments = {id(info.stars): info.alignment for info in results[0].frames}
+            monkeypatch.setattr("gpustacker.pipeline._solve_alignment", lambda source, reference, refine: alignments[id(source)])
+        result = StackingPipeline(settings).run()
+        results.append(result)
+        report = json.loads(result.report_path.read_text())
+        assert report["filter_baselines"]["prefilters"]["mixed_setups"]["active"] is False
+        assert report["settings"]["filters"]["camera_aware"] is camera_aware
+        assert all(frame["camera"] == "Single camera" and frame["fwhm_arcsec"] > 0 for frame in report["frames"])
+    assert [info.rejected_reason for info in results[0].frames] == [info.rejected_reason for info in results[1].frames]
+    assert results[0].reference_index == results[1].reference_index
+    assert [info.weight for info in results[0].frames] == pytest.approx([info.weight for info in results[1].frames])
+    np.testing.assert_allclose(results[0].stack.image, results[1].stack.image, rtol=1e-6, atol=1e-5, equal_nan=True)
+    np.testing.assert_array_equal(results[0].stack.coverage, results[1].stack.coverage)
+    np.testing.assert_array_equal(results[0].stack.rejection, results[1].stack.rejection)
 
 
 def test_mixed_exposures_are_kept_and_weighted_by_signal(tmp_path, scene):

@@ -76,6 +76,7 @@ class FrameStore:
     storage_dirs: list[Path] = field(default_factory=list, init=False)
     _remaining_bytes: list[int] = field(default_factory=list, init=False, repr=False)
     _data_offsets: dict[Path, int] = field(default_factory=dict, init=False, repr=False)
+    _validated_headers: dict[Path, tuple[int, int, int, tuple[int, ...]]] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -156,6 +157,8 @@ class FrameStore:
         directory: Path,
         allow_missing: bool = False,
         allowed_storage_dirs: list[Path] | None = None,
+        header_workers: int = 1,
+        header_cache: dict[Path, tuple[int, int, int, tuple[int, ...]]] | None = None,
     ) -> "FrameStore":
         """Restore a registered store, validating that every frame belongs to it and matches its shape."""
 
@@ -202,14 +205,6 @@ class FrameStore:
                     path = (directory / stored_path.name).resolve(strict=not allow_missing)
                     if not path.is_relative_to(root):
                         raise ValueError(f"Registered frame is outside its store: {path}")
-                if path.exists():
-                    array = np.load(path, mmap_mode="r", allow_pickle=False)
-                    valid_shape = array.shape == shape and array.dtype == np.float32
-                    data_offset = int(array.offset)
-                    del array
-                    if not valid_shape:
-                        raise ValueError(f"Registered frame has invalid shape or dtype: {path}")
-                    store._data_offsets[path] = data_offset
                 offset_value = entry["offset"]
                 scale_value = entry["scale"]
                 offset = float(offset_value) if np.isscalar(offset_value) else np.asarray(offset_value, dtype=np.float32)
@@ -255,6 +250,31 @@ class FrameStore:
                 store.norms.append(FrameNorm(offset=offset, scale=scale, weight=float(entry["weight"]), scale_map=scale_map, offset_map=offset_map, weight_map=weight_map))
             except (OSError, KeyError, TypeError, ValueError) as exc:
                 raise ValueError(f"Invalid registered-frame entry in {directory}: {exc}") from exc
+
+        def validate_header(path: Path) -> tuple[Path, tuple[int, int, int, tuple[int, ...]]] | None:
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                if allow_missing:
+                    return None
+                raise
+            cached = None if header_cache is None else header_cache.get(path)
+            if cached is not None and cached[:2] == (stat.st_size, stat.st_mtime_ns) and cached[3] == shape:
+                return path, cached
+            array = np.load(path, mmap_mode="r", allow_pickle=False)
+            valid_shape = array.shape == shape and array.dtype == np.float32
+            data_offset = int(array.offset)
+            del array
+            if not valid_shape:
+                raise ValueError(f"Registered frame has invalid shape or dtype: {path}")
+            return path, (stat.st_size, stat.st_mtime_ns, data_offset, shape)
+
+        with ThreadPoolExecutor(max_workers=max(1, header_workers)) as executor:
+            for validated in executor.map(validate_header, store.paths):
+                if validated is not None:
+                    path, header = validated
+                    store._validated_headers[path] = header
+                    store._data_offsets[path] = header[2]
         return store
 
     def drop(self, index: int) -> None:
@@ -1110,7 +1130,8 @@ def stack_store_band(
                     host_np[index] = frame[:, read_start:read_stop, :]
         else:
             offset = read_start - data_start
-            host = torch.from_numpy(host_data[:, :, offset : offset + rows, :]).clone()  # the band is normalised in place
+            host = torch.empty((n, channels, rows, width), dtype=torch.float32, pin_memory=backend.is_cuda)
+            host.copy_(torch.from_numpy(host_data[:, :, offset : offset + rows, :]))
         tensor = host.to(backend.device, non_blocking=backend.is_cuda)
         result = _combine_stack_band(
             tensor, store, backend, settings, read_start, reject_masks, offsets, scales, weights, local_maps,
@@ -1126,7 +1147,6 @@ def stack_store_band(
         rejected_low += result.rejected_low
         rejected_high += result.rejected_high
         total_samples += result.total_samples
-    backend.empty_cache()
     return StackBandResult(image, rejected_low, rejected_high, total_samples, coverage, rejection, masks)
 
 

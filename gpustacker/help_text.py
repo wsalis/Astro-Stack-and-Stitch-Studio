@@ -28,7 +28,7 @@ Pipeline, in order:
  13. Stack pass 1 with the chosen rejection; pass 2 with local normalisation maps fitted against
      the pass-1 result (removes gradients and vignetting mismatch frame-by-frame).
  14. Optional autocrop to the region covered by the requested fraction of frames.
- 15. Optional drizzle (2x/3x) and optional ImageMM deconvolution.
+ 15. Optional drizzle (2x-5x) and optional ImageMM deconvolution.
  16. Outputs: master FITS, coverage/rejection maps, per-frame CSV, JSON report.
 
 Settings persist between sessions in ~/.gpustacker/gui_settings.json.
@@ -205,6 +205,19 @@ workers
       on the next run, so those preview decisions are estimates. Batch runs evaluate each group
       separately; cross-group preview and retained-store re-filtering are not supported.
 
+      Camera/optics-aware (default on) changes pre-registration star-count, sky, and FWHM checks
+      only for mixed setups with camera and angular-scale metadata on every candidate. Otherwise
+      legacy decisions are retained. Uncheck it or use --no-camera-aware-filters to opt out.
+      Camera: INSTRUME/CAMERA. Scale: PIXSCALE/SECPIX in arcsec/pixel, or XPIXSZ in microns and
+      focal length for unbinned square pixels. Unknown identity/ambiguous scale is not guessed.
+      Star and sky baselines use setup/exposure cohorts with at least three frames; sparse cohorts
+      skip those two relative checks. FWHM uses a shared session median in arcseconds, so a wholly
+      blurred cohort is not excused simply for being internally consistent. This is a relative
+      check, not an absolute quality guarantee. Zero thresholds still disable individual checks.
+      Preview FWHM stays in pixels; mixed FWHM exclusion reasons explicitly use arcseconds.
+      Reports record setup baselines, camera, pixel scale and angular FWHM. Transparency, PSFSW,
+      reference selection, normalization, weights and calibration are unchanged by this option.
+
       CLI: --filter-preset lenient|balanced|selective supplies starting values. Explicit
       --filter-transparency, --filter-stars, --filter-background, and --filter-fwhm override them.
 
@@ -291,11 +304,12 @@ Plate solve (ASTAP)
     ),
     (
         "Drizzle",
-        """Drizzle: off | 2x | 3x
+          """Drizzle: off | 2x | 3x | 4x | 5x
   Variable-pixel linear reconstruction onto a finer grid. Only worthwhile when the data are
   undersampled (FWHM below ~2 px) AND well dithered (20+ frames at different sub-pixel offsets).
   The output <name>_drizzle.fit is scale x larger per axis; <name>_drizzle_weight.fit is the
-  accumulated weight map.
+        accumulated weight map. Memory use grows with scale squared; 5x uses about 56% more accumulator
+        memory than 4x and may exceed available GPU memory on large images.
 
 pixfrac  (default 0.8)
   Size of the input "drop" relative to an input pixel. Smaller = sharper but noisier and needs
@@ -317,6 +331,35 @@ Bayer drizzle (raw CFA for OSC)
 
 Rejection masks from the stacking pass are applied, so trails removed in the master are also
 removed from the drizzle.""",
+    ),
+    (
+        "Multi-system stacking",
+        """Experimental: the coordinator and an authenticated worker compute different row bands from
+the same registered store. Both computers must run matching GPUStacker code. Use a trusted LAN.
+
+Remote rows per task
+  Requested remote band height, capped by the worker's bounded RAM budget. Increasing it above the
+  effective cap has no effect. The coordinator batches adjacent tasks independently for its own GPU
+  and reads one bounded batch ahead. The worker allows two tasks in flight to overlap reads and compute.
+  Advertised tasks leave 50% input-budget headroom for changes in available RAM. Near pass end,
+  measured turnaround determines whether a new remote job would delay local completion.
+
+Benchmark rows per frame
+  Controls only the manual Check worker read-throughput benchmark, not stack job sizes. Runtime
+  readiness checks store metadata and sampled pixel fingerprints without a throughput benchmark.
+
+Timing history
+  The worker's scrollable status retains recent messages. A timestamped log is written to
+  ~/.gpustacker/worker.log (rotates at 10 MiB, with three backups). Task summaries report setup, read,
+  GPU-lock wait, compute, publish, and total seconds; compute includes staging and result copies, not
+  just GPU kernels. Streamed tasks that cannot be prefetched include their reads in compute time.
+  Task summaries identify prefetched/streamed mode and input/budget MiB.
+  Worker timing summaries and coordinator read/compute timings also appear in the coordinator run log.
+
+Performance
+  Registered frames remain on the shared store; Ethernet and disk throughput can limit GPU utilization.
+  Near-full network throughput with an intermittently idle GPU can indicate an input bandwidth limit.
+  Compare total stack time and the phase timings rather than requiring a constant 100% GPU reading.""",
     ),
     (
         "ImageMM multi-frame deconvolution",

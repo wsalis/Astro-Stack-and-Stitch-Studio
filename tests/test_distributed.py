@@ -81,7 +81,42 @@ def test_worker_probe_reports_store_and_backend_capabilities(tmp_path):
         thread.join(timeout=2)
 
 
-def test_worker_probe_rejects_different_shared_store(tmp_path):
+def test_worker_readiness_skips_frame_read_benchmark(tmp_path, monkeypatch):
+    directory = tmp_path / "registered"
+    store = FrameStore(directory, (1, 4, 5))
+    store.add("frame.fit", np.ones((1, 4, 5), dtype=np.float32))
+    store.save_index()
+    (directory / "registered_store.json").write_text(json.dumps({
+        "schema": 1,
+        "stage": "registered_before_stack",
+        "shape": list(store.shape),
+        "frame_count": len(store),
+        "index": "index.json",
+    }), encoding="utf-8")
+    token = "test-worker-token-with-sufficient-entropy"
+
+    def unexpected_benchmark(*args, **kwargs):
+        pytest.fail("Readiness check must not benchmark registered frame data")
+
+    monkeypatch.setattr(distributed_module, "benchmark_store_read", unexpected_benchmark)
+    server = create_worker_server("127.0.0.1", 0, directory, token, enable_task_execution=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address[:2]
+        capabilities = probe_worker(host, port, token, expected_store=directory, readiness_only=True)
+        assert capabilities["stack_task_execution_enabled"] is True
+        assert capabilities["stack_task_max_rows"] >= 1
+        assert capabilities["coordinator_store_match"] is True
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("readiness_only", [False, True])
+def test_worker_probe_rejects_different_shared_store(tmp_path, readiness_only):
     directory = tmp_path / "registered"
     store = FrameStore(directory, (1, 4, 5))
     store.add("frame.fit", np.ones((1, 4, 5), dtype=np.float32))
@@ -96,7 +131,7 @@ def test_worker_probe_rejects_different_shared_store(tmp_path):
     different_directory = tmp_path / "different"
     shutil.copytree(directory, different_directory)
     different_frame = np.load(different_directory / "reg_0000.npy")
-    different_frame[0, 1, 2] = 3.0
+    different_frame[0, :, 2] = 3.0
     np.save(different_directory / "reg_0000.npy", different_frame)
 
     server = create_worker_server("127.0.0.1", 0, directory, "correct-worker-token-with-at-least-32-bytes", rows=1)
@@ -106,7 +141,7 @@ def test_worker_probe_rejects_different_shared_store(tmp_path):
     try:
         host, port = server.server_address[:2]
         with pytest.raises(WorkerProbeError, match="do not see the same registered store"):
-            probe_worker(host, port, "correct-worker-token-with-at-least-32-bytes", expected_store=different_directory)
+            probe_worker(host, port, "correct-worker-token-with-at-least-32-bytes", expected_store=different_directory, readiness_only=readiness_only)
     finally:
         server.shutdown()
         server.server_close()
@@ -335,20 +370,23 @@ def test_enabled_worker_computes_bands_and_matches_local_stack(tmp_path, monkeyp
         assert all(np.array_equal(np.load(path, allow_pickle=False), expected_mask) for path, expected_mask in zip(store.mask_paths, expected_masks))
         assert list((directory / "gpustacker_tasks").rglob("*.npz")) == []
         assert any("accepted (complete)" in message for message in worker_status)
+        assert any("Worker timing global rows" in message and "compute=" in message for message in worker_status)
+        expected_mode = "streamed" if mode == "stream" else "prefetched"
+        assert any(f"mode={expected_mode}" in message and "budget=" in message for message in worker_status)
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
 
 
-def test_worker_activity_replaces_stale_probe_result():
+def test_worker_activity_appends_to_history():
     window = distributed_gui.DistributedWindow.__new__(distributed_gui.DistributedWindow)
     window._closing = False
     window.events = queue.Queue()
     statuses = []
     results = []
     window.status_var = SimpleNamespace(set=statuses.append)
-    window._set_result = results.append
+    window._append_result = results.append
     window.root = SimpleNamespace(after=lambda *args: None)
     message = "Received global stack task rows 0:32; waiting for store access."
     window.events.put(("worker_status", message))
@@ -357,6 +395,17 @@ def test_worker_activity_replaces_stale_probe_result():
 
     assert statuses == [message]
     assert results == [message]
+
+
+def test_worker_status_is_timestamped_and_logged(monkeypatch):
+    window = distributed_gui.DistributedWindow.__new__(distributed_gui.DistributedWindow)
+    window.events = queue.Queue()
+    logged = []
+    monkeypatch.setattr(distributed_gui, "logging", SimpleNamespace(getLogger=lambda name: SimpleNamespace(info=logged.append)))
+    monkeypatch.setattr(distributed_gui, "time", SimpleNamespace(strftime=lambda pattern: "12:34:56"))
+    window._worker_status("Worker timing global rows 0:3: compute=0.125s")
+    assert logged == ["Worker timing global rows 0:3: compute=0.125s"]
+    assert window.events.get_nowait() == ("worker_status", "12:34:56 Worker timing global rows 0:3: compute=0.125s")
 
 
 def test_worker_retries_cuda_oom_as_smaller_bands(monkeypatch, tmp_path):
@@ -427,6 +476,101 @@ def test_loaded_store_reuses_validated_frame_headers(tmp_path, monkeypatch):
     np.testing.assert_array_equal(restored.band_reader().read(3, 7), np.stack(expected))
 
 
+def test_header_cache_reuses_unchanged_files_but_revalidates_changes(tmp_path, monkeypatch):
+    store = FrameStore(tmp_path / "registered", (1, 4, 5))
+    store.add("frame.fit", np.ones(store.shape, dtype=np.float32))
+    store.save_index()
+    restored = FrameStore.load_index(store.directory, header_workers=2)
+    original_load = np.load
+    loads = []
+
+    def counted_load(path, *args, **kwargs):
+        loads.append(path)
+        return original_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(np, "load", counted_load)
+    store.norms[0].weight = 2.0
+    store.save_index()
+    updated = FrameStore.load_index(store.directory, header_workers=2, header_cache=restored._validated_headers)
+    assert loads == []
+    assert updated.norms[0].weight == 2.0
+    store.shape = (1, 2, 10)
+    store.save_index()
+    with pytest.raises(ValueError, match="invalid shape or dtype"):
+        FrameStore.load_index(store.directory, header_workers=2, header_cache=updated._validated_headers)
+    store.shape = (1, 4, 5)
+    store.save_index()
+    loads.clear()
+    np.save(store.paths[0], np.zeros((1, 2, 5), dtype=np.float32))
+    with pytest.raises(ValueError, match="invalid shape or dtype"):
+        FrameStore.load_index(store.directory, header_workers=2, header_cache=updated._validated_headers)
+    assert len(loads) == 1
+
+
+def test_result_checksum_is_computed_during_writing():
+    import io
+
+    stream = io.BytesIO()
+    writer = distributed_module._HashingWriter(stream)
+    expected = np.arange(30, dtype=np.float32).reshape(2, 3, 5)
+    np.savez(writer, image=expected)
+    assert writer.digest.hexdigest() == hashlib.sha256(stream.getvalue()).hexdigest()
+    stream.seek(0)
+    with np.load(stream, allow_pickle=False) as archive:
+        np.testing.assert_array_equal(archive["image"], expected)
+
+
+def test_coordinator_batches_independently_and_prefetches_next_band(tmp_path, monkeypatch):
+    store = FrameStore(tmp_path / "registered", (1, 14, 5))
+    for index in range(4):
+        store.add(str(index), np.full(store.shape, index, dtype=np.float32))
+    store.save_index()
+    (store.directory / "registered_store.json").write_text("{}", encoding="utf-8")
+    settings = StackSettings(method="none", normalize=False, use_weights=False)
+    backend = select_backend("cpu")
+    expected = stack_store(store, backend, settings, reject_masks=True)
+    expected_masks = [np.load(path, allow_pickle=False).copy() for path in store.mask_paths]
+    original_read = distributed_module.read_store_band
+    original_stack = distributed_module.stack_store_band
+    next_read_started = threading.Event()
+    computed_ranges = []
+    statuses = []
+
+    def read_ahead(maps, shape, start, stop):
+        if start >= 5:
+            next_read_started.set()
+        return original_read(maps, shape, start, stop)
+
+    def compute(store_arg, backend_arg, settings_arg, start, stop, *args, **kwargs):
+        computed_ranges.append((start, stop))
+        if start == 2:
+            assert stop == 5
+            assert next_read_started.wait(timeout=2), "Next local band was not prefetched during computation"
+            assert kwargs["host_data"] is not None
+        return original_stack(store_arg, backend_arg, settings_arg, start, stop, *args, **kwargs)
+
+    def reject_worker(host, port, token, task, **kwargs):
+        return distributed_module.WorkerTaskAcknowledgement(task.task_id, "rejected", "execution_disabled", "Disabled for scheduling test")
+
+    monkeypatch.setattr(distributed_module, "_stack_band_rows", lambda *args: 3)
+    monkeypatch.setattr(distributed_module, "read_store_band", read_ahead)
+    monkeypatch.setattr(distributed_module, "stack_store_band", compute)
+    monkeypatch.setattr(distributed_module, "send_stack_band_task", reject_worker)
+    result = stack_store_distributed(
+        store, backend, settings, "worker", 47861, "scheduler-test-token-at-least-32-bytes", rows_per_task=1,
+        reject_masks=True, progress_callback=lambda fraction, message: statuses.append(message),
+    )
+    np.testing.assert_array_equal(result.image, expected.image)
+    np.testing.assert_array_equal(result.coverage, expected.coverage)
+    np.testing.assert_array_equal(result.rejection, expected.rejection)
+    assert result.total_samples == expected.total_samples
+    for path, expected_mask in zip(store.mask_paths, expected_masks):
+        np.testing.assert_array_equal(np.load(path, allow_pickle=False), expected_mask)
+    assert sum(stop - start for start, stop in computed_ranges) == store.shape[1]
+    assert any(stop - start == 3 for start, stop in computed_ranges)
+    assert any("Coordinator timing" in message for message in statuses)
+
+
 def test_pre_read_band_matches_memmap_band(tmp_path):
     store = FrameStore(tmp_path / "registered", (2, 10, 7))
     rng = np.random.default_rng(5)
@@ -492,6 +636,30 @@ def test_worker_memory_budget_and_advertised_rows_are_bounded(monkeypatch, tmp_p
     rows = distributed_module._worker_task_rows(store, budget)
     assert rows * len(store) * 3 * 3840 * 4 <= budget
     assert rows < 64
+
+
+def test_advertised_tasks_still_prefetch_after_two_inputs_allocate(tmp_path, monkeypatch):
+    available = 4 * 1024**3
+    monkeypatch.setattr(distributed_module.psutil, "virtual_memory", lambda: SimpleNamespace(available=available))
+    store = FrameStore(tmp_path, (3, 3840, 2160))
+    store.paths = [tmp_path / f"reg_{index:04d}.npy" for index in range(1068)]
+    initial_budget = distributed_module._worker_memory_budget()
+    rows = distributed_module._worker_task_rows(store, initial_budget)
+    input_bytes = rows * len(store) * 3 * 2160 * 4
+    available -= distributed_module.WORKER_TASKS_IN_FLIGHT * input_bytes
+    assert input_bytes <= distributed_module._worker_memory_budget()
+    assert input_bytes <= initial_budget // 2
+
+
+@pytest.mark.parametrize("remaining_rows,local_seconds_per_row,remote_seconds,expected", [
+    (1000, 0.04, 25.0, True),
+    (100, 0.04, 25.0, False),
+    (0, 0.04, 25.0, False),
+    (100, 0.04, 1.0, True),
+    (100, 0.04, 4.0, False),
+])
+def test_remote_dispatch_avoids_late_stragglers(remaining_rows, local_seconds_per_row, remote_seconds, expected):
+    assert distributed_module._remote_task_can_finish_in_time(remaining_rows, local_seconds_per_row, remote_seconds) is expected
 
 
 def test_large_scale_rejection_fails_clearly_without_overlap_memory(tmp_path):

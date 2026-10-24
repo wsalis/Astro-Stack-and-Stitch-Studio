@@ -79,6 +79,7 @@ class FilterSettings:
     fwhm_max_ratio: float = 1.4  # FWHM vs session median
     enabled: bool = True
     psfsw_min_ratio: float = 0.0
+    camera_aware: bool = True
 
     def __post_init__(self) -> None:
         for name in ("transparency_min", "stars_min_ratio", "background_max_ratio", "fwhm_max_ratio", "psfsw_min_ratio"):

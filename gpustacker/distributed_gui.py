@@ -5,12 +5,15 @@ from __future__ import annotations
 import base64
 import ctypes
 import json
+import logging
 import os
 import queue
 import secrets
 import socketserver
 import threading
+import time
 import tkinter as tk
+from logging.handlers import RotatingFileHandler
 from ctypes import wintypes
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -20,6 +23,7 @@ from .astro_dark_theme import DARK_BG, DARK_FIELD, DARK_TEXT, configure_dark_the
 from .distributed import WorkerProbeError, create_worker_server, probe_worker
 
 SETTINGS_PATH = Path.home() / ".gpustacker" / "distributed_settings.json"
+WORKER_LOG_PATH = Path.home() / ".gpustacker" / "worker.log"
 
 
 class _DataBlob(ctypes.Structure):
@@ -102,8 +106,20 @@ class DistributedWindow:
         root.after(100, self._poll)
 
     def _build(self) -> None:
-        outer = ttk.Frame(self.root, padding=12)
-        outer.pack(fill="both", expand=True)
+        canvas = tk.Canvas(self.root, bg=DARK_BG, highlightthickness=0)
+        page_scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=canvas.yview)
+        page_scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        canvas.configure(yscrollcommand=page_scrollbar.set)
+        outer = ttk.Frame(canvas, padding=12)
+        content = canvas.create_window((0, 0), window=outer, anchor="nw")
+
+        def resize_content(_event) -> None:
+            canvas.itemconfigure(content, width=canvas.winfo_width(), height=max(canvas.winfo_height(), outer.winfo_reqheight()))
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        canvas.bind("<Configure>", resize_content)
+        outer.bind("<Configure>", resize_content)
         outer.columnconfigure(0, weight=1)
 
         security = ttk.LabelFrame(outer, text="Shared authentication token", padding=8)
@@ -120,11 +136,14 @@ class DistributedWindow:
             variable=self.remember_token_var,
             state="normal" if os.name == "nt" else "disabled",
         ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(5, 0))
-        ttk.Label(
+        security_help = ttk.Label(
             security,
             text="Use the same random token on both computers. When enabled, Windows encrypts it for your account.",
             foreground="#9aa3b2",
-        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(3, 0))
+            wraplength=760,
+        )
+        security_help.grid(row=2, column=0, columnspan=4, sticky="w", pady=(3, 0))
+        security.bind("<Configure>", lambda event: security_help.configure(wraplength=max(240, event.width - 20)))
 
         worker = ttk.LabelFrame(outer, text="Worker computer", padding=8)
         worker.grid(row=1, column=0, sticky="ew", pady=(0, 8))
@@ -142,7 +161,7 @@ class DistributedWindow:
         ).grid(row=1, column=1, sticky="w", padx=6, pady=(6, 0))
         ttk.Label(worker, text="Port").grid(row=1, column=2, sticky="e", pady=(6, 0))
         ttk.Entry(worker, textvariable=self.worker_port_var, width=8).grid(row=1, column=3, sticky="w", padx=(6, 0), pady=(6, 0))
-        ttk.Label(worker, text="Rows to read per frame").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(worker, text="Benchmark rows per frame").grid(row=2, column=0, sticky="w", pady=(6, 0))
         ttk.Entry(worker, textvariable=self.worker_rows_var, width=8).grid(row=2, column=1, sticky="w", padx=6, pady=(6, 0))
         ttk.Checkbutton(
             worker,
@@ -155,12 +174,14 @@ class DistributedWindow:
         self.start_worker_button.pack(side="left")
         self.stop_worker_button = ttk.Button(worker_actions, text="Stop service", command=self._stop_worker, state="disabled")
         self.stop_worker_button.pack(side="left", padx=6)
-        ttk.Label(
+        worker_help = ttk.Label(
             worker,
             text="For remote access, choose trusted LAN and allow this port through the worker's firewall only from the coordinator. Traffic is not encrypted.",
             foreground="#9aa3b2",
             wraplength=760,
-        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        )
+        worker_help.grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        worker.bind("<Configure>", lambda event: worker_help.configure(wraplength=max(240, event.width - 20)))
 
         coordinator = ttk.LabelFrame(outer, text="Coordinator computer", padding=8)
         coordinator.grid(row=2, column=0, sticky="ew", pady=(0, 8))
@@ -183,7 +204,9 @@ class DistributedWindow:
         outer.rowconfigure(3, weight=1)
         result.columnconfigure(0, weight=1)
         result.rowconfigure(1, weight=1)
-        ttk.Label(result, textvariable=self.status_var, wraplength=760).grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        status_label = ttk.Label(result, textvariable=self.status_var, wraplength=760)
+        status_label.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        result.bind("<Configure>", lambda event: status_label.configure(wraplength=max(240, event.width - 20)))
         self.result_text = tk.Text(
             result,
             height=9,
@@ -197,6 +220,9 @@ class DistributedWindow:
             font=("Consolas", 9),
         )
         self.result_text.grid(row=1, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(result, orient="vertical", command=self.result_text.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns")
+        self.result_text.configure(yscrollcommand=scrollbar.set)
 
     def _browse_store(self, variable: tk.StringVar) -> None:
         selected = filedialog.askdirectory(title="Select registered-frame store", parent=self.root, mustexist=True)
@@ -290,6 +316,14 @@ class DistributedWindow:
             rows = int(self.worker_rows_var.get())
             if rows < 1:
                 raise ValueError("Rows to read must be at least 1.")
+            logger = logging.getLogger("gpustacker.worker")
+            if not logger.handlers:
+                WORKER_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+                handler = RotatingFileHandler(WORKER_LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8")
+                handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+                logger.addHandler(handler)
+                logger.setLevel(logging.INFO)
+                logger.propagate = False
             bind_host = "127.0.0.1" if self.worker_bind_var.get() == "This computer only" else "0.0.0.0"
             server = create_worker_server(
                 bind_host,
@@ -297,7 +331,7 @@ class DistributedWindow:
                 store,
                 token,
                 rows,
-                status_callback=lambda message: self.events.put(("worker_status", message)),
+                status_callback=self._worker_status,
                 enable_task_execution=self.worker_execution_var.get(),
             )
         except (OSError, ValueError, WorkerProbeError) as exc:
@@ -310,6 +344,10 @@ class DistributedWindow:
         self.stop_worker_button.configure(state="normal")
         self.status_var.set(f"Worker service listening on {server.server_address[0]}:{server.server_address[1]}.")
         threading.Thread(target=self._serve_worker, args=(server,), daemon=True).start()
+
+    def _worker_status(self, message: str) -> None:
+        logging.getLogger("gpustacker.worker").info(message)
+        self.events.put(("worker_status", f"{time.strftime('%H:%M:%S')} {message}"))
 
     def _serve_worker(self, server: socketserver.ThreadingTCPServer) -> None:
         try:
@@ -387,6 +425,14 @@ class DistributedWindow:
         self.result_text.insert("1.0", text)
         self.result_text.configure(state="disabled")
 
+    def _append_result(self, text: str) -> None:
+        self.result_text.configure(state="normal")
+        self.result_text.insert("end", text + "\n")
+        if int(self.result_text.index("end-1c").split(".")[0]) > 2000:
+            self.result_text.delete("1.0", "2.0")
+        self.result_text.see("end")
+        self.result_text.configure(state="disabled")
+
     def _poll(self) -> None:
         if self._closing:
             return
@@ -400,7 +446,7 @@ class DistributedWindow:
                     self.status_var.set("Worker service stopped.")
                 elif event == "worker_status":
                     self.status_var.set(str(payload))
-                    self._set_result(str(payload))
+                    self._append_result(str(payload))
                 elif event == "probe_result":
                     success, version_match, summary = payload
                     self.probe_button.configure(state="normal")

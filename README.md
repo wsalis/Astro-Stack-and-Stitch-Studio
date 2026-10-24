@@ -5,6 +5,14 @@ entry points remain named `GPUStacker` (`gpustacker`). It includes a dark tkinte
 **ImageMM multi-frame PSF-aware deconvolution** is an experimental optional output; it never
 changes the regular master.
 
+## Version 1.4.0: mixed-camera filters and distributed stacking
+
+This release adds conservative camera- and optics-aware prefilters for mixed acquisition setups,
+while preserving legacy decisions for homogeneous or incomplete metadata. Distributed stacking
+also gains stronger worker readiness checks, bounded task sizing and prefetch, improved timing and
+logs, and faster completion when remote work cannot beat the remaining local work. The full test
+suite passes (288 tests).
+
 ## Version 1.3.0: filtering, storage, and run workflow
 
 This release adds editable frame-filter presets and preview, including an optional post-registration
@@ -108,6 +116,32 @@ the chosen stacking weights. Groups need at least three valid measurements; unkn
 are not rejected. Scores are recorded in the `psfsw` report column separately from stack `weight`.
 Retained registered stores reuse saved exclusions and weights and cannot apply a new cutoff.
 Disabling quality filters does not bypass unreadable-frame or registration failures.
+
+### Mixed camera and optics prefilters
+
+**Camera/optics-aware** is enabled by default. It changes only the pre-registration star-count,
+sky, and FWHM filters, and only when every candidate has usable camera/pixel-scale metadata and
+more than one acquisition setup is present. Homogeneous or incomplete-metadata datasets retain
+legacy filter decisions. Uncheck it, or pass `--no-camera-aware-filters`, to force legacy comparisons.
+
+Camera identity comes from `INSTRUME` or `CAMERA`, never filenames. Angular scale comes from
+`PIXSCALE` or `SECPIX` in arcseconds/pixel, or from `XPIXSZ` (microns) and focal-length metadata
+for unbinned square pixels. Ambiguous binned/rectangular-pixel inference is not attempted.
+Setups distinguish camera, angular scale, image dimensions, channels, filter, and gain.
+Star-count and sky medians are measured within setup/exposure cohorts with at least three frames;
+sparser cohorts skip those two relative checks instead of borrowing another camera's baseline.
+FWHM is compared in arcseconds against a shared session median, not each camera's own median,
+so an internally consistent but substantially blurred cohort can still be rejected. This remains
+a relative quality check, not an absolute guarantee. Individual thresholds of zero still disable
+their checks; hard read/star-detection/registration failures remain exclusions.
+
+The preview and run log identify active versus legacy comparisons. The JSON report records cohort
+baselines under `filter_baselines.prefilters.mixed_setups`; CSV/JSON frame rows include camera,
+setup, angular pixel scale, and angular FWHM where available. Preview FWHM measurements remain
+labelled in pixels; mixed-mode FWHM rejection reasons explicitly use arcseconds.
+This does not change transparency/PSFSW filtering, reference selection, normalization, stacking
+weights, calibration-master selection, or filter-passband handling. Already registered stores
+still reuse their saved filtering. Real mixed-camera image-quality validation remains pending.
 
 ### Reference review and storage preflight
 
@@ -217,22 +251,45 @@ the worker service must point at that same folder before the stack begins. For a
 store, select that folder in both windows. Each band is assigned dynamically to the desktop or worker.
 The worker is kept two tasks ahead: it reads the next band from the shared store while its GPU computes
 the current one, so expect worker RAM use of roughly two bands' worth of frame rows.
+**Remote rows per task** is capped at half the worker's current bounded input-memory budget
+(whose ceiling is 1 GiB). This leaves headroom so two allocated inputs do not invalidate the advertised
+prefetch size as available RAM changes. The coordinator independently batches adjacent tasks for its own GPU and reads one
+bounded batch ahead; a worker with small tasks no longer forces matching tiny coordinator jobs.
+Frame-header checks on the worker use eight threads and reuse validated offsets across normalization
+updates only while the file size, modification time, and declared shape still match. CUDA allocations
+are reused between bands. Result archive checksums are computed during writing, avoiding a worker-side
+SMB reread of the completed result.
+After measuring both computers, the coordinator stops assigning new remote tasks near the end of a
+pass when their estimated turnaround (plus 25% headroom) exceeds the remaining local work. This avoids
+holding up completion for slow remote stragglers; already assigned tasks still finish or fall back locally.
 If the worker hits CUDA out-of-memory, it retries the assigned range as smaller sub-bands down to one
 row (except with large-scale trail rejection). If the worker rejects a task, disconnects, or returns an
-invalid artifact, that band is recomputed on the desktop. A remote task response can wait up to six
-hours before local fallback; connection establishment still times out after five seconds.
+invalid artifact, that band is recomputed on the desktop. A remote task response can wait up to five
+minutes before local fallback; connection establishment still times out after five seconds.
 
 The experimental run control currently excludes batch mode, resume, and multiple weighting variants.
 The retained-store workflow's existing limitations still apply. The worker's execution opt-in is off
 by default; its GUI capability report indicates whether it is enabled. The CLI `worker-agent` remains
 probe-only.
 
-The coordinator verifies the HMAC response, protocol and exact GPUStacker version, store manifest/index
-fingerprint, a deterministic sample of up to 32 frame reads, and optional CUDA availability. The worker
-checks the complete file listing and temporary write access; it does not read every frame's array header.
+The manual worker check verifies the HMAC response, protocol, store manifest/index fingerprint,
+a deterministic sample of up to 32 frame reads, and optional CUDA availability; its GUI reports version
+compatibility. The worker checks the complete file listing and temporary write access. Runtime readiness
+checks metadata and sampled pixel fingerprints without the manual throughput benchmark. Task startup
+validates every frame header before computing. **Benchmark rows per frame** affects only the manual check.
 Use this only on a trusted, firewall-restricted network; HMAC
 authenticates the peer but does not provide confidentiality or protect an exposed endpoint from denial
 of service. `--bind 0.0.0.0` should not be used on an untrusted network.
+
+The worker window retains timestamped activity and writes a rotating `~/.gpustacker/worker.log`
+(10 MiB, three backups). Per-task timing summaries include setup, read, GPU-lock wait, compute,
+result publishing, and total seconds. Compute includes data staging and result copies; tasks streamed
+without prefetch include their reads in compute time. Worker summaries and coordinator read/compute
+timings are also included in the coordinator's existing run log. At gigabit Ethernet speeds, shared-store
+reads may limit GPU utilization even with overlap; compare total wall time and phase timings, not GPU
+percentage alone.
+Worker summaries also identify `mode=prefetched` or `mode=streamed`, input MiB, and the input-memory
+budget; a streamed task's compute interval includes shared-store reads while holding the GPU lock.
 
 The **Multi-system…** GUI saves its local host, path, port, bind, and probe preferences in
 `~/.gpustacker/distributed_settings.json` on each computer. **Remember token securely** is enabled by
