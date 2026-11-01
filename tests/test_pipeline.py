@@ -96,6 +96,41 @@ def test_analysis_falls_back_when_windows_cannot_start_detection_worker(light_di
     assert any("paging file is too small" in message and "in-process" in message for message in messages)
 
 
+@pytest.mark.parametrize("failure", ["CUDA error: device-side assert triggered", "warp failure"])
+def test_registration_warp_failure_identifies_frame_and_transform(light_dir, tmp_path, monkeypatch, failure):
+    import gpustacker.pipeline as pipeline_module
+
+    settings = PipelineSettings(
+        lights=sorted(light_dir.glob("*.fit"))[:1],
+        output=tmp_path / "failed.fit",
+        device="cpu",
+        workers=1,
+        cosmetic="off",
+        debayer="off",
+    )
+    pipeline = StackingPipeline(settings)
+    infos = pipeline.analyse()
+    store = FrameStore(tmp_path / "registered", (1, *infos[0].meta.shape))
+    original = RuntimeError(failure)
+
+    def fail_warp(*_args, **_kwargs):
+        raise original
+
+    monkeypatch.setattr(pipeline_module, "warp_to_reference", fail_warp)
+
+    with pytest.raises(RuntimeError, match="Registration warp failed") as caught:
+        pipeline.register(infos, 0, store)
+
+    assert str(settings.lights[0]) in str(caught.value)
+    assert failure in str(caught.value)
+    assert caught.value.__cause__ is original
+    assert ("Restart GPUStacker" in str(caught.value)) == ("device-side assert" in failure)
+    assert "Registration 1/1" in str(caught.value)
+    assert "matrix=" in str(caught.value)
+    assert "inverse_poly=None" in str(caught.value)
+    assert len(store) == 0
+
+
 def test_distributed_pipeline_preflights_worker_and_routes_stack(monkeypatch, tmp_path):
     settings = PipelineSettings(
         lights=[],
@@ -378,7 +413,7 @@ def test_full_field_registration_expands_canvas_and_shifts_reference_coords(ligh
     monkeypatch.setattr(pipeline_module, "select_photometry_stars", lambda *_args: StarSet(np.array([8], np.float32), np.array([8], np.float32), 2))
     monkeypatch.setattr(pipeline_module, "aperture_flux", lambda *_args: np.ones(12, np.float32))
 
-    def solve(source, _reference, _refine):
+    def solve(source, _reference, _refine, _mixed=None):
         if source is reference_stars:
             return Alignment.identity()
         if source is distant_stars:
@@ -421,12 +456,34 @@ def test_automatic_reference_compares_bright_star_signal_per_second():
             rejected_reason=None,
             fwhm=fwhm,
             noise=1.0,
-            meta=SimpleNamespace(exposure=exposure),
+            meta=SimpleNamespace(exposure=exposure, header={}),
             stars=SimpleNamespace(total_detected=100, flux=np.full(30, exposure * rate)),
         ))
     pipeline = SimpleNamespace(settings=SimpleNamespace(reference=None))
 
     assert StackingPipeline.choose_reference(pipeline, frames) == 0
+
+
+def test_automatic_reference_prefers_finest_pixel_scale_for_mixed_optics():
+    def frame(index, focal, fwhm):
+        header = {"XPIXSZ": 2.9, "YPIXSZ": 2.9, "FOCALLEN": focal}
+        return SimpleNamespace(
+            index=index, rejected_reason=None, fwhm=fwhm, noise=1.0,
+            meta=SimpleNamespace(exposure=30.0, header=header),
+            stars=SimpleNamespace(total_detected=100, flux=np.full(30, 1000.0)),
+        )
+
+    # coarse 150 mm frames have the smallest FWHM in pixels but would set a low-resolution grid
+    frames = [frame(0, 150.0, 1.6), frame(1, 150.0, 1.7), frame(2, 260.0, 2.6), frame(3, 260.0, 2.4), frame(4, 250.0, 2.2)]
+    messages = []
+    pipeline = SimpleNamespace(settings=SimpleNamespace(reference=None), status=messages.append)
+    assert StackingPipeline.choose_reference(pipeline, frames) == 3
+    assert any("finest 2.301 arcsec/px" in message for message in messages)
+
+    same = [frame(index, 250.0, fwhm) for index, fwhm in enumerate((2.4, 2.1, 2.3))]
+    quiet = SimpleNamespace(settings=SimpleNamespace(reference=None), status=messages.append)
+    messages.clear()
+    assert StackingPipeline.choose_reference(quiet, same) == 1 and not messages
 
 
 def test_pipeline_reuses_preflight_analysis(light_dir, tmp_path, monkeypatch):
@@ -862,7 +919,7 @@ def test_pipeline_records_alternate_weighting_failure_and_retains_master(light_d
         filters=FilterSettings(enabled=False),
         save_maps=False,
         plate_solve=False,
-        weightings=["psfsw", "noise"],
+        weightings=["psfsnr", "noise"],
         stack=StackSettings(method="none", normalize=False),
     )
     original_stack_store = pipeline_module.stack_store
@@ -878,7 +935,7 @@ def test_pipeline_records_alternate_weighting_failure_and_retains_master(light_d
     report = json.loads(result.report_path.read_text(encoding="utf-8"))
 
     assert result.output.is_file()
-    assert result.weighting_outputs == {"psfsw": result.output}
+    assert result.weighting_outputs == {"psfsnr": result.output}
     assert report["products"]["weighting_noise"]["status"] == "failed"
     assert "simulated variant stack failure" in report["products"]["weighting_noise"]["error"]
 
@@ -949,10 +1006,17 @@ def test_retained_registered_store_round_trips_and_cleans_external_drive(light_d
     info = FrameInfo(0, light, meta, stars, 2.0, 1.0, 10.0, alignment=Alignment.identity(), store_index=0)
     StackingPipeline(PipelineSettings(lights=[light], output=tmp_path / "source.fit"))._save_registered_store_manifest(work_dir, store, [info], 0, {})
 
-    restored, _, _, _, _ = StackingPipeline(PipelineSettings(
+    restored, _, _, _, weighting = StackingPipeline(PipelineSettings(
         lights=[], output=tmp_path / "restored.fit", registered_dir=work_dir,
     ))._restore_registered_store(work_dir)
     assert restored.paths == store.paths
+    assert weighting == "psfsnr"
+    manifest_path = work_dir / "registered_store.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("weighting_names_version")
+    manifest["weighting"] = "psfsw"  # written before PixInsight PSFSW took the name
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert StackingPipeline(PipelineSettings(lights=[], output=tmp_path / "restored.fit", registered_dir=work_dir))._restore_registered_store(work_dir)[4] == "psfsnr"
     assert json.loads((work_dir / "registered_store.json").read_text(encoding="utf-8"))["storage_dirs"] == [str(external_dir.resolve())]
 
     removed_count, _ = cleanup_registered_store(work_dir)
@@ -1056,7 +1120,37 @@ def test_registered_drive_cli_option(tmp_path, monkeypatch):
     assert settings_from_args(args).registered_storage_dirs == [first, second]
 
 
-@pytest.mark.parametrize("scale", [4, 5])
+def test_test_mode_sample_spans_folders_and_nights():
+    from gpustacker.io import sample_test_frames, sampled_output_path
+
+    big = [Path(f"G:/data/S50 20S LP/Light_{i:05d}.fit") for i in range(9000)]
+    mid = [Path(f"G:/data/S30 60S IRCUT/Light_{i:05d}.fit") for i in range(900)]
+    tiny = [Path(f"G:/data/S30 Pro 20S IRCUT/Light_{i:02d}.fit") for i in range(20)]
+    lights = big + mid + tiny
+    subset, summary = sample_test_frames(lights, 100)
+    counts = {Path(folder).name: chosen for folder, chosen, _ in summary}
+    assert len(subset) == 100 and counts == {"S50 20S LP": 90, "S30 60S IRCUT": 9, "S30 Pro 20S IRCUT": 1}
+    s50 = [int(p.stem.split("_")[1]) for p in subset if p.parent.name == "S50 20S LP"]
+    assert s50[0] == 50 and s50[-1] == 8950  # evenly spread, not the first 90 files
+    assert subset == [p for p in lights if p in set(subset)]  # original order kept
+    assert sample_test_frames(lights, 100)[0] == subset  # deterministic
+
+    reference = Path("G:/data/S30 60S IRCUT/Light_00001.fit")
+    with_reference, _ = sample_test_frames(lights, 100, keep=(reference,))
+    assert reference in with_reference
+    assert sample_test_frames(lights[:5], 100)[0] == lights[:5]
+    assert sampled_output_path(Path("G:/out/m33.fit"), 500) == Path("G:/out/m33_test500.fit")
+
+
+def test_cli_test_frames_samples_lights_and_renames_output(light_dir, tmp_path):
+    lights = sorted(light_dir.glob("*.fit"))
+    args = build_parser().parse_args(["stack", str(light_dir), "-o", str(tmp_path / "m.fit"), "--test-frames", "2"])
+    settings = settings_from_args(args)
+    assert len(settings.lights) == 2 < len(lights)
+    assert settings.output == tmp_path / "m_test2.fit"
+
+
+@pytest.mark.parametrize("scale", [4, 5, 1.5])
 def test_drizzle_kernel_and_min_weight_cli_options(scale):
     args = build_parser().parse_args([
         "stack", "light.fit", "-o", "out.fit", "--registered-dir", "store", "--drizzle", str(scale),
@@ -1077,22 +1171,22 @@ def test_planned_output_files_match_enabled_products(tmp_path):
     settings = PipelineSettings(
         lights=[],
         output=output,
-        weightings=["psfsw", "noise", "psfsw+field"],
+        weightings=["psfsnr", "noise", "psfsnr+field"],
         drizzle=DrizzleSettings(enabled=True),
         mfdeconv=MFDeconvSettings(),
     )
 
     assert [path.name for path in planned_output_files(output, settings)] == [
-        "master_weight-psfsw.fit",
-        "master_weight-psfsw_coverage.fit",
-        "master_weight-psfsw_rejection.fit",
+        "master_weight-psfsnr.fit",
+        "master_weight-psfsnr_coverage.fit",
+        "master_weight-psfsnr_rejection.fit",
         "master_weight-noise.fit",
-        "master_weight-psfsw-field.fit",
-        "master_weight-psfsw_drizzle.fit",
-        "master_weight-psfsw_drizzle_weight.fit",
-        "master_weight-psfsw_mfdeconv.fit",
-        "master_weight-psfsw.frames.csv",
-        "master_weight-psfsw.report.json",
+        "master_weight-psfsnr-field.fit",
+        "master_weight-psfsnr_drizzle.fit",
+        "master_weight-psfsnr_drizzle_weight.fit",
+        "master_weight-psfsnr_mfdeconv.fit",
+        "master_weight-psfsnr.frames.csv",
+        "master_weight-psfsnr.report.json",
     ]
 
 
@@ -1127,9 +1221,9 @@ def test_disabled_filters_do_not_exclude_frames(tmp_path):
 
 def test_newtonian_and_additional_weighting_cli_options():
     args = build_parser().parse_args([
-        "stack", "light.fit", "-o", "out.fit", "--weighting", "psfsw+field", "--also-weighting", "noise", "--also-weighting", "none",
+        "stack", "light.fit", "-o", "out.fit", "--weighting", "psfsnr+field", "--also-weighting", "noise", "--also-weighting", "none",
     ])
-    assert args.weighting == "psfsw+field"
+    assert args.weighting == "psfsnr+field"
     assert args.also_weighting == ["noise", "none"]
 
 
@@ -1263,6 +1357,46 @@ def test_gui_filter_preset_keeps_custom_fields_and_advanced_cutoff_editable():
     app._filter_preset_vars["fwhm_max_ratio"].set(1.2)
     app._filter_fields_edited()
     assert app.filter_preset_var.get() == "Selective"
+
+
+def test_gui_reference_camera_filter_limits_choices_and_ranking(monkeypatch, tmp_path):
+    import tkinter as tk
+
+    monkeypatch.setattr(gui_module.GPUStackerApp, "_load_settings", lambda self: None)
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        app = gui_module.GPUStackerApp(root)
+        pro = [tmp_path / f"pro_{i}.fit" for i in range(3)]
+        std = [tmp_path / f"std_{i}.fit" for i in range(2)]
+        app.lights = pro + std
+        app._camera_by_path = {**{p: 'seestar s50 pro, 2.301"/px' for p in pro}, **{p: 'seestar s50, 2.393"/px' for p in std}}
+        app._update_camera_values()
+        values = app.reference_camera_combo.cget("values")
+        assert values[0] == "All cameras" and any("seestar s50 pro" in v and "(3 frames)" in v for v in values)
+        app._reference_choices_dirty = True
+        app._refresh_reference_choices()
+        assert all("[seestar" in label for label in app._reference_choices)  # model shown when unfiltered
+        app.reference_camera_var.set(next(v for v in values if "s50 pro" in v))
+        app._reference_camera_changed()
+        assert app.reference_camera_var.get() == 'seestar s50 pro, 2.301"/px'
+        assert sorted(app._reference_choices.values()) == sorted(pro)
+
+        analysed = []
+
+        class FakePipeline:
+            def __init__(self, settings, *_args):
+                analysed.extend(settings.lights)
+
+            def analyse(self):
+                return []
+
+        monkeypatch.setattr(gui_module, "StackingPipeline", FakePipeline)
+        settings = PipelineSettings(lights=pro + std, output=tmp_path / "m.fit")
+        app._rank_worker(settings, "sig", 'seestar s50 pro, 2.301"/px')
+        assert analysed == pro
+    finally:
+        root.destroy()
 
 
 def test_gui_filter_preview_counts_exposure_pending_metrics_and_hard_failures(monkeypatch):
@@ -1497,6 +1631,96 @@ def test_sparse_mixed_setup_does_not_borrow_other_camera_star_or_sky_baselines(f
         assert "FWHM" in preview[-1].rejected_reason
 
 
+def _mixed_scale_frames():
+    fine = [_filter_test_frame(index, stars=500, fwhm=2.5) for index in range(6)]  # 5.75 arcsec
+    for info in fine:
+        info.meta.header = {"INSTRUME": "Seestar S50", "PIXSCALE": 2.3}
+    coarse = [_filter_test_frame(index, stars=300, fwhm=2.25) for index in range(6, 10)]  # ~9 arcsec
+    for info in coarse:
+        info.meta.header = {"INSTRUME": "Seestar S30", "PIXSCALE": 4.0}
+    return fine + coarse
+
+
+def test_coarse_camera_kept_by_own_fwhm_baseline_with_session_floor():
+    infos = _mixed_scale_frames()
+    infos[-1].fwhm = 3.5  # 14 arcsec: outlier within its camera
+    preview, baseline = preview_frame_filters(infos, FilterSettings())
+    assert all(info.rejected_reason is None for info in preview[:-1])
+    assert "camera median 9.00 arcsec" in preview[-1].rejected_reason
+    assert baseline["mixed_setups"]["fwhm_check"]["session_floor_ratio"] == pytest.approx(1.96)
+
+    # a whole camera far softer than the session still hits the explicit floor
+    blurred = _mixed_scale_frames()
+    for info in blurred[6:]:
+        info.fwhm = 4.0  # 16 arcsec > 1.96 x 5.75
+    preview, _ = preview_frame_filters(blurred, FilterSettings())
+    assert all("session median" in info.rejected_reason for info in preview[6:])
+    assert all(info.rejected_reason is None for info in preview[:6])
+
+
+def test_mixed_scale_transparency_is_compared_within_each_camera(tmp_path):
+    from gpustacker.stacking import FrameStore
+
+    infos = _mixed_scale_frames()
+    store = FrameStore(tmp_path / "store", (1, 2, 2))
+    for info in infos:
+        info.store_index = len(store)
+        store.add(info.path.name, np.zeros((1, 2, 2), np.float32))
+    for info in infos[:6]:
+        info.transparency = 1.0
+    for info in infos[6:]:
+        info.transparency = 0.36  # 30 mm aperture: a third of the reference camera's star flux
+    infos[-1].transparency = 0.15  # genuinely hazy for that camera
+    pipeline = StackingPipeline(PipelineSettings(lights=[], output=tmp_path / "unused.fit", device="cpu"))
+    pipeline.apply_transparency_filter(infos, store)
+    assert [info.rejected_reason is None for info in infos] == [True] * 9 + [False]
+    assert infos[6].transparency == pytest.approx(1.0)
+    per_camera = pipeline.filter_baselines["transparency"]["per_camera"]
+    assert {row["camera"] for row in per_camera} == {"seestar s50", "seestar s30"}
+
+    legacy_infos = _mixed_scale_frames()
+    legacy_store = FrameStore(tmp_path / "legacy", (1, 2, 2))
+    for info in legacy_infos:
+        info.store_index = len(legacy_store)
+        legacy_store.add(info.path.name, np.zeros((1, 2, 2), np.float32))
+        info.transparency = 1.0 if info.index < 6 else 0.36
+    legacy = StackingPipeline(PipelineSettings(lights=[], output=tmp_path / "unused.fit", device="cpu", filters=FilterSettings(camera_aware=False)))
+    legacy.apply_transparency_filter(legacy_infos, legacy_store)
+    assert all(info.rejected_reason for info in legacy_infos[6:])
+    assert "per_camera" not in legacy.filter_baselines["transparency"]
+
+
+def test_coarse_camera_is_down_weighted_by_angular_sharpness(tmp_path):
+    from gpustacker.pipeline import mixed_sharpness_factors
+
+    infos = _mixed_scale_frames()
+    factors, summary = mixed_sharpness_factors(infos)
+    assert all(factors[index] == 1.0 for index in range(6))
+    assert factors[6] == pytest.approx((5.75 / 9.0) ** 2)
+    assert {row["camera"] for row in summary} == {"seestar s50", "seestar s30"}
+
+    store = SimpleNamespace(norms=[SimpleNamespace(weight=1.0, weight_map=None) for _ in infos])
+    for info in infos:
+        info.store_index = info.index
+    pipeline = StackingPipeline(PipelineSettings(lights=[], output=tmp_path / "unused.fit", device="cpu"))
+    pipeline.compute_weights(infos, store, "psfsnr")
+    assert infos[0].weight == pytest.approx(1.0) and infos[6].weight == pytest.approx((5.75 / 9.0) ** 2)
+    assert pipeline.filter_baselines["mixed_sharpness_weights"]["psfsnr"] == summary
+
+    # same pixel scale (single camera, any filters): weights untouched
+    for info in infos[6:]:
+        info.meta.header = {"INSTRUME": "Seestar S50", "PIXSCALE": 2.3}
+    assert mixed_sharpness_factors(infos) is None
+    pipeline.compute_weights(infos, store, "psfsnr")
+    assert all(info.weight == pytest.approx(1.0) for info in infos)
+    # opt-out restores legacy weights
+    for info in infos[6:]:
+        info.meta.header = {"INSTRUME": "Seestar S30", "PIXSCALE": 4.0}
+    pipeline.settings.filters = FilterSettings(camera_aware=False)
+    pipeline.compute_weights(infos, store, "psfsnr")
+    assert all(info.weight == pytest.approx(1.0) for info in infos)
+
+
 @pytest.mark.parametrize("header,expected", [
     ({"INSTRUME": "Camera", "PIXSCALE": "1.55"}, 1.55),
     ({"CAMERA": "Camera", "SECPIX": 2.0}, 2.0),
@@ -1512,6 +1736,8 @@ def test_sparse_mixed_setup_does_not_borrow_other_camera_star_or_sky_baselines(f
     ({"INSTRUME": "Camera", "PIXSCALE": "invalid"}, None),
     ({"INSTRUME": "unknown", "PIXSCALE": 1}, None),
     ({"PIXSCALE": 1}, None),
+    ({"TELESCOP": "S50 Pro_26938988", "PIXSCALE": 2.3}, 2.3),
+    ({"TELESCOP": "Newtonian 200", "PIXSCALE": 1}, None),
 ])
 def test_quality_setup_requires_reliable_camera_and_scale_metadata(header, expected):
     from gpustacker.pipeline import _quality_setup
@@ -1569,7 +1795,7 @@ def test_homogeneous_camera_aware_stack_matches_legacy(light_dir, tmp_path, monk
         if results:
             settings.analysis_cache = {str(info.path.resolve()): info for info in results[0].frames}
             alignments = {id(info.stars): info.alignment for info in results[0].frames}
-            monkeypatch.setattr("gpustacker.pipeline._solve_alignment", lambda source, reference, refine: alignments[id(source)])
+            monkeypatch.setattr("gpustacker.pipeline._solve_alignment", lambda source, reference, refine, mixed=None: alignments[id(source)])
         result = StackingPipeline(settings).run()
         results.append(result)
         report = json.loads(result.report_path.read_text())
@@ -1633,7 +1859,7 @@ def test_pipeline_end_to_end(light_dir, tmp_path, backend, scene):
     result = StackingPipeline(settings, log.append).run()
 
     assert out.exists() and result.mfdeconv_output and result.mfdeconv_output.exists()
-    assert result.weighting_outputs == {"psfsw": out}
+    assert result.weighting_outputs == {"psfsnr": out}
     stacked, meta = load_frame(out)
     assert stacked.shape == (1, 256, 320)
     assert meta.header["NFRAMES"] == 6
@@ -1647,7 +1873,7 @@ def test_pipeline_end_to_end(light_dir, tmp_path, backend, scene):
     assert result.stack.rejected_high > 0
     report = json.loads(result.report_path.read_text())
     assert len(report["frames"]) == 6 and report["mfdeconv"]["iterations"] >= 1
-    assert report["settings"]["weighting"] == "psfsw" and report["stack"]["effective_frames"] > 3
+    assert report["settings"]["weighting"] == "psfsnr" and report["stack"]["effective_frames"] > 3
     assert report["schema_version"] == 2
     assert set(report["filter_baselines"]) == {"prefilters", "transparency"}
     assert report["filter_baselines"]["prefilters"]["candidate_frames"] == 6
@@ -1672,20 +1898,20 @@ def test_pipeline_selected_weightings_write_only_selected_masters(light_dir, tmp
         lights=lights,
         output=output,
         local_norm=LocalNormSettings(enabled=False),
-        weighting="psfsw",
-        weightings=["psfsw", "noise", "psfsw+field"],
+        weighting="psfsnr",
+        weightings=["psfsnr", "noise", "psfsnr+field", "psfsw", "psfsw-ln"],
         device="cpu" if not backend.is_cuda else "auto",
     )
     result = StackingPipeline(settings, lambda _: None).run()
 
-    assert set(result.weighting_outputs) == {"psfsw", "noise", "psfsw+field"}
-    assert result.weighting_outputs["psfsw"] == output.with_name("variants_weight-psfsw.fit")
+    assert set(result.weighting_outputs) == {"psfsnr", "noise", "psfsnr+field", "psfsw", "psfsw-ln"}
+    assert result.weighting_outputs["psfsnr"] == output.with_name("variants_weight-psfsnr.fit")
     for mode, path in result.weighting_outputs.items():
         assert path.exists()
         _, meta = load_frame(path)
         assert meta.header["WEIGHTMD"] == mode
     report = json.loads(result.report_path.read_text())
-    assert set(report["weighting_outputs"]) == {"psfsw", "noise", "psfsw+field"}
+    assert set(report["weighting_outputs"]) == {"psfsnr", "noise", "psfsnr+field", "psfsw", "psfsw-ln"}
 
 
 def test_optional_drizzle_failure_keeps_master_and_records_failure(light_dir, tmp_path, monkeypatch):
@@ -1749,8 +1975,8 @@ def test_pipeline_variant_local_norm_policy(light_dir, tmp_path, backend, refit,
         lights=lights,
         output=tmp_path / f"variants-{refit}.fit",
         local_norm=LocalNormSettings(enabled=True, block=32),
-        weighting="psfsw",
-        weightings=["psfsw", "noise"],
+        weighting="psfsnr",
+        weightings=["psfsnr", "noise"],
         refit_local_norm_per_weighting=refit,
         device="cpu" if not backend.is_cuda else "auto",
     )

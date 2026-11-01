@@ -61,6 +61,13 @@ def _allocated_file_bytes(size_bytes: int) -> int:
     return ((size_bytes + 256 + 4095) // 4096) * 4096
 
 
+StoreDtype = Literal["float32", "float16"]
+FLOAT16_MAX = float(np.finfo(np.float16).max)
+# power-of-two scale is exact; widens the float16 range to +/-262016 ADU (debayered + warped peaks exceed 65535)
+FLOAT16_SCALE = 0.25
+Box = tuple[int, int, int, int]  # y0, y1, x0, x1 of the stored array on the store grid
+
+
 @dataclass
 class FrameStore:
     """Registered frames on disk plus their normalisation parameters."""
@@ -73,6 +80,9 @@ class FrameStore:
     mask_paths: list[Path] = field(default_factory=list)  # per-frame rejection masks (optional)
     storage_roots: list[Path] = field(default_factory=list)
     reserve_mask_bytes: int = 0
+    dtype: StoreDtype = "float32"
+    crop: bool = False  # keep only each frame's covered bounding box
+    boxes: list[Box | None] = field(default_factory=list)  # per frame; None = full grid
     storage_dirs: list[Path] = field(default_factory=list, init=False)
     _remaining_bytes: list[int] = field(default_factory=list, init=False, repr=False)
     _data_offsets: dict[Path, int] = field(default_factory=dict, init=False, repr=False)
@@ -101,17 +111,66 @@ class FrameStore:
     def __len__(self) -> int:
         return len(self.paths)
 
+    @property
+    def compact(self) -> bool:
+        """True when frames are stored as float16 and/or cropped (not raw full-grid float32)."""
+
+        return self.dtype != "float32" or self.crop or any(box is not None for box in self.boxes)
+
+    def encode(self, data: np.ndarray | torch.Tensor) -> tuple[np.ndarray, Box | None]:
+        """Apply the store's crop/precision to a full-grid (C, H, W) frame (NumPy or device tensor)."""
+
+        if not self.compact:
+            array = data.cpu().numpy() if isinstance(data, torch.Tensor) else data
+            return np.ascontiguousarray(array, dtype=np.float32), None
+        tensor = data if isinstance(data, torch.Tensor) else torch.from_numpy(np.asarray(data, dtype=np.float32))
+        box = None
+        if self.crop:
+            valid = torch.isfinite(tensor).any(dim=0)
+            rows = torch.nonzero(valid.any(dim=1)).flatten()
+            cols = torch.nonzero(valid.any(dim=0)).flatten()
+            height, width = tensor.shape[1:]
+            found = (0, 1, 0, 1) if rows.numel() == 0 else (int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1)
+            if found != (0, height, 0, width):
+                box = found
+                tensor = tensor[:, found[0] : found[1], found[2] : found[3]]
+        if self.dtype == "float16":
+            # NaN survives clamp; values beyond the scaled float16 range clip instead of becoming inf
+            tensor = (tensor.float() * FLOAT16_SCALE).clamp(-FLOAT16_MAX, FLOAT16_MAX).to(torch.float16)
+        else:
+            tensor = tensor.float()
+        return np.ascontiguousarray(tensor.contiguous().cpu().numpy()), box
+
+    def frame_shape(self, index: int) -> tuple[int, int, int]:
+        box = self.boxes[index] if index < len(self.boxes) else None
+        if box is None:
+            return self.shape
+        return (self.shape[0], box[1] - box[0], box[3] - box[2])
+
+    def load_frame(self, index: int) -> np.ndarray:
+        """One registered frame as full-grid float32 (C, H, W), NaN outside its stored area."""
+
+        stored = np.load(self.paths[index], allow_pickle=False)
+        if stored.dtype == np.float16:
+            stored = stored.astype(np.float32) / FLOAT16_SCALE
+        box = self.boxes[index] if index < len(self.boxes) else None
+        if box is None:
+            return stored.astype(np.float32, copy=False)
+        full = np.full(self.shape, np.nan, dtype=np.float32)
+        full[:, box[0] : box[1], box[2] : box[3]] = stored
+        return full
+
     def add(self, name: str, data: np.ndarray, norm: FrameNorm | None = None) -> Path:
-        arr = np.ascontiguousarray(data, dtype=np.float32)
-        path = self._reserve(name, norm, arr.nbytes)
+        arr, box = self.encode(data)
+        path = self._reserve(name, norm, arr.nbytes, box)
         np.save(path, arr)
         return path
 
-    def add_async(self, name: str, data: np.ndarray, norm: FrameNorm | None, executor) -> "Future[Path]":
+    def add_async(self, name: str, data: np.ndarray | torch.Tensor, norm: FrameNorm | None, executor) -> "Future[Path]":
         """Reserve the slot now (keeps frame order) and write on the executor."""
 
-        arr = np.ascontiguousarray(data, dtype=np.float32)
-        path = self._reserve(name, norm, arr.nbytes)
+        arr, box = self.encode(data)
+        path = self._reserve(name, norm, arr.nbytes, box)
 
         def write() -> Path:
             try:
@@ -122,7 +181,7 @@ class FrameStore:
 
         return executor.submit(write)
 
-    def _reserve(self, name: str, norm: FrameNorm | None, size_bytes: int) -> Path:
+    def _reserve(self, name: str, norm: FrameNorm | None, size_bytes: int, box: Box | None = None) -> Path:
         reserved_bytes = _allocated_file_bytes(size_bytes)
         if self.reserve_mask_bytes:
             reserved_bytes += _allocated_file_bytes(self.reserve_mask_bytes)
@@ -140,6 +199,7 @@ class FrameStore:
         self.paths.append(path)
         self.norms.append(norm or FrameNorm())
         self.names.append(name)
+        self.boxes.append(box)
         return path
 
     def memmaps(self) -> list[np.memmap]:
@@ -147,7 +207,8 @@ class FrameStore:
 
     def band_reader(self, workers: int = 8) -> "BandReader":
         offsets = [self._data_offsets[path] for path in self.paths] if all(path in self._data_offsets for path in self.paths) else None
-        reader = BandReader(self.paths, self.shape, workers, data_offsets=offsets)
+        boxes = self.boxes if self.compact else None
+        reader = BandReader(self.paths, self.shape, workers, data_offsets=offsets, boxes=boxes, dtype=self.dtype)
         self._data_offsets.update(zip(self.paths, reader.data_offsets))
         return reader
 
@@ -167,8 +228,13 @@ class FrameStore:
             shape = tuple(int(v) for v in index["shape"])
             frames = index["frames"]
             stored_dirs = index.get("storage_dirs", [])
+            dtype = index.get("dtype", "float32")
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"Cannot read registered-frame index in {directory}: {exc}") from exc
+        if dtype not in ("float32", "float16"):
+            raise ValueError(f"Registered-frame index has an unsupported dtype {dtype!r}")
+        if dtype == "float16" and index.get("float16_scale") != FLOAT16_SCALE:
+            raise ValueError("Registered-frame index has an unsupported float16 scale")
         if len(shape) != 3 or any(v < 1 for v in shape) or not isinstance(frames, list) or not frames:
             raise ValueError("Registered-frame index has an invalid shape or no frames")
         root = directory.resolve()
@@ -184,7 +250,7 @@ class FrameStore:
             allowed = {Path(path).resolve(strict=not allow_missing) for path in allowed_storage_dirs}
             if set(external_dirs) != allowed:
                 raise ValueError("Registered-frame storage directories do not match the store manifest")
-        store = cls(directory, shape)
+        store = cls(directory, shape, dtype=dtype)
         store.storage_dirs = [root, *external_dirs]
         for frame_index, entry in enumerate(frames):
             try:
@@ -248,10 +314,20 @@ class FrameStore:
                 store.paths.append(path)
                 store.names.append(str(entry["name"]))
                 store.norms.append(FrameNorm(offset=offset, scale=scale, weight=float(entry["weight"]), scale_map=scale_map, offset_map=offset_map, weight_map=weight_map))
+                raw_box = entry.get("box")
+                box = None
+                if raw_box is not None:
+                    box = tuple(int(v) for v in raw_box)
+                    if len(box) != 4 or not (0 <= box[0] < box[1] <= shape[1] and 0 <= box[2] < box[3] <= shape[2]):
+                        raise ValueError(f"Registered frame box is outside the store grid: {raw_box}")
+                store.boxes.append(box)  # type: ignore[arg-type]
             except (OSError, KeyError, TypeError, ValueError) as exc:
                 raise ValueError(f"Invalid registered-frame entry in {directory}: {exc}") from exc
 
+        expected_shapes = {path: store.frame_shape(i) for i, path in enumerate(store.paths)}
+
         def validate_header(path: Path) -> tuple[Path, tuple[int, int, int, tuple[int, ...]]] | None:
+            expected = expected_shapes[path]
             try:
                 stat = path.stat()
             except FileNotFoundError:
@@ -259,15 +335,15 @@ class FrameStore:
                     return None
                 raise
             cached = None if header_cache is None else header_cache.get(path)
-            if cached is not None and cached[:2] == (stat.st_size, stat.st_mtime_ns) and cached[3] == shape:
+            if cached is not None and cached[:2] == (stat.st_size, stat.st_mtime_ns) and cached[3] == expected:
                 return path, cached
             array = np.load(path, mmap_mode="r", allow_pickle=False)
-            valid_shape = array.shape == shape and array.dtype == np.float32
+            valid_shape = array.shape == expected and array.dtype == np.dtype(dtype)
             data_offset = int(array.offset)
             del array
             if not valid_shape:
                 raise ValueError(f"Registered frame has invalid shape or dtype: {path}")
-            return path, (stat.st_size, stat.st_mtime_ns, data_offset, shape)
+            return path, (stat.st_size, stat.st_mtime_ns, data_offset, expected)
 
         with ThreadPoolExecutor(max_workers=max(1, header_workers)) as executor:
             for validated in executor.map(validate_header, store.paths):
@@ -283,6 +359,8 @@ class FrameStore:
         path = self.paths.pop(index)
         self.norms.pop(index)
         self.names.pop(index)
+        if index < len(self.boxes):
+            self.boxes.pop(index)
         try:
             path.unlink()
         except OSError:
@@ -325,7 +403,7 @@ class FrameStore:
                         if temporary is not None:
                             temporary.unlink(missing_ok=True)
             stored_frame_path = path.name if path.parent == self.directory.resolve() else str(path.resolve())
-            frames.append({
+            entry = {
                 "name": name,
                 "path": stored_frame_path,
                 "offset": np.asarray(norm.offset, dtype=float).tolist(),
@@ -334,9 +412,16 @@ class FrameStore:
                 "weight_map": None if weight_map_path is None else weight_map_path.name,
                 "scale_map": None if scale_map_path is None else scale_map_path.name,
                 "offset_map": None if offset_map_path is None else offset_map_path.name,
-            })
+            }
+            box = self.boxes[i] if i < len(self.boxes) else None
+            if box is not None:
+                entry["box"] = list(box)
+            frames.append(entry)
         external_dirs = [str(path.resolve()) for path in self.storage_dirs if path.resolve() != self.directory.resolve()]
         index = {"shape": list(self.shape), "storage_dirs": external_dirs, "frames": frames}
+        if self.dtype != "float32":
+            index["dtype"] = self.dtype
+            index["float16_scale"] = FLOAT16_SCALE
         out = self.directory / "index.json"
         write_json_atomic(out, index)
         return out
@@ -375,7 +460,7 @@ def registered_store_cleanup_plan(directory: Path) -> list[Path]:
                 if any(
                     not isinstance(name, str)
                     or name not in ("index.json", "registered_store.json")
-                    and re.fullmatch(r"(?:reg|rej|weight|scale|offset)_\d{4}\.npy", name) is None
+                    and re.fullmatch(r"(?:reg|rej|weight|scale|offset)_\d{4,}\.npy", name) is None
                     for name in names
                 ):
                     raise ValueError("Cleanup marker contains an unowned filename")
@@ -405,9 +490,9 @@ def registered_store_cleanup_plan(directory: Path) -> list[Path]:
             resolved = path.resolve(strict=True)
             root_artifact = resolved.parent == root and (
                 resolved.name in ("index.json", "registered_store.json", "cleanup_pending.json")
-                or re.fullmatch(r"(?:reg|rej|weight|scale|offset)_\d{4}\.npy", resolved.name) is not None
+                or re.fullmatch(r"(?:reg|rej|weight|scale|offset)_\d{4,}\.npy", resolved.name) is not None
             )
-            external_artifact = any(resolved.parent == storage_dir and re.fullmatch(r"(?:reg|rej)_\d{4}\.npy", resolved.name) is not None for storage_dir in storage_dirs)
+            external_artifact = any(resolved.parent == storage_dir and re.fullmatch(r"(?:reg|rej)_\d{4,}\.npy", resolved.name) is not None for storage_dir in storage_dirs)
             if not (root_artifact or external_artifact) or not resolved.is_file():
                 raise ValueError(f"Registered-store artifact is not a regular file inside its store: {path}")
             validated.append(resolved)
@@ -464,9 +549,9 @@ def registered_store_cleanup_plan(directory: Path) -> list[Path]:
         resolved = path.resolve(strict=True)
         root_artifact = resolved.parent == root and (
             resolved.name in ("index.json", "registered_store.json", "cleanup_pending.json")
-            or re.fullmatch(r"(?:reg|rej|weight|scale|offset)_\d{4}\.npy", resolved.name) is not None
+            or re.fullmatch(r"(?:reg|rej|weight|scale|offset)_\d{4,}\.npy", resolved.name) is not None
         )
-        external_artifact = any(resolved.parent == storage_dir and re.fullmatch(r"(?:reg|rej)_\d{4}\.npy", resolved.name) is not None for storage_dir in storage_dirs)
+        external_artifact = any(resolved.parent == storage_dir and re.fullmatch(r"(?:reg|rej)_\d{4,}\.npy", resolved.name) is not None for storage_dir in storage_dirs)
         if not (root_artifact or external_artifact) or not resolved.is_file():
             raise ValueError(f"Registered-store artifact is not a regular file inside its store: {path}")
         validated.append(resolved)
@@ -971,28 +1056,68 @@ class BandReader:
     threads keeps an NVMe busy; strided memmap copies from one thread run at a fraction of that.
     """
 
-    def __init__(self, paths: list[Path], shape: tuple[int, int, int], workers: int = 8, data_offsets: list[int] | None = None) -> None:
+    def __init__(
+        self,
+        paths: list[Path],
+        shape: tuple[int, int, int],
+        workers: int = 8,
+        data_offsets: list[int] | None = None,
+        boxes: list[Box | None] | None = None,
+        dtype: StoreDtype = "float32",
+    ) -> None:
         channels, height, width = shape
         self.paths = [str(p) for p in paths]
         self.shape = shape
         self.row_bytes = width * 4
         self.plane_bytes = height * self.row_bytes
         self.workers = max(1, workers)
+        # compact stores (cropped boxes and/or float16) are expanded to full-grid float32 rows on read
+        self.compact = boxes is not None or dtype != "float32"
+        self.dtype = np.dtype(dtype)
+        self.boxes: list[Box | None] = list(boxes) if boxes is not None else [None] * len(self.paths)
+        if len(self.boxes) != len(self.paths):
+            raise ValueError("Registered-frame boxes do not match the store")
         self.data_offsets: list[int] = []
         if data_offsets is not None:
             if len(data_offsets) != len(paths) or any(offset < 0 for offset in data_offsets):
                 raise ValueError("Registered-frame data offsets do not match the store")
             self.data_offsets = list(data_offsets)
             return
-        for path in self.paths:
+        for path, box in zip(self.paths, self.boxes):
+            expected = shape if box is None else (channels, box[1] - box[0], box[3] - box[2])
             array = np.load(path, mmap_mode="r", allow_pickle=False)
-            if array.shape != shape or array.dtype != np.float32:
+            if array.shape != expected or array.dtype != self.dtype:
                 raise ValueError(f"Registered frame {path} does not match the store shape")
             self.data_offsets.append(int(array.offset))
             del array
 
     def __len__(self) -> int:
         return len(self.paths)
+
+    def _read_compact(self, index: int, row_start: int, rows: int, out: np.ndarray) -> None:
+        channels, height, width = self.shape
+        out[index, :, :rows, :] = np.nan
+        y0, y1, x0, x1 = self.boxes[index] or (0, height, 0, width)
+        first, last = max(row_start, y0), min(row_start + rows, y1)
+        if first >= last:
+            return
+        box_width = x1 - x0
+        row_bytes = box_width * self.dtype.itemsize
+        plane_bytes = (y1 - y0) * row_bytes
+        buffer = np.empty((last - first, box_width), dtype=self.dtype)
+        view = memoryview(buffer.view(np.uint8).reshape(-1))
+        with open(self.paths[index], "rb", buffering=0) as handle:
+            for c in range(channels):
+                handle.seek(self.data_offsets[index] + c * plane_bytes + (first - y0) * row_bytes)
+                filled = 0
+                while filled < len(view):
+                    got = handle.readinto(view[filled:])
+                    if not got:
+                        raise OSError(f"Short read in registered frame {self.paths[index]}")
+                    filled += got
+                out[index, c, first - row_start : last - row_start, x0:x1] = buffer
+                if self.dtype == np.float16:
+                    out[index, c, first - row_start : last - row_start, x0:x1] *= 1.0 / FLOAT16_SCALE
 
     def read_into(self, row_start: int, row_stop: int, out: np.ndarray) -> None:
         """Fill ``out[:, :, :rows, :]`` (N, C, >=rows, W float32, C-contiguous) with the row range."""
@@ -1006,6 +1131,9 @@ class BandReader:
 
         def read_frames(first: int, last: int) -> None:
             for index in range(first, last):
+                if self.compact:
+                    self._read_compact(index, row_start, rows, out)
+                    continue
                 base = self.data_offsets[index] + row_offset
                 with open(self.paths[index], "rb", buffering=0) as handle:
                     for c in range(channels):

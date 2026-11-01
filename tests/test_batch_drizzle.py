@@ -36,6 +36,40 @@ def test_drizzle_flat_field_and_coverage(kernel, scale):
     assert acc.weight_map()[border:-border, border:-border].min() > 0
 
 
+def test_drizzle_fractional_scale_flat_field():
+    acc = new_accumulator(1, 32, 32, 1.5, torch.device("cpu"))
+    frame = torch.full((1, 32, 32), 100.0)
+    for dx, dy in [(0.0, 0.0), (0.33, 0.0), (0.0, 0.33), (0.33, 0.33), (0.66, 0.66)]:
+        drizzle_frame(acc, frame, _shift_alignment(dx, dy), FrameNorm(offset=100.0, scale=1.0, weight=1.0), 100.0, DrizzleSettings(scale=1.5, pixfrac=0.8))
+    img = acc.image(0.05)
+    assert img.shape == (1, 48, 48)
+    inner = img[0, 6:-6, 6:-6]
+    assert abs(inner.mean() - 100) < 1e-3 and inner.std() < 1e-3
+    assert acc.weight_map()[6:-6, 6:-6].min() > 0
+
+
+def test_coarser_frame_drop_sampling_scales_with_its_pixel_size():
+    from gpustacker.drizzle import _subsample_offsets, normalize_drizzle_scale
+
+    settings = DrizzleSettings(scale=2, pixfrac=0.8)
+    legacy = _subsample_offsets(settings, torch.device("cpu"))
+    assert torch.equal(_subsample_offsets(settings, torch.device("cpu"), 1.0005), legacy)  # same camera: unchanged
+    assert torch.equal(_subsample_offsets(settings, torch.device("cpu"), 0.6), legacy)
+    assert len(_subsample_offsets(settings, torch.device("cpu"), 1.78)) > len(legacy)
+    assert normalize_drizzle_scale(2.0) == 2 and isinstance(normalize_drizzle_scale(2.0), int)
+    assert normalize_drizzle_scale(1.5) == 1.5
+
+    # a single coarse frame (1.78x larger pixels, pixfrac 1) drizzled 2x must tile the output without holes;
+    # the same-camera sample count (3 per axis) leaves holes at this drop size
+    coarse = Alignment(np.diag([1.78, 1.78, 1.0]), 0, 0.0, 1.78, (0.0, 0.0))
+    for subsamples, holes in ((3, True), (0, False)):
+        acc = new_accumulator(1, 64, 64, 2, torch.device("cpu"))
+        drizzle_frame(acc, torch.full((1, 32, 32), 50.0), coarse, FrameNorm(offset=0.0, scale=1.0), 0.0, DrizzleSettings(scale=2, pixfrac=1.0, subsamples=subsamples))
+        weight = acc.weight_map()[8:96, 8:96]
+        assert bool(weight.min() == 0) is holes
+    assert np.allclose(acc.image(0.0)[0, 8:96, 8:96], 50.0, atol=1e-3)
+
+
 def test_drizzle_places_frame_on_shifted_full_field_canvas():
     origin = (-2, -3)
     frame = torch.full((1, 4, 5), 100.0)

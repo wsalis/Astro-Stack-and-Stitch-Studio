@@ -76,6 +76,80 @@ def test_reference_overlap_fraction_measures_shifted_footprint():
     assert reference_overlap_fraction(shifted, (100, 100), (100, 100)) == 0.2
 
 
+def _mixed_star_fields(seed: int = 3):
+    """Wide reference catalogue and a narrower, coarser, rotated frame covering ~22% of it."""
+
+    from gpustacker.detection import Stars
+
+    rng = np.random.default_rng(seed)
+    ref_shape, src_shape = (2400, 1350), (1200, 680)
+    n = 900
+    ref_xy = np.column_stack([rng.uniform(0, ref_shape[1] - 1, n), rng.uniform(0, ref_shape[0] - 1, n)])
+    flux = rng.pareto(1.2, n) + 1.0
+    scale, theta, offset = 1.05, np.radians(17.0), np.array([660.0, 1250.0])
+    c, s = np.cos(theta), np.sin(theta)
+    matrix = np.array([[scale * c, -scale * s, 0.0], [scale * s, scale * c, 0.0], [0.0, 0.0, 1.0]])
+    centre = np.array([(src_shape[1] - 1) / 2, (src_shape[0] - 1) / 2])
+    matrix[:2, 2] = offset - matrix[:2, :2] @ centre  # source centre lands on `offset` in the reference
+    src_xy = (ref_xy - matrix[:2, 2]) @ np.linalg.inv(matrix[:2, :2]).T
+    inside = (src_xy[:, 0] >= 0) & (src_xy[:, 0] <= src_shape[1] - 1) & (src_xy[:, 1] >= 0) & (src_xy[:, 1] <= src_shape[0] - 1)
+    keep = np.flatnonzero(inside)
+    keep = keep[np.argsort(-flux[keep])][:90]  # shallower sensor: only its brightest stars
+    src_xy = src_xy[keep] + rng.normal(0, 0.05, (len(keep), 2))
+
+    def stars(xy: np.ndarray, f: np.ndarray) -> Stars:
+        order = np.argsort(-f)
+        ones = np.ones(len(xy))
+        return Stars(xy[order, 0], xy[order, 1], f[order], ones, ones, f[order], total_detected=len(xy))
+
+    return stars(src_xy, flux[keep]), stars(ref_xy, flux), src_shape, ref_shape, matrix
+
+
+def test_mixed_alignment_matches_narrow_coarse_frame_to_wide_reference():
+    from gpustacker.registration import confirm_alignment, estimate_alignment_mixed, refine_alignment
+
+    src, ref, src_shape, ref_shape, truth = _mixed_star_fields()
+    align = estimate_alignment_mixed(src, ref, src_shape, ref_shape, scale_hint=1.04)
+    assert abs(align.scale - 1.05) < 2e-3 and abs(align.rotation_deg - 17.0) < 0.1
+    corners = np.array([[0, 0, 1], [src_shape[1] - 1, src_shape[0] - 1, 1]], dtype=np.float64)
+    assert np.abs((corners @ align.matrix.T)[:, :2] - (corners @ truth.T)[:, :2]).max() < 0.5
+    confirmed, tested = confirm_alignment(align.matrix, src, ref, ref_shape)
+    assert tested >= 40 and confirmed == tested
+
+    refined = refine_alignment(align, src, ref, shapes=(src_shape, ref_shape))
+    assert refined.inverse_poly is not None and refined.refined_matches >= 60
+
+    # reverse roles: wide frame registered onto the narrow reference
+    reverse = estimate_alignment_mixed(ref, src, ref_shape, src_shape, scale_hint=1 / 1.04)
+    assert abs(reverse.scale - 1 / 1.05) < 2e-3 and abs(reverse.rotation_deg + 17.0) < 0.1
+
+
+def test_mixed_alignment_rejects_scale_contradicting_metadata():
+    from gpustacker.registration import estimate_alignment_mixed
+
+    src, ref, src_shape, ref_shape, _ = _mixed_star_fields()
+    with pytest.raises(ValueError, match="mixed-setup alignment failed"):
+        estimate_alignment_mixed(src, ref, src_shape, ref_shape, scale_hint=1.6)
+
+
+def test_mixed_hint_only_for_differing_grid_or_scale():
+    from types import SimpleNamespace
+
+    from gpustacker.pipeline import _mixed_align_hint
+
+    def meta(shape, focal):
+        return SimpleNamespace(shape=shape, header={"XPIXSZ": 2.9, "YPIXSZ": 2.9, "FOCALLEN": focal})
+
+    assert _mixed_align_hint(meta((1920, 1080), 250.0), meta((1920, 1080), 250.0)) is None
+    assert _mixed_align_hint(SimpleNamespace(shape=(100, 80), header={}), SimpleNamespace(shape=(100, 80), header={})) is None
+    hint = _mixed_align_hint(meta((1920, 1080), 250.0), meta((3840, 2160), 260.0))
+    assert hint is not None and hint[:2] == ((1920, 1080), (3840, 2160)) and abs(hint[2] - 1.04) < 1e-3
+    same_grid = _mixed_align_hint(meta((1920, 1080), 150.0), meta((1920, 1080), 250.0))
+    assert same_grid is not None and abs(same_grid[2] - 250 / 150) < 1e-3
+    unknown_scale = _mixed_align_hint(SimpleNamespace(shape=(100, 80), header={}), SimpleNamespace(shape=(200, 160), header={}))
+    assert unknown_scale == ((100, 80), (200, 160), None)
+
+
 def test_lanczos_keeps_star_sharpness_and_blocks_dark_halos():
     """Half-pixel Lanczos resampling must not broaden a star (the old clamp did, ~7%) nor ring below the local sky."""
 

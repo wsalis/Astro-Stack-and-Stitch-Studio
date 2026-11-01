@@ -137,13 +137,21 @@ Large-scale (trails)
     (
         "Weighting, normalisation, hardware",
         """Weighting
-  psfsw (default)   PSF-signal weight: (transparency / noise)^2 per frame. Clear, low-noise frames
-                    dominate; hazy frames are down-weighted. Equivalent in spirit to PixInsight's
-                    PSF Signal Weight.
-  psfsw+fwhm        As psfsw times (median FWHM / frame FWHM)^2. Sharper frames weigh more. Tends to
+  psfsnr (default)  PSF SNR: (transparency / noise)^2 per frame (PixInsight PSF SNR style, eq. 18).
+                    Clear, low-noise frames dominate; hazy frames are down-weighted. Called "psfsw"
+                    before version-2 names; older settings and retained stores are mapped automatically.
+  psfsnr+fwhm       As psfsnr times (median FWHM / frame FWHM)^2. Sharper frames weigh more. Tends to
                     reduce effective depth slightly; use when seeing varied a lot.
-  psfsw+field       PSFSW with a capped regional sharpness factor. The shared sensor-field pattern is
+  psfsnr+field      psfsnr with a capped regional sharpness factor. The shared sensor-field pattern is
                     divided out, so only frame-to-frame local softness changes the weight.
+  psfsw             PixInsight PSF Signal Weight formula: sum(F) x sum(M) / (noise x M*), where F is
+                    the star flux, M = F / area of the FWTM measurement circle (so 1/FWHM^2) and M*
+                    the sky background (calibration pedestal removed). Rewards bright, tight stars on
+                    a dark, quiet sky; much wider weight range than psfsnr.
+  psfsw-ln          psfsw evaluated on the normalised frame y = s x + z: star flux, noise and sky
+                    are scaled to the reference first (a cloud-dimmed frame keeps its amplified
+                    noise; its brighter sky is removed by the zero offset), then the same FWHM
+                    penalty. Uses the global normalisation scale/offset.
   noise             (median noise / frame noise)^2 only.
   fwhm              (median FWHM / frame FWHM)^2 only.
   both              noise x fwhm.
@@ -208,15 +216,23 @@ workers
       Camera/optics-aware (default on) changes pre-registration star-count, sky, and FWHM checks
       only for mixed setups with camera and angular-scale metadata on every candidate. Otherwise
       legacy decisions are retained. Uncheck it or use --no-camera-aware-filters to opt out.
-      Camera: INSTRUME/CAMERA. Scale: PIXSCALE/SECPIX in arcsec/pixel, or XPIXSZ in microns and
+      Camera: INSTRUME/CAMERA; if both are empty, a Seestar model name in TELESCOP (e.g.
+      "S50 Pro_<serial>" -> seestar s50 pro, serial ignored). Other TELESCOP values are not used.
+      Scale: PIXSCALE/SECPIX in arcsec/pixel, or XPIXSZ in microns and
       focal length for unbinned square pixels. Unknown identity/ambiguous scale is not guessed.
       Star and sky baselines use setup/exposure cohorts with at least three frames; sparse cohorts
       skip those two relative checks. FWHM uses a shared session median in arcseconds, so a wholly
       blurred cohort is not excused simply for being internally consistent. This is a relative
       check, not an absolute quality guarantee. Zero thresholds still disable individual checks.
+      When pixel scales differ (e.g. S30 + S50), FWHM is instead checked against each camera's own
+      median (same ratio) plus a session floor of ratio^2 x the session median, and a camera whose
+      median FWHM in arcsec is softer than the sharpest camera's is DOWN-WEIGHTED at stacking by
+      (sharpest / its median)^2 rather than rejected (logged per camera; not applied for weighting
+      "none"; FWHM weighting modes use arcsec FWHM instead). Single-scale data is unaffected.
       Preview FWHM stays in pixels; mixed FWHM exclusion reasons explicitly use arcseconds.
-      Reports record setup baselines, camera, pixel scale and angular FWHM. Transparency, PSFSW,
-      reference selection, normalization, weights and calibration are unchanged by this option.
+      Reports record setup baselines, camera, pixel scale and angular FWHM. With differing pixel
+      scales, transparency is also compared within each camera (different apertures collect
+      different star flux on the same night). PSFSW, normalization and calibration are unchanged.
 
       CLI: --filter-preset lenient|balanced|selective supplies starting values. Explicit
       --filter-transparency, --filter-stars, --filter-background, and --filter-fwhm override them.
@@ -267,7 +283,14 @@ star sigma  (default 5.0)
 
 The reference frame is chosen automatically: among frames with a normal star count and clear sky
 (top-30 star flux within 90 % of the best), the one with the smallest FWHM. The log prints the
-chosen file.""",
+chosen file.
+
+Reference picker: Analyze & rank, Preview, Use as reference, Camera
+  Camera lists the camera models found in the frame headers (model + arcsec/px, with frame
+  counts); opening it reads the headers once in the background. Choosing a model limits the
+  reference list and Analyze & rank to that camera's frames, so you only analyse those. With
+  "All cameras" each entry shows its model in brackets. The picker only narrows what you browse;
+  the run uses whatever reference you confirm with Use as reference (or automatic).""",
     ),
     (
         "Output options",
@@ -294,22 +317,51 @@ Keep registered frames
   keeps their locations for later stacking; cleanup removes only the files owned by that store.
   Costs disk space (frames x width x height x 4 bytes x channels). CLI: repeat --registered-drive.
 
+Frame format: 32-bit | 16-bit, Covered area only  (scratch storage for registered frames)
+  16-bit halves scratch disk use. Values are clipped at 65504 (saturated 16-bit ADU) and rounded
+  to about 3 significant digits, far below single-sub noise. Covered area only stores each frame's
+  bounding box instead of the whole reference grid: large savings when smaller sensors, mosaics
+  or full-field canvases leave most of a frame empty, little for one camera. Frames are expanded
+  back to float32 on read, so stacking math is unchanged. Not supported with network workers.
+  CLI: --registered-precision float16, --registered-crop.
+
 Plate solve (ASTAP)
   After each master, drizzle and deconvolved image is saved, solve it with ASTAP (auto-detected;
   needs a D50/D80 star database) and write the WCS + SIP distortion into its header (PLTSOLVD = T).
   RA/DEC, FOCALLEN and XPIXSZ from the subs are used as hints; if that fails a whole-sky search
   with the known field size follows. The WCS of the subs is never copied to outputs (it is wrong
   after registration, crop or drizzle), so an unsolved output simply has no WCS. A failed solve
-  is logged and does not stop the run. CLI: --no-solve, --astap <path>.""",
+  is logged and does not stop the run. CLI: --no-solve, --astap <path>.
+
+CUDA launch blocking (debug)
+  Sets CUDA_LAUNCH_BLOCKING=1 so a GPU error names the operation that actually failed instead
+  of a later one. Slower. Applied when the GPU is first used; if it already was in this session,
+  restart GPUStacker. CLI: --cuda-launch-blocking.
+
+Test mode: use a sample of N frames
+  Stack only N of the listed light frames to try settings before a full run. The sample is split
+  across source folders in proportion to their size (every folder gets at least one frame) and
+  evenly spaced through each folder's sorted files, so it spans every camera/filter folder and
+  night. The same list always gives the same sample. A manually chosen reference is always kept.
+  Outputs get a _test<N> suffix (batch mode: a _test<N> subfolder) so full-run files are never
+  overwritten. Preview filters still analyses the whole list (or the sample); Analyze & rank
+  uses the sample, limited to the selected Camera. CLI: --test-frames N.""",
     ),
     (
         "Drizzle",
-          """Drizzle: off | 2x | 3x | 4x | 5x
+          """Drizzle: off | 1.5x | 2x | 2.5x | 3x | 4x | 5x
   Variable-pixel linear reconstruction onto a finer grid. Only worthwhile when the data are
   undersampled (FWHM below ~2 px) AND well dithered (20+ frames at different sub-pixel offsets).
   The output <name>_drizzle.fit is scale x larger per axis; <name>_drizzle_weight.fit is the
         accumulated weight map. Memory use grows with scale squared; 5x uses about 56% more accumulator
         memory than 4x and may exceed available GPU memory on large images.
+
+  Mixed cameras/focal lengths: every frame is drizzled onto ONE output grid, the reference grid
+  times the scale, so each camera automatically gets its own effective factor (equivalent focal
+  length). With mixed pixel scales the automatic reference comes from the finest-scale optics,
+  e.g. S50 Pro reference + 2x = 1.15"/px: S50 Pro 2x, S50 ~2.1x, S30 Pro ~3.3x, S30 ~3.5x. The log
+  lists the output arcsec/px, equivalent focal length and each camera's effective factor. Coarser
+  cameras' drops are sampled more densely so they do not leave gaps.
 
 pixfrac  (default 0.8)
   Size of the input "drop" relative to an input pixel. Smaller = sharper but noisier and needs
@@ -588,7 +640,7 @@ CLI: gpustacker mosaic <tiles or folder> -o mosaic.fit. Options: --gradient {0,1
 Soft, bloated stars
   Make sure a master dark is applied (without one, cosmetic auto is on and may still touch star
   cores on undersampled data). Use lanczos3 and keep Polynomial refine on. Try weighting
-  psfsw+fwhm.
+  psfsw or psfsnr+fwhm.
 
 Blotchy background or visible frame edges
   Turn Local norm on, use autocrop 100 %, check that the flat matches (same optics/rotation).

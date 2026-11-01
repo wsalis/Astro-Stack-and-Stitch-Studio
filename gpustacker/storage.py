@@ -81,7 +81,9 @@ def estimate_stack_disk_space(
         frame_count = scratch_frames if group_inputs is None and scratch_frames is not None else len(lights)
         mask_bytes = pixels if settings.drizzle.enabled or settings.mfdeconv is not None else 0
         rejection_masks = mask_bytes * frame_count
-        registered_bytes = frame_count * master_bytes + rejection_masks
+        # covered-area cropping is not credited: coverage is unknown until frames are registered
+        frame_bytes = master_bytes // 2 if settings.registered_precision == "float16" else master_bytes
+        registered_bytes = frame_count * frame_bytes + rejection_masks
         checkpoint_arrays = 0
         if settings.resume:
             two_pass = settings.local_norm.enabled and frame_count >= 3
@@ -95,7 +97,7 @@ def estimate_stack_disk_space(
                 )
                 checkpoint_arrays += frame_count * channels * map_pixels * 2 * 4
         group_working = registered_bytes + checkpoint_arrays
-        group_storage.append((frame_count, master_bytes, mask_bytes, checkpoint_arrays))
+        group_storage.append((frame_count, frame_bytes, mask_bytes, checkpoint_arrays))
         group_output = 0
         for output in planned_outputs:
             stem = output.stem.lower()
@@ -104,9 +106,9 @@ def estimate_stack_disk_space(
             if stem.endswith("_coverage") or stem.endswith("_rejection"):
                 product_bytes = pixels * 4
             elif stem.endswith("_drizzle_weight"):
-                product_bytes = pixels * scale * scale * 4
+                product_bytes = int(pixels * scale * scale * 4)
             elif stem.endswith("_drizzle"):
-                product_bytes = pixels * scale * scale * drizzle_channels * 4
+                product_bytes = int(pixels * scale * scale * drizzle_channels * 4)
             else:
                 product_bytes = master_bytes
             group_output += product_bytes

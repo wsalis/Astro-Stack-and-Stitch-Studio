@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -9,8 +10,60 @@ import torch
 
 from .detection import Stars
 
-Weighting = str  # "psfsw" | "psfsw+fwhm" | "noise" | "fwhm" | "both" | "none"
-WEIGHTING_CHOICES = ("psfsw", "psfsw+fwhm", "psfsw+field", "noise", "fwhm", "both", "none")
+Weighting = str  # "psfsnr" | "psfsnr+fwhm" | "psfsnr+field" | "psfsw" | "psfsw-ln" | "noise" | "fwhm" | "both" | "none"
+WEIGHTING_CHOICES = ("psfsnr", "psfsnr+fwhm", "psfsnr+field", "psfsw", "psfsw-ln", "noise", "fwhm", "both", "none")
+DEFAULT_WEIGHTING = "psfsnr"
+# modes whose formula already contains a star-size term
+PSF_MODEL_WEIGHTINGS = ("psfsw", "psfsw-ln")
+# names used before PixInsight's PSFSW formula took over "psfsw" (settings/stores written without WEIGHTING_NAMES_VERSION)
+LEGACY_WEIGHTING_NAMES = {"psfsw": "psfsnr", "psfsw+fwhm": "psfsnr+fwhm", "psfsw+field": "psfsnr+field", "psfsw-pi": "psfsw"}
+WEIGHTING_NAMES_VERSION = 2
+
+
+def upgrade_weighting_name(mode: str) -> str:
+    return LEGACY_WEIGHTING_NAMES.get(mode, mode)
+# full width at tenth maximum of a Gaussian profile, in FWHM units
+FWTM_PER_FWHM = math.sqrt(math.log(10.0) / math.log(2.0))
+
+
+def psf_measurement_area(fwhm: np.ndarray, growth: float = 1.0) -> np.ndarray:
+    """Area of PixInsight's PSF flux measurement region (circle at FWTM x growth) [px^2]."""
+
+    radius = 0.5 * growth * FWTM_PER_FWHM * np.asarray(fwhm, dtype=np.float64)
+    return np.pi * radius * radius
+
+
+def psf_signal_weight(total_flux: np.ndarray, fwhm: np.ndarray, noise: np.ndarray, mstar: np.ndarray, growth: float = 1.0) -> np.ndarray:
+    """PixInsight PSF Signal Weight (ImageWeighting eq. 16): sum(f) * sum(f/(pi r^2)) / (sigma_n * M*).
+
+    r = 2.1460 sigma = FWTM/2 (eq. 9), so the mean-flux term penalises bloated stars as 1/FWHM^2;
+    c1/c2 (eq. 17) cancel in median-normalised weights. NaN = invalid.
+    """
+
+    flux = np.asarray(total_flux, dtype=np.float64)
+    noise = np.asarray(noise, dtype=np.float64)
+    mstar = np.asarray(mstar, dtype=np.float64)
+    area = psf_measurement_area(fwhm, growth)
+    valid = (flux > 0) & (noise > 0) & (mstar > 0) & (area > 0) & np.isfinite(flux * noise * mstar * area)
+    out = np.full(np.broadcast(flux, noise, mstar, area).shape, np.nan)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        signal = flux * flux / (noise * mstar)
+        np.copyto(out, signal / area, where=valid)
+    return out
+
+
+def ln_psf_signal_weight(total_flux: np.ndarray, fwhm: np.ndarray, noise: np.ndarray, mstar: np.ndarray, scale: np.ndarray, zero_offset: np.ndarray, growth: float = 1.0) -> np.ndarray:
+    """PSFSW evaluated on the locally normalised frame y = scale * x + zero_offset.
+
+    Signal and noise are scaled onto the reference (a cloud-attenuated frame gets scale > 1, so its
+    noise is amplified exactly as normalisation will amplify it in the stack) and the background is the
+    frame's sky after normalisation; the FWHM resolution term is applied afterwards, unchanged.
+    """
+
+    scale = np.asarray(scale, dtype=np.float64)
+    scale = np.where(np.isfinite(scale) & (scale > 0), scale, np.nan)
+    background = scale * np.asarray(mstar, dtype=np.float64) + np.asarray(zero_offset, dtype=np.float64)
+    return psf_signal_weight(scale * np.asarray(total_flux, dtype=np.float64), fwhm, scale * np.asarray(noise, dtype=np.float64), background, growth)
 
 
 def field_weight_factors(fwhm_grids: list[np.ndarray], minimum: float = 0.5, maximum: float = 2.0, confidence_counts: list[np.ndarray] | None = None, confidence_prior: float = 16.0) -> list[np.ndarray]:
@@ -206,11 +259,15 @@ def relative_psfsw(noise: np.ndarray, flux_ratio: np.ndarray, exposures: list[fl
     return result
 
 
-def compute_weights(mode: str, noise: np.ndarray, fwhm: np.ndarray, transp: np.ndarray) -> np.ndarray:
+def compute_weights(
+    mode: str, noise: np.ndarray, fwhm: np.ndarray, transp: np.ndarray,
+    background: np.ndarray | None = None, scale: np.ndarray | None = None, zero_offset: np.ndarray | None = None,
+) -> np.ndarray:
     """Per-frame weights normalised to a median of 1 and clipped to [0.05, 20].
 
-    psfsw: (transparency / noise)^2 — PSF-signal-weight style; frames with unknown transparency fall
-    back to the noise-only term.
+    psfsnr: (transparency / noise)^2, PixInsight PSF SNR style; frames with unknown transparency fall
+    back to the noise-only term. psfsw / psfsw-ln need the sky ``background`` (M*); psfsw-ln also
+    needs the normalisation ``scale`` and ``zero_offset``.
     """
 
     noise = np.asarray(noise, dtype=np.float64)
@@ -225,11 +282,19 @@ def compute_weights(mode: str, noise: np.ndarray, fwhm: np.ndarray, transp: np.n
     ref_fwhm = np.nanmedian(fwhm) if np.isfinite(fwhm).any() else np.nan
     t = np.where(np.isfinite(transp), transp, 1.0)
     w = np.ones(n)
-    if mode in ("psfsw", "psfsw+fwhm", "psfsw+field"):
+    if mode in PSF_MODEL_WEIGHTINGS:
+        if background is None or (mode == "psfsw-ln" and (scale is None or zero_offset is None)):
+            raise ValueError(f"{mode} weighting needs background" + (", scale and zero offset" if mode == "psfsw-ln" else ""))
+        f = np.where(np.isfinite(fwhm) & (fwhm > 0), fwhm, ref_fwhm if np.isfinite(ref_fwhm) else 1.0)
+        if mode == "psfsw":
+            w = psf_signal_weight(t, f, noise, background)
+        else:
+            w = ln_psf_signal_weight(t, f, noise, background, scale, zero_offset)
+    if mode in ("psfsnr", "psfsnr+fwhm", "psfsnr+field"):
         w *= (t * ref_noise / np.maximum(noise, 1e-9)) ** 2
     if mode in ("noise", "both"):
         w *= (ref_noise / np.maximum(noise, 1e-9)) ** 2
-    if mode in ("fwhm", "both", "psfsw+fwhm") and np.isfinite(ref_fwhm):
+    if mode in ("fwhm", "both", "psfsnr+fwhm") and np.isfinite(ref_fwhm):
         f = np.where(np.isfinite(fwhm), fwhm, ref_fwhm)
         w *= (ref_fwhm / np.maximum(f, 0.5)) ** 2
     med = np.nanmedian(w)

@@ -58,21 +58,141 @@ def estimate_alignment(source_stars: Stars, reference_stars: Stars, max_control_
     )
 
 
+def _apply_matrix(matrix: np.ndarray, xy: np.ndarray) -> np.ndarray:
+    h = np.column_stack([xy, np.ones(len(xy))]) @ matrix.T
+    return h[:, :2] / h[:, 2:3]
+
+
+def _inside(xy: np.ndarray, shape: tuple[int, int], margin: float = 0.0) -> np.ndarray:
+    height, width = shape
+    return (xy[:, 0] >= margin) & (xy[:, 0] <= width - 1 - margin) & (xy[:, 1] >= margin) & (xy[:, 1] <= height - 1 - margin)
+
+
+def _window_centers(shape: tuple[int, int], radius: float, limit: int) -> list[tuple[float, float]]:
+    height, width = shape
+    cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
+    step = max(0.75 * radius, 1.0)
+    nx, ny = int(np.ceil(cx / step)), int(np.ceil(cy / step))
+    centers = [(cx + i * step, cy + j * step) for i in range(-nx, nx + 1) for j in range(-ny, ny + 1)]
+    centers = [(min(max(x, 0.0), width - 1.0), min(max(y, 0.0), height - 1.0)) for x, y in centers]
+    centers.sort(key=lambda c: (c[0] - cx) ** 2 + (c[1] - cy) ** 2)
+    return centers[:limit]
+
+
+def confirm_alignment(matrix: np.ndarray, source_stars: Stars, reference_stars: Stars, reference_shape: tuple[int, int], radius: float = 3.0, brightest: int = 50) -> tuple[int, int]:
+    """(matched, tested): brightest source stars that land inside the reference and hit a reference star."""
+
+    if len(source_stars) == 0 or len(reference_stars) == 0:
+        return 0, 0
+    pred = _apply_matrix(matrix, source_stars.xy().astype(np.float64))
+    pred = pred[_inside(pred, reference_shape, margin=radius)][:brightest]
+    if len(pred) == 0:
+        return 0, 0
+    ref = reference_stars.xy().astype(np.float64)
+    d2 = ((pred[:, None, :] - ref[None, :, :]) ** 2).sum(-1)
+    return int((d2.min(1) < radius * radius).sum()), int(len(pred))
+
+
+def estimate_alignment_mixed(
+    source_stars: Stars,
+    reference_stars: Stars,
+    source_shape: tuple[int, int],
+    reference_shape: tuple[int, int],
+    scale_hint: float | None = None,
+    max_control_points: int = 60,
+    max_windows: int = 13,
+    scale_tolerance: float = 0.15,
+    min_confirmed: int = 8,
+    confirm_fraction: float = 0.4,
+) -> Alignment:
+    """Similarity transform between frames from different sensors / pixel scales.
+
+    When one field covers only part of the other, most of the brightest stars of the wider frame lie outside the
+    shared sky and plain astroalign matching fails. The wider frame's stars are restricted to circular windows the
+    size of the narrower footprint (centre first, then outward) and the first transform that agrees with the
+    metadata scale hint and is confirmed by independent star matches is accepted. ``scale_hint`` is source arcsec/px
+    divided by reference arcsec/px.
+    """
+
+    import astroalign
+
+    if len(source_stars) < 3 or len(reference_stars) < 3:
+        raise ValueError("Not enough stars to align (need at least 3 in each frame)")
+    scale = scale_hint if scale_hint is not None and np.isfinite(scale_hint) and scale_hint > 0 else 1.0
+    source_radius = 0.5 * float(np.hypot(*source_shape)) * scale  # reference pixels
+    reference_radius = 0.5 * float(np.hypot(*reference_shape))
+    widen_reference = source_radius < reference_radius
+    if widen_reference:
+        wide_stars, wide_shape, radius = reference_stars, reference_shape, 1.1 * source_radius
+    else:
+        wide_stars, wide_shape, radius = source_stars, source_shape, 1.1 * reference_radius / scale
+    wide_xy = wide_stars.xy()
+    covers_all = radius >= 0.5 * float(np.hypot(*wide_shape))
+    centers = [((wide_shape[1] - 1) / 2.0, (wide_shape[0] - 1) / 2.0)] if covers_all else _window_centers(wide_shape, radius, max_windows)
+    src_xy, ref_xy = source_stars.xy(), reference_stars.xy()
+    last_error = "no window contained enough stars"
+    for cx, cy in centers:
+        subset = wide_xy if covers_all else wide_xy[np.hypot(wide_xy[:, 0] - cx, wide_xy[:, 1] - cy) <= radius]
+        if len(subset) < 3:
+            continue
+        src_pts, ref_pts = (src_xy, subset) if widen_reference else (subset, ref_xy)
+        try:
+            transform, (matched_pts, _) = astroalign.find_transform(
+                src_pts[:max_control_points], ref_pts[:max_control_points], max_control_points=max_control_points
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+        found_scale = float(transform.scale)
+        if scale_hint is not None and abs(found_scale / scale - 1.0) > scale_tolerance:
+            last_error = f"scale {found_scale:.3f} disagrees with metadata {scale:.3f}"
+            continue
+        params = np.asarray(transform.params, dtype=np.float64)
+        confirmed, tested = confirm_alignment(params, source_stars, reference_stars, reference_shape)
+        if confirmed < min_confirmed or confirmed < confirm_fraction * tested:
+            last_error = f"only {confirmed}/{tested} stars confirmed"
+            continue
+        return Alignment(
+            matrix=params,
+            matched=int(len(matched_pts)),
+            rotation_deg=float(np.degrees(transform.rotation)),
+            scale=found_scale,
+            shift=(float(transform.translation[0]), float(transform.translation[1])),
+        )
+    raise ValueError(f"mixed-setup alignment failed after {len(centers)} star window(s): {last_error}")
+
+
 def _poly_design(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     return np.column_stack([np.ones_like(x), x, y, x * x, x * y, y * y, x**3, x * x * y, x * y * y, y**3])
 
 
-def refine_alignment(alignment: Alignment, source_stars: Stars, reference_stars: Stars, max_stars: int = 400, match_radius: float = 2.0, min_matches: int = 60, clip_sigma: float = 3.0) -> Alignment:
+def refine_alignment(
+    alignment: Alignment,
+    source_stars: Stars,
+    reference_stars: Stars,
+    max_stars: int = 400,
+    match_radius: float = 2.0,
+    min_matches: int = 60,
+    clip_sigma: float = 3.0,
+    shapes: tuple[tuple[int, int], tuple[int, int]] | None = None,
+) -> Alignment:
     """Fit a 3rd-order polynomial (reference -> source) through all stars matched by the similarity transform.
 
     Cubic terms capture ordinary radial optical distortion. Falls back to the similarity transform when
-    too few stars match. Residuals are iteratively sigma clipped.
+    too few stars match. Residuals are iteratively sigma clipped. ``shapes`` = (source, reference) limits
+    both star lists to the shared footprint before taking the brightest (used for mixed setups).
     """
 
     if len(source_stars) < min_matches or len(reference_stars) < min_matches:
         return alignment
-    src = source_stars.xy()[:max_stars].astype(np.float64)
-    ref = reference_stars.xy()[:max_stars].astype(np.float64)
+    src = source_stars.xy().astype(np.float64)
+    ref = reference_stars.xy().astype(np.float64)
+    if shapes is not None:
+        src = src[_inside(_apply_matrix(alignment.matrix, src), shapes[1])]
+        ref = ref[_inside(_apply_matrix(np.linalg.inv(alignment.matrix), ref), shapes[0])]
+    src, ref = src[:max_stars], ref[:max_stars]
+    if len(src) == 0 or len(ref) == 0:
+        return alignment
     src_h = np.column_stack([src, np.ones(len(src))]) @ alignment.matrix.T
     pred = src_h[:, :2] / src_h[:, 2:3]
     d2 = ((pred[:, None, :] - ref[None, :, :]) ** 2).sum(-1)

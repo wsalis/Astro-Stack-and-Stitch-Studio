@@ -48,6 +48,8 @@ def test_estimate_stack_disk_space_uses_largest_mixed_frame_shape(tmp_path):
 
     expected_master = 4 * 5 * 3 * 4
     assert estimate.working_bytes == 2 * expected_master
+    half = estimate_stack_disk_space(PipelineSettings(lights=[small, large], output=tmp_path / "master.fit", debayer="off", registered_precision="float16"), [settings.output], tmp_path)
+    assert half.working_bytes == expected_master
     assert estimate.output_bytes == expected_master
 
 

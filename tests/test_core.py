@@ -12,6 +12,72 @@ from gpustacker.io import load_frame, load_meta, normalize_layout, save_fits
 from gpustacker.stacking import FrameNorm, FrameStore, StackSettings, cleanup_registered_store, combine_tensor, stack_store, stack_store_band
 
 
+def _partial_frames(count: int = 6, shape=(3, 40, 56), seed: int = 4):
+    """Registered-like frames: offset partial footprints with NaN outside (mixed sensors / drift)."""
+
+    rng = np.random.default_rng(seed)
+    frames = []
+    for index in range(count):
+        frame = (500.0 + rng.normal(0, 5, shape)).astype(np.float32)
+        frame[:, 10:13, 20:23] += 30000.0  # bright star
+        if index % 2:
+            frame[:, : 3 + index, :] = np.nan
+            frame[:, :, 30 + index :] = np.nan
+        frames.append(frame)
+    frames[-1][:, 5, 5] = 70000.0  # above the raw float16 range: kept by the 1/4 storage scale
+    return frames
+
+
+@pytest.mark.parametrize("dtype,crop", [("float32", True), ("float16", False), ("float16", True)])
+def test_compact_store_reads_back_full_grid_and_stacks_like_float32(tmp_path, dtype, crop):
+    from gpustacker.backend import select_backend
+
+    frames = _partial_frames()
+    shape = frames[0].shape
+    legacy = FrameStore(tmp_path / "legacy", shape)
+    compact = FrameStore(tmp_path / "compact", shape, dtype=dtype, crop=crop)
+    for index, frame in enumerate(frames):
+        norm = FrameNorm(offset=500.0, scale=1.0, weight=1.0 + 0.1 * index)
+        legacy.add(f"f{index}", frame, norm)
+        # registration hands the device tensor straight to compact stores
+        compact.add(f"f{index}", torch.from_numpy(frame) if index % 2 else frame, FrameNorm(offset=500.0, scale=1.0, weight=1.0 + 0.1 * index))
+    assert compact.compact and not legacy.compact
+    if crop:
+        assert compact.boxes[1] == (4, 40, 0, 31) and compact.boxes[0] is None
+    atol, rtol = (0.0, 0.0) if dtype == "float32" else (0.2, 1e-3)  # float16: ~11 significant bits
+    full = legacy.band_reader().read(0, shape[1])
+    expanded = compact.band_reader().read(0, shape[1])
+    assert np.array_equal(np.isnan(full), np.isnan(expanded))
+    np.testing.assert_allclose(expanded, full, atol=atol, rtol=rtol, equal_nan=True)
+    np.testing.assert_allclose(compact.load_frame(3), full[3], atol=atol, rtol=rtol, equal_nan=True)
+    np.testing.assert_allclose(compact.load_frame(5), expanded[5], atol=0, equal_nan=True)
+    np.testing.assert_allclose(compact.band_reader().read(7, 19), expanded[:, :, 7:19], atol=0, equal_nan=True)
+
+    compact.save_index()
+    restored = FrameStore.load_index(tmp_path / "compact")
+    assert restored.dtype == dtype and restored.boxes == compact.boxes
+    np.testing.assert_allclose(restored.band_reader().read(0, shape[1]), expanded, atol=0, equal_nan=True)
+
+    backend = select_backend("cpu")
+    settings = StackSettings(method="sigma", normalize=True)
+    reference = stack_store(legacy, backend, settings)
+    result = stack_store(restored, backend, settings)
+    sky = (slice(None), slice(20, 40), slice(0, 20))
+    assert np.array_equal(result.coverage, reference.coverage)
+    np.testing.assert_allclose(result.image[sky], reference.image[sky], atol=0 if dtype == "float32" else 0.2)
+
+    compact.drop(1)
+    assert len(compact.boxes) == len(compact.paths) == len(frames) - 1
+
+
+def test_legacy_store_index_and_reader_are_unchanged(tmp_path):
+    store = FrameStore(tmp_path, (1, 4, 5))
+    store.add("a", np.ones((1, 4, 5), np.float32))
+    index = json.loads(store.save_index().read_text())
+    assert "dtype" not in index and "box" not in index["frames"][0]
+    assert not store.band_reader().compact
+
+
 def test_stack_store_per_channel_normalisation(tmp_path):
     """Frames with a different sky colour must be matched to the reference channel by channel."""
 

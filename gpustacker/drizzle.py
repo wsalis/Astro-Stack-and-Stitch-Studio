@@ -37,7 +37,7 @@ def _noop_status(_: str) -> None:
 @dataclass
 class DrizzleSettings:
     enabled: bool = False
-    scale: int = 2
+    scale: float = 2  # output pixels per reference pixel per axis; fractional values (e.g. 1.5) allowed
     kernel: Literal["square", "point", "gaussian"] = "square"
     pixfrac: float = 0.8
     cfa: bool = True  # drizzle Bayer colours straight from the CFA (OSC only); otherwise debayered frames
@@ -49,7 +49,7 @@ class DrizzleSettings:
 class DrizzleAccumulator:
     num: torch.Tensor  # (C, Ho, Wo) weighted flux
     den: torch.Tensor  # (C, Ho, Wo) weight
-    scale: int
+    scale: float
     frames: int = 0
 
     def image(self, min_weight: float) -> np.ndarray:
@@ -62,34 +62,52 @@ class DrizzleAccumulator:
         return self.den.mean(dim=0).cpu().numpy().astype(np.float32)
 
 
-def new_accumulator(channels: int, height: int, width: int, scale: int, device: torch.device) -> DrizzleAccumulator:
+def drizzle_shape(height: int, width: int, scale: float) -> tuple[int, int]:
+    return int(round(height * scale)), int(round(width * scale))
+
+
+def normalize_drizzle_scale(value: float) -> float:
+    """Whole-number scales stay ints so headers/outputs match the integer-only behaviour."""
+
+    return int(value) if float(value).is_integer() else float(value)
+
+
+def new_accumulator(channels: int, height: int, width: int, scale: float, device: torch.device) -> DrizzleAccumulator:
+    out_h, out_w = drizzle_shape(height, width, scale)
     return DrizzleAccumulator(
-        torch.zeros((channels, height * scale, width * scale), dtype=torch.float32, device=device),
-        torch.zeros((channels, height * scale, width * scale), dtype=torch.float32, device=device),
+        torch.zeros((channels, out_h, out_w), dtype=torch.float32, device=device),
+        torch.zeros((channels, out_h, out_w), dtype=torch.float32, device=device),
         scale,
     )
 
 
-def estimate_accumulator_bytes(channels: int, height: int, width: int, scale: int) -> int:
+def estimate_accumulator_bytes(channels: int, height: int, width: int, scale: float) -> int:
     """Bytes for the float32 numerator and denominator arrays."""
 
-    return 2 * channels * height * width * scale * scale * 4
+    out_h, out_w = drizzle_shape(height, width, scale)
+    return 2 * channels * out_h * out_w * 4
 
 
-def _subsample_offsets(settings: DrizzleSettings, device: torch.device) -> torch.Tensor:
-    k = settings.subsamples if settings.subsamples > 0 else int(max(2, math.ceil(settings.pixfrac * settings.scale) + 1))
+def _subsample_offsets(settings: DrizzleSettings, device: torch.device, footprint_scale: float = 1.0) -> torch.Tensor:
+    if settings.subsamples > 0:
+        k = settings.subsamples
+    elif footprint_scale > 1.01:
+        # a coarser camera's drop spans more output pixels; keep sub-samples about one output pixel apart
+        k = int(max(2, math.ceil(settings.pixfrac * settings.scale * footprint_scale) + 1))
+    else:
+        k = int(max(2, math.ceil(settings.pixfrac * settings.scale) + 1))
     # centres of k x k cells inside the pixfrac-shrunk drop, in source-pixel units
     edges = (torch.arange(k, device=device, dtype=torch.float32) + 0.5) / k - 0.5
     return edges * settings.pixfrac  # (k,)
 
 
-def _kernel_samples(settings: DrizzleSettings, device: torch.device) -> list[tuple[float, float, float]]:
+def _kernel_samples(settings: DrizzleSettings, device: torch.device, footprint_scale: float = 1.0) -> list[tuple[float, float, float]]:
     """Return (dy, dx, normalized weight) samples for the selected drop kernel."""
 
     if settings.kernel == "point":
         return [(0.0, 0.0, 1.0)]
 
-    offsets = _subsample_offsets(settings, device)
+    offsets = _subsample_offsets(settings, device, footprint_scale)
     offset_values = offsets.tolist()
     if settings.kernel == "square":
         sample_weight = 1.0 / (len(offset_values) ** 2)
@@ -133,7 +151,7 @@ def drizzle_frame(acc: DrizzleAccumulator, frame: torch.Tensor, alignment: Align
     scale = acc.scale
     out_h, out_w = acc.num.shape[1], acc.num.shape[2]
     weight = float(norm.weight)
-    samples = _kernel_samples(settings, device)
+    samples = _kernel_samples(settings, device, abs(float(alignment.scale)))
     n_col = acc.num.shape[0]
     g_off = torch.from_numpy(norm_vec(norm.offset, n_col)).to(device).view(-1, 1)
     g_scale = torch.from_numpy(norm_vec(norm.scale, n_col)).to(device).view(-1, 1)

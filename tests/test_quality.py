@@ -8,7 +8,7 @@ from gpustacker.backend import select_backend
 from gpustacker.detection import Stars, detect_stars, fwhm_grid, fwhm_grid_with_counts
 from gpustacker.diagnostics import crop_box_for, effective_frames, full_depth_box, stack_noise
 from gpustacker.normalization import LocalNormSettings, block_stats, fit_norm_maps
-from gpustacker.quality import FILTER_PRESETS, FilterSettings, StarSet, aperture_flux, compute_weights, field_weight_factors, filter_preset, relative_psfsw, sample_field_grid, select_photometry_stars, transparency
+from gpustacker.quality import FILTER_PRESETS, FWTM_PER_FWHM, FilterSettings, StarSet, aperture_flux, compute_weights, field_weight_factors, filter_preset, ln_psf_signal_weight, psf_signal_weight, relative_psfsw, sample_field_grid, select_photometry_stars, transparency, upgrade_weighting_name
 from gpustacker.registration import Alignment, estimate_alignment, refine_alignment, warp_to_reference
 from gpustacker.stacking import FrameNorm, FrameStore, StackSettings, combine_full, combine_tensor, stack_store
 from gpustacker.tilt import build_map, describe, frame_scatter, session_median
@@ -170,14 +170,46 @@ def test_psfsw_ranks_cloudy_and_moonlit_frames_low():
     transp = np.array([1.0, 0.5, 1.0, 1.0])
     w_noise = compute_weights("noise", noise, fwhm, transp)
     assert w_noise[1] == w_noise.max()
-    w = compute_weights("psfsw", noise, fwhm, transp)
+    w = compute_weights("psfsnr", noise, fwhm, transp)
     assert w[1] < w[0] and w[2] < w[0] and w[3] == pytest.approx(w[0])
-    w2 = compute_weights("psfsw+fwhm", noise, fwhm, transp)
+    w2 = compute_weights("psfsnr+fwhm", noise, fwhm, transp)
     assert w2[3] < w2[0]
     assert np.allclose(compute_weights("none", noise, fwhm, transp), 1.0)
     # unknown transparency falls back to noise-only for that frame
-    w3 = compute_weights("psfsw", noise, fwhm, np.array([1.0, np.nan, 1.0, 1.0]))
+    w3 = compute_weights("psfsnr", noise, fwhm, np.array([1.0, np.nan, 1.0, 1.0]))
     assert np.isfinite(w3).all()
+
+
+def test_pixinsight_psfsw_formula_and_resolution_penalty():
+    area = np.pi * (FWTM_PER_FWHM * 3.0 / 2) ** 2
+    assert psf_signal_weight(np.array([2.0]), np.array([3.0]), np.array([4.0]), np.array([10.0]))[0] == pytest.approx(2.0 * (2.0 / area) / (4.0 * 10.0))
+    w = psf_signal_weight(np.array([1.0, 1.0, 2.0, 1.0, 1.0]), np.array([3.0, 6.0, 3.0, 3.0, 3.0]), np.array([5.0, 5.0, 5.0, 10.0, 5.0]), np.array([100.0, 100.0, 100.0, 100.0, 200.0]))
+    np.testing.assert_allclose(w[1:] / w[0], [0.25, 4.0, 0.5, 0.5])
+    assert np.isnan(psf_signal_weight(np.array([1.0, 0.0]), np.array([3.0, 3.0]), np.array([5.0, 5.0]), np.array([0.0, 100.0]))).all()
+
+
+def test_locally_normalized_psfsw_corrects_transparency_but_keeps_seeing_penalty():
+    # clear, high cloud (half flux, brighter + noisier sky), poor seeing, clear
+    flux = np.array([1.0, 0.5, 1.0, 1.0])
+    noise = np.array([5.0, 5.5, 5.0, 5.0])
+    sky = np.array([100.0, 140.0, 100.0, 100.0])
+    fwhm = np.array([3.0, 3.0, 4.5, 3.0])
+    scale = 1.0 / flux
+    zero = 100.0 - scale * sky
+    pi = compute_weights("psfsw", noise, fwhm, flux, background=sky)
+    ln = compute_weights("psfsw-ln", noise, fwhm, flux, background=sky, scale=scale, zero_offset=zero)
+    assert pi[1] / pi[0] == pytest.approx(0.25 * 5.0 * 100.0 / (5.5 * 140.0))
+    # normalised: same signal and sky as the reference, noise amplified by the scale
+    assert ln[1] / ln[0] == pytest.approx(5.0 / (2.0 * 5.5))
+    assert pi[2] / pi[0] == pytest.approx((3.0 / 4.5) ** 2)
+    assert ln[2] / ln[0] == pytest.approx((3.0 / 4.5) ** 2)
+    assert ln_psf_signal_weight(flux, fwhm, noise, sky, np.ones(4), np.zeros(4)) == pytest.approx(psf_signal_weight(flux, fwhm, noise, sky))
+    with pytest.raises(ValueError, match="scale and zero offset"):
+        compute_weights("psfsw-ln", noise, fwhm, flux, background=sky)
+
+
+def test_legacy_weighting_names_map_to_renamed_methods():
+    assert [upgrade_weighting_name(m) for m in ("psfsw", "psfsw+fwhm", "psfsw+field", "psfsw-pi", "psfsw-ln", "noise")] == ["psfsnr", "psfsnr+fwhm", "psfsnr+field", "psfsw", "psfsw-ln", "noise"]
 
 
 def test_field_weight_factors_ignore_persistent_soft_corner():

@@ -63,6 +63,51 @@ def discover_frames(folder: Path | str, recursive: bool = False, skip_outputs: b
     return files
 
 
+def sample_test_frames(paths: list[Path], limit: int, keep: tuple[Path, ...] = ()) -> tuple[list[Path], list[tuple[str, int, int]]]:
+    """Deterministic test subset of at most ``limit`` frames (plus ``keep``).
+
+    Split proportionally across source folders (largest remainder, at least one per folder when the
+    limit allows) and evenly spaced within each folder's sorted files, so a sample spans every
+    camera/filter folder and every night instead of just the first files. Returns the subset in the
+    original order and (folder, chosen, available) per folder.
+    """
+
+    if limit < 1:
+        raise ValueError("Test mode needs at least one frame")
+    folders: dict[Path, list[Path]] = {}
+    for path in paths:
+        folders.setdefault(path.parent, []).append(path)
+    total = len(paths)
+    if limit >= total:
+        return list(paths), [(str(folder), len(items), len(items)) for folder, items in folders.items()]
+    exact = {folder: limit * len(items) / total for folder, items in folders.items()}
+    quota = {folder: int(value) for folder, value in exact.items()}
+    for folder in sorted(folders, key=lambda f: exact[f] - quota[f], reverse=True)[: limit - sum(quota.values())]:
+        quota[folder] += 1
+    if limit >= len(folders):
+        for folder in [f for f in folders if quota[f] == 0]:
+            donor = max(quota, key=lambda f: quota[f])
+            quota[donor] -= 1
+            quota[folder] = 1
+    chosen: set[Path] = set()
+    if keep:
+        wanted = {os.path.normcase(os.path.abspath(p)) for p in keep}
+        chosen.update(p for p in paths if os.path.normcase(os.path.abspath(p)) in wanted)
+    for folder, items in folders.items():
+        ordered = sorted(items, key=lambda p: p.name)
+        count = quota[folder]
+        chosen.update(ordered[int((i + 0.5) * len(ordered) / count)] for i in range(count))
+    subset = [path for path in paths if path in chosen]
+    summary = [(str(folder), sum(1 for p in items if p in chosen), len(items)) for folder, items in folders.items()]
+    return subset, summary
+
+
+def sampled_output_path(output: Path, limit: int) -> Path:
+    """Test-mode outputs never overwrite a full run's files."""
+
+    return output.with_name(f"{output.stem}_test{limit}{output.suffix}")
+
+
 def _header_float(header: dict[str, Any], *keys: str) -> float | None:
     for key in keys:
         value = header.get(key)

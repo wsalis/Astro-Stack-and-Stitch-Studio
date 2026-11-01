@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import time
 import copy
@@ -21,7 +22,7 @@ import torch
 
 from . import __version__
 from .backend import Backend, StatusCallback, select_backend, to_numpy, to_tensor
-from .calibration import Masters, calibrate, load_masters
+from .calibration import ADU_FULL_SCALE, AUTO_PEDESTAL_ADU, Masters, calibrate, load_masters
 from .checkpoint import CheckpointError, fingerprint_inputs, load_manifest, write_json_atomic, write_manifest, write_npy_atomic
 from .cosmetic import CosmeticSettings, CosmeticStats, cosmetic_correct
 from .debayer import debayer
@@ -32,12 +33,12 @@ from .io import FrameMeta, load_frame, load_meta, save_fits
 from .mfdeconv import MFDeconvResult, MFDeconvSettings, run_mfdeconv
 from .normalization import LocalNormSettings, block_stats, fit_norm_maps, reference_block_stats
 from .platesolve import find_astap, solve_fits
-from .quality import WEIGHTING_CHOICES, FilterSettings, StarSet, aperture_flux, compute_weights, field_weight_factors, relative_psfsw, sample_field_grid, select_photometry_stars, transparency
-from .registration import Alignment, Interpolation, estimate_alignment, reference_overlap_fraction, refine_alignment, source_coords_at, union_reference_grid, warp_to_reference
+from .quality import DEFAULT_WEIGHTING, PSF_MODEL_WEIGHTINGS, WEIGHTING_CHOICES, WEIGHTING_NAMES_VERSION, FilterSettings, StarSet, aperture_flux, compute_weights, field_weight_factors, relative_psfsw, sample_field_grid, select_photometry_stars, transparency, upgrade_weighting_name
+from .registration import Alignment, Interpolation, estimate_alignment, estimate_alignment_mixed, reference_overlap_fraction, refine_alignment, source_coords_at, union_reference_grid, warp_to_reference
 from .stacking import FrameNorm, FrameStore, StackResult, StackSettings, estimate_norm, norm_vec, stack_store
 
 ProgressCallback = Callable[[float, str], None]
-Weighting = Literal["psfsw", "psfsw+fwhm", "psfsw+field", "noise", "fwhm", "both", "none"]
+Weighting = Literal["psfsnr", "psfsnr+fwhm", "psfsnr+field", "psfsw", "psfsw-ln", "noise", "fwhm", "both", "none"]
 REPORT_SCHEMA_VERSION = 2
 
 
@@ -105,7 +106,7 @@ class PipelineSettings:
     full_field: bool = False
     detection_sigma: float = 5.0
     min_stars: int = 8
-    weighting: Weighting = "psfsw"
+    weighting: Weighting = DEFAULT_WEIGHTING
     weightings: list[Weighting] = field(default_factory=list)
     filters: FilterSettings = field(default_factory=FilterSettings)
     interpolation: Interpolation = "lanczos3"
@@ -123,6 +124,8 @@ class PipelineSettings:
     mfdeconv_blend: float = 0.3
     keep_registered: bool = False
     registered_storage_dirs: list[Path] = field(default_factory=list)
+    registered_precision: Literal["float32", "float16"] = "float32"
+    registered_crop: bool = False  # store only each registered frame's covered bounding box
     resume: bool = False
     device: Literal["auto", "cpu"] = "auto"
     vram_fraction: float = 0.75
@@ -279,21 +282,36 @@ class _LumaRing:
             pass
 
 
-def _solve_alignment(stars: Stars, ref_stars: Stars, refine: bool) -> Alignment:
+# (source shape, reference shape, source/reference arcsec-per-pixel ratio or None)
+MixedAlignHint = tuple[tuple[int, int], tuple[int, int], float | None]
+
+
+def _solve_alignment(stars: Stars, ref_stars: Stars, refine: bool, mixed: MixedAlignHint | None = None) -> Alignment:
     """Star-pattern alignment of one frame to the reference (CPU only; runs on the worker pool)."""
 
-    align = estimate_alignment(stars, ref_stars)
+    if mixed is None:
+        align = estimate_alignment(stars, ref_stars)
+        if refine:
+            align = refine_alignment(align, stars, ref_stars)
+        return align
+    source_shape, reference_shape, scale_hint = mixed
+    align = estimate_alignment_mixed(stars, ref_stars, source_shape, reference_shape, scale_hint)
     if refine:
-        align = refine_alignment(align, stars, ref_stars)
+        align = refine_alignment(align, stars, ref_stars, shapes=(source_shape, reference_shape))
     return align
 
 
-def _quality_setup(meta: FrameMeta) -> tuple[str, float] | None:
-    header = meta.header
-    camera = " ".join(str(header.get("INSTRUME") or header.get("CAMERA") or "").split()).casefold()
-    if not camera or camera in ("unknown", "none", "n/a"):
-        return None
+def _mixed_align_hint(meta: FrameMeta, ref_meta: FrameMeta) -> MixedAlignHint | None:
+    """None (legacy alignment) unless the frame's grid or known pixel scale differs from the reference."""
 
+    scale, ref_scale = _pixel_scale_arcsec(meta.header), _pixel_scale_arcsec(ref_meta.header)
+    ratio = scale / ref_scale if scale is not None and ref_scale is not None else None
+    if tuple(meta.shape) == tuple(ref_meta.shape) and (ratio is None or abs(ratio - 1.0) <= 0.01):
+        return None
+    return tuple(meta.shape), tuple(ref_meta.shape), ratio
+
+
+def _pixel_scale_arcsec(header: dict) -> float | None:
     def positive(*keys: str) -> float | None:
         for key in keys:
             try:
@@ -315,12 +333,84 @@ def _quality_setup(meta: FrameMeta) -> tuple[str, float] | None:
             return None
         scale = 206.264806 * pixel / focal
     scale = round(scale, 3)
-    if scale <= 0:
+    return scale if scale > 0 else None
+
+
+_SEESTAR_TELESCOP = re.compile(r"^(?:seestar\s+)?(s\d{2}(?:\s+pro)?)(?:_[0-9a-f]{6,})?$")
+
+
+def _camera_identity(header: dict) -> str | None:
+    """INSTRUME/CAMERA; else a Seestar model from TELESCOP (Pro models leave INSTRUME empty), serial dropped."""
+
+    camera = " ".join(str(header.get("INSTRUME") or header.get("CAMERA") or "").split()).casefold()
+    if camera:
+        return None if camera in ("unknown", "none", "n/a") else camera
+    match = _SEESTAR_TELESCOP.match(" ".join(str(header.get("TELESCOP") or "").split()).casefold())
+    return f"seestar {match.group(1)}" if match else None
+
+
+def _quality_setup(meta: FrameMeta) -> tuple[str, float] | None:
+    header = meta.header
+    camera = _camera_identity(header)
+    if camera is None:
+        return None
+    scale = _pixel_scale_arcsec(header)
+    if scale is None:
         return None
     gain = meta.gain if meta.gain is not None and np.isfinite(meta.gain) else None
     height, width = meta.shape
     label = f"{camera}; {scale:g} arcsec/px; {width}x{height}; {meta.channels}ch; filter={(meta.filter_name or 'unknown').casefold()}; gain={gain}"
     return label, scale
+
+
+def _sharpness_cohorts(infos: list[FrameInfo]) -> dict[tuple[str, float], list[tuple[FrameInfo, float]]] | None:
+    """(camera, arcsec/px) -> [(frame, angular FWHM)] when every frame is known and pixel scales differ, else None."""
+
+    cohorts: dict[tuple[str, float], list[tuple[FrameInfo, float]]] = {}
+    for info in infos:
+        setup = _quality_setup(info.meta) if info.meta is not None else None
+        if setup is None:
+            return None
+        camera = _camera_identity(info.meta.header) or "unknown"
+        cohorts.setdefault((camera, setup[1]), []).append((info, info.fwhm * setup[1] if np.isfinite(info.fwhm) and info.fwhm > 0 else float("nan")))
+    scales = [key[1] for key in cohorts]
+    if not scales or max(scales) <= 1.01 * min(scales):
+        return None
+    return cohorts
+
+
+def _cohort_median(members: list[tuple[FrameInfo, float]]) -> float | None:
+    values = [value for _, value in members if np.isfinite(value)]
+    return float(np.median(values)) if len(values) >= 3 else None
+
+
+def mixed_sharpness_factors(infos: list[FrameInfo]) -> tuple[dict[int, float], list[dict]] | None:
+    """Weight factors <= 1 for cameras whose stars are softer in arcsec than the sharpest camera.
+
+    Squared FWHM ratio against the sharpest camera cohort's median (cohorts need >= 3 measured frames;
+    sparse cohorts use each frame's own FWHM). None unless pixel scales differ.
+    """
+
+    cohorts = _sharpness_cohorts(infos)
+    if cohorts is None:
+        return None
+    medians = {key: _cohort_median(members) for key, members in cohorts.items()}
+    known = [value for value in medians.values() if value is not None]
+    if not known:
+        return None
+    best = min(known)
+    factors: dict[int, float] = {}
+    summary = []
+    for key, members in cohorts.items():
+        median = medians[key]
+        for info, value in members:
+            reference = median if median is not None else value
+            factors[info.index] = float(min(1.0, (best / reference) ** 2)) if np.isfinite(reference) and reference > 0 else 1.0
+        summary.append({
+            "camera": key[0], "pixel_scale_arcsec": key[1], "frames": len(members),
+            "median_fwhm_arcsec": median, "weight_factor": None if median is None else round(min(1.0, (best / median) ** 2), 4),
+        })
+    return factors, summary
 
 
 def preview_frame_filters(infos: list[FrameInfo], filters: FilterSettings) -> tuple[list[FrameInfo], dict]:
@@ -375,6 +465,20 @@ def preview_frame_filters(infos: list[FrameInfo], filters: FilterSettings) -> tu
         "median_fwhm_arcsec": float(np.median(angular_fwhms)) if angular_fwhms else None,
         "cohorts": [{"setup": key[0], "exposure": key[1], **value} for key, value in per_setup.items()],
     }
+    # different pixel scales: a coarser camera is judged against its own sharpness, with a looser session floor;
+    # its softer stars are down-weighted at stacking time instead of rejected
+    sharpness = _sharpness_cohorts(usable) if mixed else None
+    camera_fwhm: dict[int, float | None] = {}
+    if sharpness is not None:
+        for members in sharpness.values():
+            median = _cohort_median(members)
+            for info, _ in members:
+                camera_fwhm[info.index] = median
+        baseline["mixed_setups"]["fwhm_check"] = {
+            "mode": "camera cohort median, session floor",
+            "session_floor_ratio": filters.fwhm_max_ratio ** 2,
+            "camera_median_fwhm_arcsec": [{"camera": key[0], "pixel_scale_arcsec": key[1], "frames": len(members), "median": _cohort_median(members)} for key, members in sharpness.items()],
+        }
     if not filters.enabled or len(usable) < 3:
         return evaluated, baseline
     for info in usable:
@@ -397,7 +501,14 @@ def preview_frame_filters(infos: list[FrameInfo], filters: FilterSettings) -> tu
             reasons.append(f"stars {info.stars.total_detected} < {filters.stars_min_ratio:.0%} of median {stars:.0f}")
         if filters.background_max_ratio > 0 and sky is not None and sky > 0 and info.background > filters.background_max_ratio * sky:
             reasons.append(f"sky {info.background:.0f} > {filters.background_max_ratio:g}x median {sky:.0f}")
-        if filters.fwhm_max_ratio > 0 and fwhm is not None and np.isfinite(measured_fwhm) and measured_fwhm > filters.fwhm_max_ratio * fwhm:
+        if filters.fwhm_max_ratio > 0 and fwhm is not None and np.isfinite(measured_fwhm) and sharpness is not None:
+            own = camera_fwhm.get(info.index)
+            floor = filters.fwhm_max_ratio ** 2
+            if own is not None and measured_fwhm > filters.fwhm_max_ratio * own:
+                reasons.append(f"FWHM {measured_fwhm:.2f} arcsec > {filters.fwhm_max_ratio:g}x camera median {own:.2f} arcsec")
+            elif measured_fwhm > floor * fwhm:
+                reasons.append(f"FWHM {measured_fwhm:.2f} arcsec > {floor:.3g}x session median {fwhm:.2f} arcsec")
+        elif filters.fwhm_max_ratio > 0 and fwhm is not None and np.isfinite(measured_fwhm) and measured_fwhm > filters.fwhm_max_ratio * fwhm:
             if mixed:
                 reasons.append(f"FWHM {measured_fwhm:.2f} {fwhm_unit} > {filters.fwhm_max_ratio:g}x median {fwhm:.2f} {fwhm_unit}")
             else:
@@ -607,7 +718,9 @@ class StackingPipeline:
             if mixed["active"]:
                 self.status(f"Mixed setup baselines: {len(mixed['cohorts'])} setup/exposure cohorts; session FWHM median {mixed['median_fwhm_arcsec']} arcsec")
                 if any(cohort["frames"] < 3 for cohort in mixed["cohorts"]):
-                    self.status("Mixed setup cohorts with fewer than 3 frames skip relative star-count/sky checks; the session angular-FWHM check still applies")
+                    self.status("Mixed setup cohorts with fewer than 3 frames skip relative star-count/sky checks; the angular-FWHM check still applies")
+                if "fwhm_check" in mixed:
+                    self.status(f"Mixed pixel scales: FWHM checked against each camera's own median, plus a {mixed['fwhm_check']['session_floor_ratio']:.3g}x session-median floor; softer cameras are down-weighted at stacking")
         for info, result in zip(infos, evaluated):
             if info.rejected_reason != result.rejected_reason:
                 info.rejected_reason = result.rejected_reason
@@ -673,6 +786,14 @@ class StackingPipeline:
         usable = [f for f in infos if f.rejected_reason is None and np.isfinite(f.fwhm)]
         if not usable:
             raise ValueError("No usable frames (too few stars detected everywhere)")
+        # mixed pixel scales: the reference grid sets the master's resolution, so anchor it on the finest optics
+        # (pixel FWHM alone would favour the coarsest camera)
+        pixel_scales = {f.index: _pixel_scale_arcsec(f.meta.header) for f in usable}
+        known_scales = [scale for scale in pixel_scales.values() if scale is not None]
+        if len(known_scales) == len(usable) and max(known_scales) > 1.01 * min(known_scales):
+            finest = min(known_scales)
+            usable = [f for f in usable if pixel_scales[f.index] <= 1.01 * finest]
+            self.status(f"Mixed pixel scales ({min(known_scales):g}-{max(known_scales):g} arcsec/px): reference candidates limited to the finest {finest:g} arcsec/px frames ({len(usable)})")
         # with mixed exposures, pick from the group carrying the most integration time: its deeper star
         # catalogue registers every shorter sub, and the noise tie-break would otherwise favour short subs
         by_exposure: dict[float | None, list[FrameInfo]] = {}
@@ -726,23 +847,61 @@ class StackingPipeline:
         if not usable:
             return
         mode = mode or self.settings.weighting
+        sharp = mixed_sharpness_factors(usable) if self.settings.filters.camera_aware and mode != "none" else None
+        uses_fwhm = "fwhm" in mode or mode in PSF_MODEL_WEIGHTINGS
+        fwhm = np.array([f.fwhm for f in usable])
+        if sharp is not None and uses_fwhm:
+            # FWHM weighting compares frames directly; pixels mean different angles on each camera
+            fwhm = np.array([f.fwhm * _pixel_scale_arcsec(f.meta.header) for f in usable])
+        psf_terms: dict[str, np.ndarray] = {}
+        if mode in PSF_MODEL_WEIGHTINGS:
+            psf_terms = self._psf_weight_terms(usable, store)
         # the raw flux ratio is the frame's signal scale after normalisation, so (ratio / noise)^2 is its
         # inverse variance; the exposure-corrected transparency would over-weight short subs
         w = compute_weights(
             mode,
             np.array([f.noise for f in usable]),
-            np.array([f.fwhm for f in usable]),
+            fwhm,
             np.array([f.flux_ratio for f in usable]),
+            **psf_terms,
         )
+        if sharp is not None and not uses_fwhm:
+            factors, summary = sharp
+            w = np.clip(w * np.array([factors[f.index] for f in usable]), 0.05, 20.0)
+            for cohort in summary:
+                if cohort["weight_factor"] is not None:
+                    self.status(f"Mixed-camera sharpness weight: {cohort['camera']} @ {cohort['pixel_scale_arcsec']:g} arcsec/px, median FWHM {cohort['median_fwhm_arcsec']:.2f} arcsec -> x{cohort['weight_factor']:.2f} ({cohort['frames']} frames)")
+            self.filter_baselines.setdefault("mixed_sharpness_weights", {})[mode] = summary
         for f, wi in zip(usable, w):
             f.weight = float(wi)
             store.norms[f.store_index].weight = float(wi)
             store.norms[f.store_index].weight_map = None
-        if mode == "psfsw+field":
+        if mode == "psfsnr+field":
             self._set_field_weight_maps(infos, store)
         unknown = sum(1 for f in usable if not np.isfinite(f.flux_ratio))
-        note = f" ({unknown} frame(s) without transparency fell back to noise-only)" if mode.startswith("psfsw") and unknown else ""
+        note = f" ({unknown} frame(s) without transparency fell back to noise-only)" if mode.startswith(("psfsnr", "psfsw")) and unknown else ""
         self.status(f"Weights ({mode}): min {w.min():.2f}, median {np.median(w):.2f}, max {w.max():.2f}{note}")
+
+    def _added_pedestal(self, background: float) -> float:
+        masters = self.masters
+        if masters.pedestal:
+            return float(masters.pedestal)
+        if masters.dark is None and masters.bias is None:
+            return 0.0
+        return AUTO_PEDESTAL_ADU / ADU_FULL_SCALE if background <= 1.0 else AUTO_PEDESTAL_ADU
+
+    def _psf_weight_terms(self, usable: list[FrameInfo], store: FrameStore) -> dict[str, np.ndarray]:
+        """Sky background M* (calibration pedestal removed) and global normalisation scale / zero offset."""
+
+        channels = store.shape[0]
+        pedestal = self._added_pedestal(float(np.nanmedian([f.background for f in usable])))
+        background = np.array([f.background - pedestal for f in usable], dtype=np.float64)
+        # the stack maps x -> (x - offset_i) * scale_i + offset_ref with the reference stored first, i.e.
+        # LocalNormalization's y = s x + z with z = offset_ref - s offset_i (pedestal removed on both sides)
+        ref_offset = float(np.mean(norm_vec(store.norms[0].offset, channels))) - pedestal
+        scale = np.array([float(np.mean(norm_vec(store.norms[f.store_index].scale, channels))) for f in usable])
+        offset = np.array([float(np.mean(norm_vec(store.norms[f.store_index].offset, channels))) - pedestal for f in usable])
+        return {"background": background, "scale": scale, "zero_offset": ref_offset - scale * offset}
 
     def measure_psfsw(self, infos: list[FrameInfo]) -> None:
         usable = [info for info in infos if info.rejected_reason is None and info.store_index is not None]
@@ -800,6 +959,22 @@ class StackingPipeline:
             "candidate_frames": int(vals.size),
             "normalization_median": normalization_median if vals.size >= 3 and normalization_median and normalization_median > 0 else None,
         }
+        # different apertures/sensors collect different star flux on the same night: compare each camera to itself
+        cohorts = _sharpness_cohorts([f for f in infos if f.rejected_reason is None]) if self.settings.filters.camera_aware else None
+        if cohorts is not None:
+            per_camera = []
+            for key, members in cohorts.items():
+                values = [f.transparency for f, _ in members if np.isfinite(f.transparency)]
+                median = float(np.median(values)) if len(values) >= 3 else None
+                if median is not None and median > 0:
+                    for f, _ in members:
+                        if np.isfinite(f.transparency):
+                            f.transparency /= median
+                per_camera.append({"camera": key[0], "pixel_scale_arcsec": key[1], "frames": len(values), "relative_median": median})
+            self.filter_baselines["transparency"]["per_camera"] = per_camera
+            self.status("Mixed pixel scales: transparency compared within each camera: " + ", ".join(
+                f"{row['camera']} {row['relative_median']:.2f}" if row["relative_median"] is not None else f"{row['camera']} (session, <3 frames)" for row in per_camera
+            ))
         if not self.settings.filters.enabled:
             return
         thr = self.settings.filters.transparency_min
@@ -822,6 +997,10 @@ class StackingPipeline:
         align_ahead = max(4, 4 * self.cpu_workers)
         ref.alignment = Alignment.identity()
         self.output_origin = (0, 0)
+        hints = {f.index: _mixed_align_hint(f.meta, ref.meta) for f in usable if f.index != reference_index}
+        mixed_count = sum(hint is not None for hint in hints.values())
+        if mixed_count:
+            self.status(f"Mixed sensor/pixel-scale registration: {mixed_count} frame(s) differ from the reference grid or scale; using footprint-windowed star matching for them")
         if self.settings.full_field:
             min_reference_overlap = 0.25
             align_queue = [f for f in order if f.index != reference_index]
@@ -836,10 +1015,10 @@ class StackingPipeline:
                         align_next += 1
                         executor = _InlineExecutor() if pool_state["broken"] else align_pool
                         try:
-                            align_futures[f.index] = executor.submit(_solve_alignment, f.stars, ref.stars, self.settings.refine_registration)
+                            align_futures[f.index] = executor.submit(_solve_alignment, f.stars, ref.stars, self.settings.refine_registration, hints[f.index])
                         except BrokenProcessPool:
                             pool_state["broken"] = True
-                            align_futures[f.index] = _InlineExecutor().submit(_solve_alignment, f.stars, ref.stars, self.settings.refine_registration)
+                            align_futures[f.index] = _InlineExecutor().submit(_solve_alignment, f.stars, ref.stars, self.settings.refine_registration, hints[f.index])
 
                 submit_alignments()
                 for f in align_queue:
@@ -849,7 +1028,7 @@ class StackingPipeline:
                         if not pool_state["broken"]:
                             pool_state["broken"] = True
                             self.status("Alignment worker pool failed; continuing in-process for the remaining frames")
-                        f.alignment = _solve_alignment(f.stars, ref.stars, self.settings.refine_registration)
+                        f.alignment = _solve_alignment(f.stars, ref.stars, self.settings.refine_registration, hints[f.index])
                     except Exception as exc:
                         f.rejected_reason = f"alignment failed: {exc}"
                         self.status(f"Skipping {f.path.name}: {f.rejected_reason}")
@@ -891,10 +1070,10 @@ class StackingPipeline:
                     align_next += 1
                     executor = _InlineExecutor() if pool_state["broken"] else align_pool
                     try:
-                        align_futures[f.index] = executor.submit(_solve_alignment, f.stars, ref.stars, self.settings.refine_registration)
+                        align_futures[f.index] = executor.submit(_solve_alignment, f.stars, ref.stars, self.settings.refine_registration, hints[f.index])
                     except BrokenProcessPool:
                         pool_state["broken"] = True
-                        align_futures[f.index] = _InlineExecutor().submit(_solve_alignment, f.stars, ref.stars, self.settings.refine_registration)
+                        align_futures[f.index] = _InlineExecutor().submit(_solve_alignment, f.stars, ref.stars, self.settings.refine_registration, hints[f.index])
 
             def alignment_for(f: FrameInfo) -> Alignment:
                 submit_alignments()
@@ -904,7 +1083,7 @@ class StackingPipeline:
                     if not pool_state["broken"]:
                         pool_state["broken"] = True
                         self.status("Alignment worker pool failed; continuing in-process for the remaining frames")
-                    return _solve_alignment(f.stars, ref.stars, self.settings.refine_registration)
+                    return _solve_alignment(f.stars, ref.stars, self.settings.refine_registration, hints[f.index])
 
             submit_alignments()
             for n, (path, data, meta) in enumerate(self._prefetch([f.path for f in order], loader)):
@@ -920,13 +1099,26 @@ class StackingPipeline:
                         self.status(f"Skipping {info.path.name}: {info.rejected_reason}")
                         continue
                 tensor = self._calibrate_data(data, meta, path)
-                warped = warp_to_reference(
-                    tensor,
-                    info.alignment,
-                    mode=self.settings.interpolation,
-                    output_shape=store.shape[1:],
-                    origin=self.output_origin,
-                )
+                try:
+                    warped = warp_to_reference(
+                        tensor,
+                        info.alignment,
+                        mode=self.settings.interpolation,
+                        output_shape=store.shape[1:],
+                        origin=self.output_origin,
+                    )
+                except RuntimeError as exc:
+                    message = f"Registration warp failed for {path}: {exc}"
+                    if "device-side assert" in str(exc).lower():
+                        message += " Restart GPUStacker before retrying; the CUDA context is no longer usable."
+                    context = (
+                        f"Registration {n + 1}/{total}; input shape={tuple(tensor.shape)}, "
+                        f"output shape={store.shape}, origin={self.output_origin}, "
+                        f"interpolation={self.settings.interpolation}, "
+                        f"matrix={info.alignment.matrix.tolist()}, "
+                        f"inverse_poly={None if info.alignment.inverse_poly is None else info.alignment.inverse_poly.tolist()}"
+                    )
+                    raise RuntimeError(f"{message}\n{context}") from exc
                 lum = _luma_tensor(warped)
                 channels = warped.shape[0]
                 norms = [estimate_norm(warped[c]) for c in range(channels)]
@@ -957,7 +1149,7 @@ class StackingPipeline:
                     # block statistics for the local-normalisation fit, taken now while the warped frame is
                     # on the device instead of re-reading every registered frame from disk later
                     norm.block_stats = tuple(t.cpu().numpy() for t in block_stats(warped, self.settings.local_norm.block))
-                writes.append(store.add_async(info.path.name, to_numpy(warped), norm, writer))
+                writes.append(store.add_async(info.path.name, warped if store.compact else to_numpy(warped), norm, writer))
                 while len(writes) > 4:  # bound host memory held by queued writes
                     writes.pop(0).result()
                 a = info.alignment
@@ -984,7 +1176,7 @@ class StackingPipeline:
             stats = store.norms[i].block_stats
             if stats is not None and stats[0].shape[0] != reference.shape[0]:
                 stats = None  # taken for a different channel count (should not happen); refit from disk
-            frame = None if stats is not None else torch.from_numpy(np.load(path)).to(self.backend.device)
+            frame = None if stats is not None else torch.from_numpy(store.load_frame(i)).to(self.backend.device)
             scale_map, offset_map = fit_norm_maps(frame, ref_med, ref_mad, ref_frac, ln, scale=store.norms[i].scale, stats=stats)
             store.norms[i].scale_map = scale_map
             store.norms[i].offset_map = offset_map
@@ -1032,6 +1224,8 @@ class StackingPipeline:
         }
         if s.registered_storage_dirs:
             settings["registered_storage_dirs"] = [str(path.expanduser().resolve()) for path in s.registered_storage_dirs]
+        if s.registered_precision != "float32" or s.registered_crop:
+            settings["registered_storage"] = {"precision": s.registered_precision, "crop": s.registered_crop}
         return settings
 
     def _resume_input_paths(self) -> list[Path]:
@@ -1184,6 +1378,7 @@ class StackingPipeline:
             "frame_count": len(store),
             "reference_index": reference_index,
             "weighting": self.settings.weighting,
+            "weighting_names_version": WEIGHTING_NAMES_VERSION,
             "inputs": fingerprint_inputs(self.settings.lights),
             "index": "index.json",
             "storage_dirs": [str(path.resolve()) for path in store.storage_dirs if path.resolve() != work_dir.resolve()],
@@ -1412,12 +1607,14 @@ class StackingPipeline:
             if not isinstance(storage_dirs, list) or any(not isinstance(path, str) for path in storage_dirs):
                 raise CheckpointError("Registered-store manifest has invalid storage directories")
             store = FrameStore.load_index(directory, allowed_storage_dirs=[Path(path) for path in storage_dirs])
-            if self.settings.distributed_enabled and len(store.storage_dirs) > 1:
-                raise CheckpointError("Multi-drive registered stores cannot be used with experimental network workers")
+            if self.settings.distributed_enabled and (len(store.storage_dirs) > 1 or store.compact):
+                raise CheckpointError("Multi-drive, 16-bit or covered-area registered stores cannot be used with experimental network workers")
             if list(store.shape) != manifest.get("shape") or len(store) != manifest.get("frame_count"):
                 raise CheckpointError("Registered-store manifest does not match its index")
             infos, reference_index, tilt = self._restore_registered_state(directory, manifest, store)
             weighting = manifest.get("weighting")
+            if manifest.get("weighting_names_version") != WEIGHTING_NAMES_VERSION and isinstance(weighting, str):
+                weighting = upgrade_weighting_name(weighting)
             if weighting not in WEIGHTING_CHOICES:
                 raise CheckpointError("Registered-store weighting metadata is invalid")
         except CheckpointError:
@@ -1493,6 +1690,8 @@ class StackingPipeline:
             raise ValueError("Drive selection applies only when registering original light frames")
         if s.distributed_enabled and s.registered_storage_dirs:
             raise ValueError("Multi-drive registered storage is not supported with experimental network workers")
+        if s.distributed_enabled and (s.registered_precision != "float32" or s.registered_crop):
+            raise ValueError("16-bit or covered-area registered storage is not supported with experimental network workers")
         if from_registered_store and (s.resume or s.drizzle.enabled):
             raise ValueError("Registered-store stacking does not support resume or drizzle")
         if from_registered_store and s.filters.enabled and s.filters.psfsw_min_ratio > 0:
@@ -1521,7 +1720,7 @@ class StackingPipeline:
         resuming = s.resume and checkpoint_path.exists() and not from_registered_store
         if from_registered_store:
             store, infos, ref_index, tilt, registered_weighting = self._restore_registered_store(work_dir)
-            if s.weighting not in ("psfsw", registered_weighting):
+            if s.weighting not in (DEFAULT_WEIGHTING, registered_weighting):
                 raise CheckpointError(f"Registered store uses {registered_weighting!r} weighting; its weights cannot be recomputed")
             s.weighting = registered_weighting  # type: ignore[assignment]
             s.weightings = [registered_weighting]  # type: ignore[list-item]
@@ -1570,7 +1769,11 @@ class StackingPipeline:
                 shape,
                 storage_roots=s.registered_storage_dirs,
                 reserve_mask_bytes=shape[1] * shape[2] if s.drizzle.enabled or s.mfdeconv is not None else 0,
+                dtype=s.registered_precision,
+                crop=s.registered_crop,
             )  # type: ignore[arg-type]
+            if store.compact:
+                self.status(f"Registered frames stored as {s.registered_precision}" + (", covered area only" if s.registered_crop else ""))
             if s.registered_storage_dirs:
                 self.status(f"Registered frames will be distributed across {len(store.storage_dirs)} drive(s)")
         completed = False
@@ -1782,7 +1985,7 @@ class StackingPipeline:
             if s.drizzle.enabled:
                 try:
                     with self._stage("drizzle"):
-                        drz_out, drizzle_weight_path, drizzle_weight_error = self._run_drizzle(store, infos, header_items, result.crop_box)
+                        drz_out, drizzle_weight_path, drizzle_weight_error = self._run_drizzle(store, infos, header_items, result.crop_box, infos[ref_index].meta)
                     product_statuses["drizzle"] = {"status": "complete", "path": str(drz_out)}
                     if drizzle_weight_path is not None:
                         product_statuses["drizzle_weight"] = {"status": "complete", "path": str(drizzle_weight_path)}
@@ -1841,7 +2044,7 @@ class StackingPipeline:
         channels = store.shape[0]
         ref_off = norm_vec(ref.offset, channels)[:, None, None]
         for i in order:
-            arr = np.load(store.paths[i]).astype(np.float32)
+            arr = store.load_frame(i)
             norm = store.norms[i]
             variance_frame = arr
             rejection = np.load(store.mask_paths[i]).astype(bool) if store.mask_paths else None
@@ -1880,7 +2083,30 @@ class StackingPipeline:
         self._plate_solve(out)
         return out, result
 
-    def _run_drizzle(self, store: FrameStore, infos: list[FrameInfo], header_items: list, crop_box) -> tuple[Path, Path | None, str | None]:
+    def _log_drizzle_resolution(self, order: list[FrameInfo], scale: float, reference_meta: FrameMeta | None) -> None:
+        """Per-camera effective drizzle factor on the shared output grid (mixed pixel scales only)."""
+
+        ref_scale = _pixel_scale_arcsec(reference_meta.header) if reference_meta is not None else None
+        cohorts: dict[float, list[FrameInfo]] = {}
+        for f in order:
+            pixel = _pixel_scale_arcsec(f.meta.header)
+            if pixel is None or ref_scale is None:
+                return
+            cohorts.setdefault(pixel, []).append(f)
+        if len(cohorts) < 2 or max(cohorts) <= 1.01 * min(cohorts):
+            return
+        out_scale = ref_scale / scale
+        try:
+            pixel_um = float(reference_meta.header.get("XPIXSZ") or 0.0)
+        except (TypeError, ValueError):
+            pixel_um = 0.0
+        equivalent = f" (~{206.264806 * pixel_um / out_scale:.0f} mm focal length at {pixel_um:g} um pixels)" if np.isfinite(pixel_um) and pixel_um > 0 else ""
+        self.status(f"Mixed-scale drizzle output: {out_scale:.3f} arcsec/px{equivalent}")
+        for pixel, members in sorted(cohorts.items()):
+            cameras = sorted({_camera_identity(f.meta.header) or "unknown camera" for f in members})
+            self.status(f"    {', '.join(cameras)} @ {pixel:g} arcsec/px: {len(members)} frames, effective drizzle {pixel / out_scale:.2f}x")
+
+    def _run_drizzle(self, store: FrameStore, infos: list[FrameInfo], header_items: list, crop_box, reference_meta: FrameMeta | None = None) -> tuple[Path, Path | None, str | None]:
         s = self.settings
         d = s.drizzle
         channels, height, width = store.shape
@@ -1901,7 +2127,8 @@ class StackingPipeline:
         acc = new_accumulator(drizzle_channels, height, width, d.scale, self.backend.device)
         ref_offset = store.norms[0].offset
         mode = "Bayer-drizzle (raw CFA)" if use_cfa else "drizzle"
-        self.status(f"{mode}: scale {d.scale}x, pixfrac {d.pixfrac}, {len(order)} frames")
+        self.status(f"{mode}: scale {d.scale:g}x, pixfrac {d.pixfrac}, {len(order)} frames")
+        self._log_drizzle_resolution(order, d.scale, reference_meta)
         with ThreadPoolExecutor(self.io_workers) as loader:
             for n, (path, data, meta) in enumerate(self._prefetch([f.path for f in order], loader)):
                 self._check_cancel()
@@ -1923,10 +2150,10 @@ class StackingPipeline:
         items = [h for h in header_items if h[0] not in ("CROPX0", "CROPY0", "BGNOISE")]
         if crop_box is not None:
             y0, y1, x0, x1 = crop_box
-            box = (y0 * d.scale, y1 * d.scale, x0 * d.scale, x1 * d.scale)
+            box = tuple(int(round(v * d.scale)) for v in (y0, y1, x0, x1))
             image = apply_box(image, box)
             weight = apply_box(weight, box)
-            items += [("CROPX0", x0 * d.scale, "Autocrop left edge (drizzle px)"), ("CROPY0", y0 * d.scale, "Autocrop top edge (drizzle px)")]
+            items += [("CROPX0", box[2], "Autocrop left edge (drizzle px)"), ("CROPY0", box[0], "Autocrop top edge (drizzle px)")]
         items += [
             ("DRIZSCL", d.scale, "Drizzle output scale"),
             ("DRIZKERN", d.kernel, "Drizzle drop kernel"),
@@ -1985,7 +2212,7 @@ class StackingPipeline:
                     "stacked": f.store_index is not None and f.rejected_reason is None,
                     "exposure_s": f.meta.exposure,
                     "focal_length_mm": _focal_length_mm(f.meta.header),
-                    "camera": f.meta.header.get("INSTRUME") or f.meta.header.get("CAMERA") or None,
+                    "camera": f.meta.header.get("INSTRUME") or f.meta.header.get("CAMERA") or _camera_identity(f.meta.header),
                     "quality_setup": None if setup is None else setup[0],
                     "pixel_scale_arcsec": None if setup is None else setup[1],
                     "fwhm_arcsec": None if setup is None or not np.isfinite(f.fwhm) else round(f.fwhm * setup[1], 3),

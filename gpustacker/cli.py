@@ -14,13 +14,13 @@ from . import __version__
 from .batch import DEFAULT_GROUP_KEYS, describe_groups, group_frames, run_batch
 from .cosmetic import CosmeticSettings
 from .distributed import WorkerProbeError, benchmark_store_read, create_worker_server, probe_worker
-from .drizzle import DrizzleSettings
-from .io import discover_frames, is_gpustacker_output
+from .drizzle import DrizzleSettings, normalize_drizzle_scale
+from .io import discover_frames, is_gpustacker_output, sample_test_frames, sampled_output_path
 from .mfdeconv import MFDECONV_PRESETS, MFDeconvSettings
 from .mosaic import BLEND_MODES, INTERPOLATIONS, ORIENTATIONS
 from .normalization import LocalNormSettings
 from .pipeline import PipelineSettings, StackingPipeline
-from .quality import FILTER_PRESETS, WEIGHTING_CHOICES, FilterSettings, filter_preset
+from .quality import DEFAULT_WEIGHTING, FILTER_PRESETS, WEIGHTING_CHOICES, FilterSettings, filter_preset
 from .runlog import RunLog
 from .stacking import StackSettings
 
@@ -88,7 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--gesd-significance", type=float, default=0.05)
     st.add_argument("--gesd-low-relax", type=float, default=1.5, help="GESD: >1 protects dark outliers")
     st.add_argument("--large-scale", action="store_true", help="Grow dense high-rejections (satellite/plane trails)")
-    st.add_argument("--weighting", choices=list(WEIGHTING_CHOICES), default="psfsw", help="psfsw = (transparency/noise)^2, PixInsight PSF-Signal-Weight style")
+    st.add_argument("--weighting", choices=list(WEIGHTING_CHOICES), default=DEFAULT_WEIGHTING, help="psfsnr = (transparency/noise)^2, PixInsight PSF SNR style; psfsw = PixInsight PSF Signal Weight formula; psfsw-ln = PSFSW on normalised frames")
     st.add_argument("--also-weighting", choices=list(WEIGHTING_CHOICES), action="append", default=[], help="Also write a master with this weighting (repeatable)")
     st.add_argument("--no-normalize", action="store_true")
     st.add_argument("--no-local-norm", action="store_true", help="Skip the second, locally normalised stacking pass")
@@ -101,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--no-solve", action="store_true", help="Do not plate solve the outputs with ASTAP")
     st.add_argument("--astap", type=Path, help="Path to astap_cli/astap executable (default: auto-detect)")
     dz = st.add_argument_group("drizzle")
-    dz.add_argument("--drizzle", type=int, default=0, help="Also produce a drizzle integration at this scale (5 is experimental and memory-intensive; 0 = off)")
+    dz.add_argument("--drizzle", type=float, default=0, help="Also produce a drizzle integration at this scale, e.g. 1.5, 2, 3 (5 is experimental and memory-intensive; 0 = off)")
     dz.add_argument("--drizzle-kernel", choices=["square", "point", "gaussian"], default="square")
     dz.add_argument("--pixfrac", type=float, default=0.8)
     dz.add_argument("--drizzle-min-weight", type=float, default=0.05, help="Minimum drizzle weight relative to the map median")
@@ -117,6 +117,10 @@ def build_parser() -> argparse.ArgumentParser:
     fl.add_argument("--filter-psfsw", type=float, default=0.0, help="Optional minimum PSFSW relative to its exposure-group median, measured after registration (default off)")
     st.add_argument("--keep-registered", action="store_true", help="Keep registered .npy frames after stacking")
     st.add_argument("--registered-drive", type=Path, action="append", default=[], dest="registered_storage_dirs", help="Folder on a drive for registered frames; repeat to distribute across drives")
+    st.add_argument("--registered-precision", choices=["float32", "float16"], default="float32", help="Registered-frame storage precision; float16 halves scratch disk use")
+    st.add_argument("--registered-crop", action="store_true", help="Store only each registered frame's covered area (saves disk for mixed sensors / mosaics)")
+    st.add_argument("--cuda-launch-blocking", action="store_true", help="Set CUDA_LAUNCH_BLOCKING=1 so GPU errors point at the failing operation (slower; debugging)")
+    st.add_argument("--test-frames", type=int, default=0, help="Test mode: stack a sample of N frames spread over source folders/nights; outputs get a _test<N> suffix (0 = all frames)")
     st.add_argument("--resume", action="store_true", help="Save a registered-stage checkpoint and resume it on a matching rerun after failure")
     st.add_argument("--work-dir", type=Path)
     st.add_argument("--cpu", action="store_true", help="Force CPU backend")
@@ -217,6 +221,17 @@ def settings_from_args(args: argparse.Namespace) -> PipelineSettings:
         raise SystemExit("Use either light frames or --registered-dir, not both")
     if args.registered_dir is not None and (args.group_by or args.list_groups):
         raise SystemExit("Batch grouping is not supported with --registered-dir")
+    output = args.output
+    if args.test_frames:
+        if args.test_frames < 2:
+            raise SystemExit("--test-frames needs at least 2 frames")
+        if args.registered_dir is not None:
+            raise SystemExit("--test-frames applies to light frames, not --registered-dir")
+        lights, summary = sample_test_frames(lights, args.test_frames, keep=(args.reference,) if args.reference else ())
+        output = sampled_output_path(args.output, args.test_frames)
+        print(f"Test mode: {len(lights)} frames spread over {len(summary)} folder(s)", flush=True)
+        for folder, chosen, available in summary:
+            print(f"    {Path(folder).name}: {chosen}/{available}", flush=True)
     mf = None
     mfv = _mf_values(args)
     if args.mfdeconv:
@@ -236,7 +251,7 @@ def settings_from_args(args: argparse.Namespace) -> PipelineSettings:
         )
     return PipelineSettings(
         lights=lights,
-        output=args.output,
+        output=output,
         work_dir=args.work_dir,
         bias=args.bias,
         dark=args.dark,
@@ -268,7 +283,7 @@ def settings_from_args(args: argparse.Namespace) -> PipelineSettings:
         save_maps=not args.no_maps,
         plate_solve=not args.no_solve,
         astap_path=args.astap,
-        drizzle=DrizzleSettings(enabled=args.drizzle > 0, scale=max(1, args.drizzle), kernel=args.drizzle_kernel, pixfrac=args.pixfrac, min_weight=args.drizzle_min_weight, cfa=not args.no_cfa_drizzle),
+        drizzle=DrizzleSettings(enabled=args.drizzle > 0, scale=normalize_drizzle_scale(max(1.0, args.drizzle)), kernel=args.drizzle_kernel, pixfrac=args.pixfrac, min_weight=args.drizzle_min_weight, cfa=not args.no_cfa_drizzle),
         stack=StackSettings(
             method=args.method,
             sigma_low=args.sigma_low,
@@ -285,6 +300,8 @@ def settings_from_args(args: argparse.Namespace) -> PipelineSettings:
         mfdeconv_blend=args.mf_blend,
         keep_registered=args.keep_registered,
         registered_storage_dirs=args.registered_storage_dirs,
+        registered_precision=args.registered_precision,
+        registered_crop=args.registered_crop,
         resume=args.resume,
         device="cpu" if args.cpu else "auto",
         vram_fraction=args.vram_fraction,
@@ -295,6 +312,8 @@ def settings_from_args(args: argparse.Namespace) -> PipelineSettings:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if getattr(args, "cuda_launch_blocking", False):
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"  # must precede the first CUDA call in this process
     run_log: RunLog | None = None
 
     def status(msg: str) -> None:
@@ -439,6 +458,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.list_groups:
         if args.group_by:
             output_dir = args.output if args.output.suffix.lower() not in (".fit", ".fits", ".fts") else args.output.parent
+            if args.test_frames:
+                output_dir = output_dir / f"_test{args.test_frames}"
             log_path = output_dir / "gpustacker_batch.log"
         else:
             log_path = settings.output.with_suffix(".log")
@@ -473,6 +494,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.list_groups:
                 return 0
             out_dir = args.output if args.output.suffix.lower() not in (".fit", ".fits", ".fts") else args.output.parent
+            if args.test_frames:
+                out_dir = out_dir / f"_test{args.test_frames}"
             batch = run_batch(settings, groups, out_dir, args.name_template, status, progress)
             failed = [g for g, p, _ in batch.outputs if p is None]
             for group, output, error in batch.outputs:

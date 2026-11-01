@@ -5,6 +5,14 @@ entry points remain named `GPUStacker` (`gpustacker`). It includes a dark tkinte
 **ImageMM multi-frame PSF-aware deconvolution** is an experimental optional output; it never
 changes the regular master.
 
+## Version 1.5.0: mixed-resolution stacking and efficient workflows
+
+This release improves mixed-camera stacking with finer-scale reference selection, fractional drizzle,
+camera-specific reference ranking, and camera-aware sharpness and transparency handling. Registered
+frames can optionally use cropped coverage regions or float16 storage to reduce scratch space. Test
+mode samples frames across source folders, while new PSFSW weighting options and CUDA launch-blocking
+diagnostics expand weighting and troubleshooting controls.
+
 ## Version 1.4.0: mixed-camera filters and distributed stacking
 
 This release adds conservative camera- and optics-aware prefilters for mixed acquisition setups,
@@ -69,13 +77,13 @@ py -3 run_gpustacker.py gui
 py -3 run_gpustacker.py stack "G:\Target\Lights" -o "G:\Target\stack.fit" --dark master_dark.fit --flat master_flat.fit
 py -3 run_gpustacker.py stack "G:\Target\Lights" -o out.fit --mfdeconv --mf-frames 12 --mf-iters 30
 py -3 run_gpustacker.py stack --help
-py -3 run_gpustacker.py compare master.fit reference.xisf --also master_weight-noise.fit --also master_weight-psfsw-field.fit
+py -3 run_gpustacker.py compare master.fit reference.xisf --also master_weight-noise.fit --also master_weight-psfsnr-field.fit
 ```
 
 Key options: `--method {winsorized,gesd,sigma,percentile,median,none}`, `--sigma-low/high`,
 `--gesd-outliers/--gesd-significance/--gesd-low-relax`, `--large-scale` (grow trail rejections),
 `--cosmetic {auto,on,off}` with `--hot-sigma 3 --cold-sigma 0`,
-`--weighting {psfsw,psfsw+fwhm,psfsw+field,noise,fwhm,both,none}` (psfsw = (transparency/noise)^2),
+`--weighting {psfsnr,psfsnr+fwhm,psfsnr+field,psfsw,psfsw-ln,noise,fwhm,both,none}` (psfsnr = (transparency/noise)^2, default; psfsw = PixInsight PSF Signal Weight formula),
 `--also-weighting MODE` (repeat to write only the selected additional weighting masters),
 `--filter-transparency 0.6 --filter-stars 0.6 --filter-background 2.0 --filter-fwhm 1.4` (x median; 0 = off; `--no-filters` disables all),
 `--interp {lanczos3,bicubic,bilinear}`, `--no-refine`, `--no-local-norm`, `--local-norm-block 128`,

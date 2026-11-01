@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 from collections import Counter
+from dataclasses import replace as dataclass_replace
 
 import numpy as np
 import tkinter as tk
@@ -23,14 +24,14 @@ from . import APP_NAME, __version__
 from .astro_dark_theme import DARK_BG, DARK_BORDER, DARK_FIELD, DARK_TEXT, configure_dark_theme
 from .batch import DEFAULT_GROUP_KEYS, FrameGroup, describe_groups, group_frames, run_batch
 from .cosmetic import CosmeticSettings
-from .drizzle import DrizzleSettings
+from .drizzle import DrizzleSettings, normalize_drizzle_scale
 from .distributed_gui import _protect_token, _unprotect_token
 from .help_text import HELP_SECTIONS
-from .io import discover_frames, is_gpustacker_output
+from .io import discover_frames, is_gpustacker_output, load_meta, sample_test_frames, sampled_output_path
 from .mfdeconv import MFDECONV_PRESETS, MFDeconvSettings
 from .normalization import LocalNormSettings
-from .pipeline import FrameInfo, PipelineResult, PipelineSettings, StackingPipeline, preview_frame_filters, weighting_output_path
-from .quality import FILTER_PRESETS, WEIGHTING_CHOICES, FilterSettings, filter_preset
+from .pipeline import FrameInfo, PipelineResult, PipelineSettings, StackingPipeline, _camera_identity, _pixel_scale_arcsec, preview_frame_filters, weighting_output_path
+from .quality import DEFAULT_WEIGHTING, FILTER_PRESETS, WEIGHTING_CHOICES, WEIGHTING_NAMES_VERSION, FilterSettings, filter_preset, upgrade_weighting_name
 from .runlog import RunLog
 from .storage import DiskSpaceEstimate, estimate_stack_disk_space, format_bytes
 from .stacking import StackSettings, cleanup_registered_store, registered_store_cleanup_plan
@@ -38,6 +39,7 @@ from .stacking import StackSettings, cleanup_registered_store, registered_store_
 IMAGE_TYPES = [("Astro images", "*.fit *.fits *.fts *.xisf"), ("All files", "*.*")]
 SETTINGS_PATH = Path.home() / ".gpustacker" / "gui_settings.json"
 _AUTO_REFERENCE = "Automatic (sharpest eligible frame)"
+_ALL_CAMERAS = "All cameras"
 _TRANSIENT_VARS = {"count_var", "status_var", "reference_display_var", "reference_stats_var", "reference_choice_status_var", "distributed_token_var", "filter_summary_var", "filter_pending_var", "filter_reason_var"}
 
 
@@ -121,6 +123,30 @@ def rank_reference_infos(infos: list[FrameInfo]) -> dict[str, dict[str, float | 
             "excluded": info.rejected_reason or "",
         })
     return _rank_reference_rows([info.path for info in infos], rows)
+
+
+def camera_model_label(path: Path) -> str:
+    """Camera model + pixel scale from the FITS header, e.g. 'seestar s50 pro, 2.301"/px'."""
+
+    try:
+        header = load_meta(path).header
+    except Exception:
+        return "unreadable header"
+    camera = _camera_identity(header) or "unknown camera"
+    scale = _pixel_scale_arcsec(header)
+    return f'{camera}, {scale:g}"/px' if scale else camera
+
+
+def scan_camera_models(paths: list[Path], progress=None, workers: int = 8) -> dict[Path, str]:
+    from concurrent.futures import ThreadPoolExecutor
+
+    result: dict[Path, str] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for index, (path, label) in enumerate(zip(paths, pool.map(camera_model_label, paths))):
+            result[path] = label
+            if progress is not None and (index + 1) % 250 == 0:
+                progress((index + 1) / len(paths), f"Reading camera headers {index + 1}/{len(paths)}")
+    return result
 
 
 def _rank_reference_rows(lights: list[Path], rows: list[dict]) -> dict[str, dict[str, float | int | None]] | None:
@@ -237,6 +263,7 @@ class GPUStackerApp:
         root.minsize(900, 640)
         configure_dark_theme(root)
         self.lights: list[Path] = []
+        self._test_mode_lines: list[str] = []
         self._reference_choices: dict[str, Path] = {}
         self._analysis_cache: dict[str, FrameInfo] | None = None
         self._analysis_cache_signature: str | None = None
@@ -244,6 +271,8 @@ class GPUStackerApp:
         self._reference_choices_dirty = True
         self._ranking = False
         self._previewing = False
+        self._camera_by_path: dict[Path, str] = {}
+        self._camera_scanning = False
         self._preview_candidate_path: Path | None = None
         self._preview_window: tk.Toplevel | None = None
         self._preview_photo: tk.PhotoImage | None = None
@@ -279,6 +308,7 @@ class GPUStackerApp:
     def _save_settings(self) -> None:
         try:
             data = {k: v.get() for k, v in self._setting_vars().items()}
+            data["weighting_names_version"] = WEIGHTING_NAMES_VERSION
             token = self.distributed_token_var.get()
             if self.distributed_remember_token_var.get() and token and os.name == "nt":
                 data["protected_distributed_token"] = _protect_token(token)
@@ -301,6 +331,8 @@ class GPUStackerApp:
                     var.set(data[name])
                 except tk.TclError:
                     pass  # type mismatch from an older settings file: keep the default
+        if data.get("weighting_names_version") != WEIGHTING_NAMES_VERSION:
+            self.weightings_var.set(",".join(upgrade_weighting_name(mode) for mode in self.weightings_var.get().split(",")))
         if os.name == "nt" and self.distributed_remember_token_var.get() and data.get("protected_distributed_token"):
             try:
                 self.distributed_token_var.set(_unprotect_token(data["protected_distributed_token"]))
@@ -310,6 +342,27 @@ class GPUStackerApp:
     def _on_close(self) -> None:
         self._save_settings()
         self.root.destroy()
+
+    def _apply_cuda_launch_blocking(self) -> None:
+        """CUDA reads CUDA_LAUNCH_BLOCKING once, when this process first initialises the GPU."""
+
+        wanted = bool(self.cuda_blocking_var.get())
+        if wanted:
+            os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+            self._cuda_blocking_applied = True
+        elif getattr(self, "_cuda_blocking_applied", False):
+            os.environ.pop("CUDA_LAUNCH_BLOCKING", None)  # never clear a value set outside the GUI
+            self._cuda_blocking_applied = False
+        try:
+            import torch
+
+            initialised = torch.cuda.is_initialized()
+        except Exception:
+            initialised = False
+        if initialised:
+            self._append_log("CUDA launch blocking change takes effect after restarting GPUStacker (the GPU is already initialised).")
+        elif wanted:
+            self._append_log("CUDA launch blocking ON: GPU errors will point at the failing operation; runs are slower.")
 
     # ------------------------------------------------------------------ layout
 
@@ -361,6 +414,11 @@ class GPUStackerApp:
         self.preview_reference_button = ttk.Button(actions, text="Preview", command=self._preview_reference)
         self.preview_reference_button.pack(side="left")
         ttk.Button(actions, text="Use as reference", command=self._use_reference_candidate).pack(side="left", padx=6)
+        ttk.Label(actions, text="Camera").pack(side="left", padx=(6, 0))
+        self.reference_camera_var = tk.StringVar(value=_ALL_CAMERAS)
+        self.reference_camera_combo = ttk.Combobox(actions, textvariable=self.reference_camera_var, values=(_ALL_CAMERAS,), state="readonly", width=30, postcommand=self._ensure_camera_scan)
+        self.reference_camera_combo.pack(side="left", padx=(4, 0))
+        self.reference_camera_combo.bind("<<ComboboxSelected>>", lambda _event: self._reference_camera_changed())
         self.reference_stats_var = tk.StringVar(value="No ranking stats yet. Click Analyze & rank.")
         ttk.Label(reference, textvariable=self.reference_stats_var, foreground="#9aa3b2").grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
         registered = ttk.Frame(box)
@@ -378,6 +436,13 @@ class GPUStackerApp:
         self.frame_storage_list.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(3, 0))
         ttk.Button(registered, text="Remove", command=self._remove_frame_storage_drive).grid(row=3, column=2, sticky="e", padx=(6, 0), pady=(3, 0))
         self.frame_storage_dirs_var.trace_add("write", lambda *_: self._refresh_frame_storage_list())
+        storage_format = ttk.Frame(registered)
+        storage_format.grid(row=4, column=0, columnspan=3, sticky="w", pady=(3, 0))
+        ttk.Label(storage_format, text="Frame format").pack(side="left")
+        self.registered_precision_var = tk.StringVar(value="32-bit")
+        ttk.Combobox(storage_format, textvariable=self.registered_precision_var, values=("32-bit", "16-bit"), width=7, state="readonly").pack(side="left", padx=(4, 8))
+        self.registered_crop_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(storage_format, text="Covered area only", variable=self.registered_crop_var).pack(side="left")
         self.reference_choice_status_var = tk.StringVar(value="Run reference: automatic")
         ttk.Label(reference, textvariable=self.reference_choice_status_var, foreground="#9aa3b2").grid(row=3, column=0, columnspan=3, sticky="w")
 
@@ -495,8 +560,8 @@ class GPUStackerApp:
         ttk.Label(stack, text="Weighting").grid(row=2, column=0, sticky="w", pady=2)
         row = ttk.Frame(stack)
         row.grid(row=2, column=1, columnspan=2, sticky="ew")
-        self.weightings_var = tk.StringVar(value="psfsw")
-        self.weighting_button = ttk.Button(row, text="Weighting: psfsw", command=self._choose_weightings)
+        self.weightings_var = tk.StringVar(value=DEFAULT_WEIGHTING)
+        self.weighting_button = ttk.Button(row, text=f"Weighting: {DEFAULT_WEIGHTING}", command=self._choose_weightings)
         self.weighting_button.pack(side="left")
         self.weightings_var.trace_add("write", lambda *_: self._update_weighting_label())
         self.normalize_var = tk.BooleanVar(value=True)
@@ -550,9 +615,9 @@ class GPUStackerApp:
         note.grid(row=3, column=2, columnspan=2, sticky="w")
         self.filter_controls.append(note)
         self.camera_aware_filters_var = tk.BooleanVar(value=True)
-        camera_aware = ttk.Checkbutton(row, text="Camera/optics-aware", variable=self.camera_aware_filters_var)
+        # stays enabled with filters off: it also drives mixed-camera transparency and sharpness weighting
+        camera_aware = ttk.Checkbutton(row, text="Camera/optics-aware (mixed cameras)", variable=self.camera_aware_filters_var)
         camera_aware.grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
-        self.filter_controls.append(camera_aware)
         self.camera_aware_filters_var.trace_add("write", self._filter_fields_edited)
         self.filter_summary_var = tk.StringVar(value="Analysis pending")
         ttk.Label(row, textvariable=self.filter_summary_var, wraplength=440).grid(row=5, column=0, columnspan=4, sticky="w", pady=(4, 0))
@@ -590,6 +655,17 @@ class GPUStackerApp:
         ttk.Checkbutton(row, text="Resume after failure", variable=self.resume_var).pack(side="left")
         self.solve_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row, text="Plate solve (ASTAP)", variable=self.solve_var).pack(side="left")
+        self.cuda_blocking_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="CUDA launch blocking (debug)", variable=self.cuda_blocking_var).pack(side="left", padx=(8, 0))
+        self.cuda_blocking_var.trace_add("write", lambda *_: self._apply_cuda_launch_blocking())
+        ttk.Label(products, text="Test mode").grid(row=5, column=0, sticky="w", pady=2)
+        row = ttk.Frame(products)
+        row.grid(row=5, column=1, columnspan=3, sticky="ew")
+        self.test_mode_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="Use a sample of", variable=self.test_mode_var).pack(side="left")
+        self.test_frames_var = tk.IntVar(value=500)
+        ttk.Spinbox(row, textvariable=self.test_frames_var, from_=2, to=100000, increment=100, width=7).pack(side="left", padx=(4, 4))
+        ttk.Label(row, text="frames (spread over folders/nights; outputs get _test<N>)", foreground="#9aa3b2").pack(side="left")
 
         ttk.Label(products, text="Drizzle").grid(row=2, column=0, sticky="w", pady=2)
         drizzle_controls = ttk.Frame(products)
@@ -597,7 +673,7 @@ class GPUStackerApp:
         row = ttk.Frame(drizzle_controls)
         row.pack(anchor="w")
         self.drizzle_var = tk.StringVar(value="off")
-        ttk.Combobox(row, textvariable=self.drizzle_var, values=["off", "2x", "3x", "4x", "5x"], width=5, state="readonly").pack(side="left")
+        ttk.Combobox(row, textvariable=self.drizzle_var, values=["off", "1.5x", "2x", "2.5x", "3x", "4x", "5x"], width=5, state="readonly").pack(side="left")
         ttk.Label(row, text=" kernel").pack(side="left")
         self.drizzle_kernel_var = tk.StringVar(value="square")
         ttk.Combobox(row, textvariable=self.drizzle_kernel_var, values=["square", "point", "gaussian"], width=9, state="readonly").pack(side="left")
@@ -752,12 +828,14 @@ class GPUStackerApp:
         if metrics is None and output_text:
             metrics = rank_reference_frames(self.lights, Path(output_text).with_suffix(".frames.csv"))
         self._reference_metrics = metrics
-        ordered_lights = self.lights
+        candidates = self._camera_filtered(self.lights)
+        ordered_lights = candidates
         if metrics is not None:
-            ordered_lights = sorted(self.lights, key=lambda path: metrics[path.name]["rank"] or math.inf)
+            ordered_lights = sorted(candidates, key=lambda path: (metrics.get(path.name) or {}).get("rank") or math.inf)
         name_counts: dict[str, int] = {}
-        for path in self.lights:
+        for path in candidates:
             name_counts[path.name] = name_counts.get(path.name, 0) + 1
+        show_camera = bool(self._camera_by_path) and self.reference_camera_var.get() == _ALL_CAMERAS
 
         choices: dict[str, Path] = {}
         for path in ordered_lights:
@@ -766,6 +844,8 @@ class GPUStackerApp:
                 label = f"{path.name} ({path.parent.name})"
             if label in choices:
                 label = str(path)
+            if show_camera and path in self._camera_by_path:
+                label = f"{label}  [{self._camera_by_path[path]}]"
             metric = metrics.get(path.name) if metrics is not None else None
             if metric is not None:
                 if metric["rank"] is not None:
@@ -796,6 +876,37 @@ class GPUStackerApp:
     def _select_reference(self, _event=None) -> None:
         self._preview_candidate_path = self._reference_choices.get(self.reference_display_var.get())
         self._update_reference_stats()
+
+    def _camera_filtered(self, paths: list[Path]) -> list[Path]:
+        """Frames of the selected camera model; all frames until headers have been scanned."""
+
+        camera = self.reference_camera_var.get() if hasattr(self, "reference_camera_var") else _ALL_CAMERAS
+        if camera == _ALL_CAMERAS or not self._camera_by_path:
+            return list(paths)
+        return [path for path in paths if self._camera_by_path.get(path) == camera]
+
+    def _ensure_camera_scan(self) -> None:
+        missing = [path for path in self.lights if path not in self._camera_by_path]
+        if not missing or self._camera_scanning:
+            self._update_camera_values()
+            return
+        self._camera_scanning = True
+        self.status_var.set(f"Reading camera headers for {len(missing)} frame(s)... reopen the list when done")
+        progress = lambda fraction, message: self.events.put(("progress", (fraction, message)))  # noqa: E731
+        threading.Thread(target=lambda: self.events.put(("camera_scan", scan_camera_models(missing, progress))), daemon=True).start()
+
+    def _update_camera_values(self) -> None:
+        counts = Counter(self._camera_by_path[path] for path in self.lights if path in self._camera_by_path)
+        self._camera_value_map = {f"{camera}  ({count} frames)": camera for camera, count in sorted(counts.items())}
+        self.reference_camera_combo.configure(values=(_ALL_CAMERAS, *self._camera_value_map))
+
+    def _reference_camera_changed(self) -> None:
+        label = self.reference_camera_var.get()
+        camera = getattr(self, "_camera_value_map", {}).get(label)
+        if camera is not None:
+            self.reference_camera_var.set(camera)  # store the bare model so saved settings survive count changes
+        self._reference_choices_dirty = True
+        self._refresh_reference_choices()
 
     def _update_reference_stats(self) -> None:
         selected_reference = self.reference_path_var.get()
@@ -1000,13 +1111,29 @@ class GPUStackerApp:
         self.progress["value"] = 0
         self.status_var.set("Analyzing frames for filter preview..." if for_filters else "Analyzing frames for reference ranking...")
         signature = self._analysis_signature(settings)
-        self.worker = threading.Thread(target=self._rank_worker, args=(settings, signature), daemon=True)
+        camera = self.reference_camera_var.get()
+        if for_filters or camera == _ALL_CAMERAS:
+            camera = None  # filter previews always analyse every listed frame
+        self.worker = threading.Thread(target=self._rank_worker, args=(settings, signature, camera), daemon=True)
         self.worker.start()
 
-    def _rank_worker(self, settings: PipelineSettings, signature: str) -> None:
+    def _rank_worker(self, settings: PipelineSettings, signature: str, camera: str | None = None) -> None:
         status = lambda message: self.events.put(("log", message))
         progress = lambda fraction, message: self.events.put(("progress", (fraction, message)))
         try:
+            if camera is not None:
+                missing = [path for path in settings.lights if path not in self._camera_by_path]
+                if missing:
+                    scanned = scan_camera_models(missing, progress)
+                    self.events.put(("camera_scan", scanned))
+                else:
+                    scanned = {}
+                lights = [path for path in settings.lights if (scanned.get(path) or self._camera_by_path.get(path)) == camera]
+                if not lights:
+                    raise ValueError(f"No listed frames are from {camera}")
+                status(f"Reference ranking limited to {camera}: {len(lights)} of {len(settings.lights)} frames")
+                settings.lights = lights
+                signature = self._analysis_signature(settings)
             pipeline = StackingPipeline(settings, status, progress)
             self.pipeline = pipeline
             infos = pipeline.analyse()
@@ -1061,10 +1188,21 @@ class GPUStackerApp:
                 use_star_masks=bool(self.mf_masks.get()),
                 use_variance_maps=bool(self.mf_var.get()),
             )
-        weightings = [mode for mode in self.weightings_var.get().split(",") if mode in WEIGHTING_CHOICES] or ["psfsw"]
+        weightings = [mode for mode in self.weightings_var.get().split(",") if mode in WEIGHTING_CHOICES] or [DEFAULT_WEIGHTING]
+        lights = [] if registered_dir is not None else list(self.lights)
+        output = Path(self.output_var.get())
+        self._test_mode_lines = []
+        test_limit = self._test_limit() if registered_dir is None else None
+        if test_limit is not None:
+            reference = opt(self.reference_path_var.get())
+            lights, summary = sample_test_frames(lights, test_limit, keep=(reference,) if reference else ())
+            output = sampled_output_path(output, test_limit)
+            self._test_mode_lines = [f"Test mode: {len(lights)} of {len(self.lights)} frames, spread over {len(summary)} folder(s)"] + [
+                f"    {Path(folder).name}: {chosen}/{available}" for folder, chosen, available in summary
+            ]
         settings = PipelineSettings(
-            lights=[] if registered_dir is not None else list(self.lights),
-            output=Path(self.output_var.get()),
+            lights=lights,
+            output=output,
             registered_dir=registered_dir,
             reference=opt(self.reference_path_var.get()),
             bias=opt(self.bias_var.get()),
@@ -1087,7 +1225,7 @@ class GPUStackerApp:
             full_field=bool(self.full_field_var.get()),
             save_maps=bool(self.maps_var.get()),
             plate_solve=bool(self.solve_var.get()),
-            drizzle=DrizzleSettings(enabled=self.drizzle_var.get() != "off", scale=int(self.drizzle_var.get().rstrip("x")) if self.drizzle_var.get() != "off" else 2, kernel=self.drizzle_kernel_var.get(), pixfrac=float(self.pixfrac_var.get()), min_weight=float(self.drizzle_min_weight_var.get()), cfa=bool(self.cfa_drizzle_var.get())),
+            drizzle=DrizzleSettings(enabled=self.drizzle_var.get() != "off", scale=normalize_drizzle_scale(float(self.drizzle_var.get().rstrip("x"))) if self.drizzle_var.get() != "off" else 2, kernel=self.drizzle_kernel_var.get(), pixfrac=float(self.pixfrac_var.get()), min_weight=float(self.drizzle_min_weight_var.get()), cfa=bool(self.cfa_drizzle_var.get())),
             stack=StackSettings(
                 method=self.method_var.get(),  # type: ignore[arg-type]
                 sigma_low=float(self.sigma_low.get()),
@@ -1104,6 +1242,8 @@ class GPUStackerApp:
             mfdeconv_blend=float(self.mf_blend.get()),
             keep_registered=bool(self.keep_var.get()),
             registered_storage_dirs=registered_storage_dirs,
+            registered_precision="float16" if self.registered_precision_var.get() == "16-bit" else "float32",
+            registered_crop=bool(self.registered_crop_var.get()),
             distributed_enabled=distributed_enabled,
             distributed_host=self.distributed_host_var.get().strip(),
             distributed_port=int(self.distributed_port_var.get()),
@@ -1115,14 +1255,23 @@ class GPUStackerApp:
         )
         if self._analysis_cache is not None and self._analysis_signature(settings) == self._analysis_cache_signature:
             settings.analysis_cache = self._analysis_cache
-        elif self._analysis_cache is not None:
+        elif self._analysis_cache is not None and not self._analysis_cache_still_valid(settings):
             self._invalidate_analysis_cache()
         return settings
+
+    def _analysis_cache_still_valid(self, settings: PipelineSettings) -> bool:
+        """A camera-subset ranking stays valid while its frames are listed and analysis settings are unchanged."""
+
+        analysed = [info.path for info in self._analysis_cache.values()] if self._analysis_cache else []
+        listed = set(settings.lights)
+        if not analysed or any(path not in listed for path in analysed):
+            return False
+        return self._analysis_signature(dataclass_replace(settings, lights=analysed, analysis_cache=None)) == self._analysis_cache_signature
 
     def _update_weighting_label(self) -> None:
         selected = [mode for mode in self.weightings_var.get().split(",") if mode in WEIGHTING_CHOICES]
         if not selected:
-            selected = ["psfsw"]
+            selected = [DEFAULT_WEIGHTING]
         label = selected[0] if len(selected) == 1 else f"{selected[0]} (+{len(selected) - 1})"
         self.weighting_button.configure(text=f"Weighting: {label}")
         enabled = len(selected) > 1 and self.local_norm_var.get()
@@ -1360,7 +1509,7 @@ class GPUStackerApp:
         buttons.pack(fill="x")
 
         def apply() -> None:
-            modes = [choices.get(index) for index in choices.curselection()] or ["psfsw"]
+            modes = [choices.get(index) for index in choices.curselection()] or [DEFAULT_WEIGHTING]
             self.weightings_var.set(",".join(modes))
             popup.destroy()
 
@@ -1452,6 +1601,8 @@ class GPUStackerApp:
             batch_groups = group_frames(list(settings.lights), self._group_keys(), group_messages.append)
             out = Path(self.output_var.get())
             batch_output_dir = out if out.suffix.lower() not in (".fit", ".fits", ".fts") else out.parent
+            if self._test_mode_lines:
+                batch_output_dir = batch_output_dir / f"_test{self._test_limit()}"
             notes.extend(group_messages)
             skipped = [group for group in batch_groups if len(group.lights) < 2]
             notes.extend(f"Skipped {group.key.slug}: fewer than 2 frames" for group in skipped)
@@ -1482,6 +1633,7 @@ class GPUStackerApp:
             disk_estimate = None
         if settings.full_field:
             notes.append("Full-field scratch use may exceed this estimate because the aligned canvas size is known only during registration.")
+        notes = self._test_mode_lines + notes
         if not self._confirm_stack(planned, notes, disk_estimate):
             return
         self._save_settings()
@@ -1489,10 +1641,18 @@ class GPUStackerApp:
         self._clear_log()
         self._cancel_requested = False
         self._run_started = time.perf_counter()
-        self.worker = threading.Thread(target=self._work, args=(settings, batch_groups, batch_output_dir), daemon=True)
+        self.worker = threading.Thread(target=self._work, args=(settings, batch_groups, batch_output_dir, list(self._test_mode_lines)), daemon=True)
         self.worker.start()
 
-    def _work(self, settings: PipelineSettings, batch_groups: list[FrameGroup] | None = None, batch_output_dir: Path | None = None) -> None:
+    def _test_limit(self) -> int | None:
+        if not self.test_mode_var.get():
+            return None
+        limit = int(self.test_frames_var.get())
+        if limit < 2:
+            raise ValueError("Test mode needs at least 2 frames")
+        return limit
+
+    def _work(self, settings: PipelineSettings, batch_groups: list[FrameGroup] | None = None, batch_output_dir: Path | None = None, run_notes: list[str] | None = None) -> None:
         log_path = settings.output.with_suffix(".log")
         if batch_groups is not None and batch_output_dir is not None:
             log_path = batch_output_dir / "gpustacker_batch.log"
@@ -1516,6 +1676,8 @@ class GPUStackerApp:
             run_log.write(f"GPUStacker {__version__}")
             run_log.write(f"Output: {settings.output}")
             self.events.put(("log", f"Run log: {log_path}"))
+        for line in run_notes or []:
+            status(line)
         try:
             if batch_groups is not None:
                 if batch_output_dir is None:
@@ -1726,6 +1888,14 @@ class GPUStackerApp:
                     self._set_running(False)
                     self._reference_choices_dirty = True
                     self._show_finished(Path(folder), lines, elapsed)
+                elif kind == "camera_scan":
+                    self._camera_by_path.update(payload)
+                    self._camera_scanning = False
+                    self._update_camera_values()
+                    self._reference_choices_dirty = True
+                    self._refresh_reference_choices()
+                    if not self._ranking:
+                        self.status_var.set(f"Camera models read: {len(set(payload.values()))} model(s) in {len(payload)} new frame(s)")
                 elif kind == "ranked":
                     infos, signature = payload
                     self._analysis_cache = {str(info.path.resolve()): info for info in infos}

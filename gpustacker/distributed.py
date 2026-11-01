@@ -273,7 +273,7 @@ def _load_probe_store(directory: Path) -> FrameStore:
             raise ValueError("Registered-store frame entry has no path")
         stored_path = Path(stored_name)
         name = stored_path.name
-        if not re.fullmatch(r"reg_\d{4}\.npy", name) or (not stored_path.is_absolute() and len(stored_path.parts) != 1):
+        if not re.fullmatch(r"reg_\d{4,}\.npy", name) or (not stored_path.is_absolute() and len(stored_path.parts) != 1):
             raise ValueError(f"Registered-store frame path is not an owned array: {stored_name}")
         if name in names:
             raise ValueError(f"Registered-store index repeats frame path: {name}")
