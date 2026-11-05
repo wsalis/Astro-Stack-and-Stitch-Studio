@@ -579,7 +579,7 @@ class GPUStackerApp:
         ttk.Checkbutton(row, text="Force CPU", variable=self.cpu_var).pack(side="left", padx=(8, 0))
         ttk.Label(row, text=" workers").pack(side="left")
         self.workers_var = tk.IntVar(value=0)
-        ttk.Spinbox(row, textvariable=self.workers_var, from_=0, to=8, width=4).pack(side="left")
+        ttk.Spinbox(row, textvariable=self.workers_var, from_=0, to=61 if sys.platform == "win32" else max(64, os.cpu_count() or 1), width=4).pack(side="left")
 
         self.filters_enabled_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(stack, text="Filters", variable=self.filters_enabled_var).grid(row=4, column=0, sticky="w", pady=2)

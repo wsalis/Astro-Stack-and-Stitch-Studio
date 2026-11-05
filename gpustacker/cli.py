@@ -125,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--work-dir", type=Path)
     st.add_argument("--cpu", action="store_true", help="Force CPU backend")
     st.add_argument("--vram-fraction", type=float, default=0.75)
-    st.add_argument("--workers", type=int, default=0, help="CPU worker processes for star detection (0 = auto; maximum 8)")
+    st.add_argument("--workers", type=int, default=0, help="CPU worker processes for star detection (0 = auto, up to 8; positive values override auto; Windows maximum 61)")
 
     sb = sub.add_parser("store-benchmark", help="Validate and measure bounded reads from a registered store or network share")
     sb.add_argument("registered_dir", type=Path, help="Registered store directory (use its UNC path on a remote worker)")

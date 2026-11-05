@@ -5,6 +5,14 @@ entry points remain named `GPUStacker` (`gpustacker`). It includes a dark tkinte
 **ImageMM multi-frame PSF-aware deconvolution** is an experimental optional output; it never
 changes the regular master.
 
+## Version 1.5.1: worker overrides and registration hardening
+
+Explicit positive CPU worker counts now override the automatic eight-process limit; automatic
+selection remains conservative, and the GUI and help describe the Windows process limit. Lanczos
+registration uses bounded 64-bit gather indices, with CPU and CUDA regression coverage. This is
+defensive hardening, not a confirmed fix for the previously reported intermittent CUDA assertion.
+Package metadata and the application's reported version are synchronized.
+
 ## Version 1.5.0: mixed-resolution stacking and efficient workflows
 
 This release improves mixed-camera stacking with finer-scale reference selection, fractional drizzle,

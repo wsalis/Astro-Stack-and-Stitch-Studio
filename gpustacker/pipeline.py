@@ -129,7 +129,7 @@ class PipelineSettings:
     resume: bool = False
     device: Literal["auto", "cpu"] = "auto"
     vram_fraction: float = 0.75
-    workers: int = 0  # CPU worker processes for star detection; 0 = auto, max 8
+    workers: int = 0  # CPU worker processes for star detection; 0 = auto
     registered_dir: Path | None = None
     distributed_enabled: bool = False
     distributed_host: str = ""
@@ -532,15 +532,8 @@ class StackingPipeline:
         self.timings: dict[str, float] = {}
         self._cancel = False
         cores = os.cpu_count() or 2
-        # Beyond ~8 workers detection already outruns the GPU main thread, and large pools are flaky on Windows.
-        worker_limit = max(1, min(8, cores - 1))
-        requested_workers = settings.workers if settings.workers > 0 else worker_limit
-        self.cpu_workers = min(requested_workers, worker_limit)
-        if requested_workers > self.cpu_workers:
-            status_cb(
-                f"Requested {requested_workers} detection workers; capped at {self.cpu_workers} "
-                "to limit process memory use"
-            )
+        auto_workers = max(1, min(8, cores - 1))
+        self.cpu_workers = settings.workers if settings.workers > 0 else auto_workers
         self.io_workers = int(min(4, max(1, self.cpu_workers)))
         self.phot: StarSet | None = None
         self.output_origin = (0, 0)

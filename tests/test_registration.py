@@ -220,6 +220,33 @@ def test_lanczos_nonfinite_coordinates_are_missing_data(device, tile_rows):
     torch.testing.assert_close(actual[:, 1, 3], image[:, 2, 2])
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_lanczos_indices_are_int64_and_bounded(device, monkeypatch):
+    from gpustacker.registration import _warp_lanczos
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    image = torch.arange(60, dtype=torch.float32, device=device).reshape(3, 4, 5)
+    sx = torch.tensor([[-1e30, 1e30, -0.5, 4.5], [0.0, 4.0, 1.25, 2.75]], device=device)
+    sy = torch.tensor([[1e30, -1e30, -0.5, 3.5], [0.0, 3.0, 1.25, 2.75]], device=device)
+    expected = _warp_lanczos_reference(image, sx, sy)
+    original = torch.Tensor.index_select
+    gathered = []
+
+    def checked_index_select(tensor, dimension, indices):
+        assert indices.dtype == torch.int64
+        assert int(indices.min()) >= 0
+        assert int(indices.max()) < tensor.shape[dimension]
+        gathered.append(indices.numel())
+        return original(tensor, dimension, indices)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", checked_index_select)
+    actual = _warp_lanczos(image, sx, sy, tile_rows=1)
+
+    assert len(gathered) == 72
+    torch.testing.assert_close(actual, expected)
+
+
 def test_lanczos_tiled_matches_reference():
     from gpustacker.registration import Alignment, _warp_lanczos, source_coords
 

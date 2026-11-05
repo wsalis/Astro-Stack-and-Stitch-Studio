@@ -53,18 +53,21 @@ def test_mfdeconv_blend_endpoints_and_fraction():
         PipelineSettings(lights=[], output=Path("unused.fit"), mfdeconv_blend=1.2)
 
 
-def test_detection_workers_are_capped_to_limit_process_memory(monkeypatch, tmp_path):
+@pytest.mark.parametrize("cores, requested, expected", [(32, 26, 26), (4, 12, 12), (32, 0, 8), (4, 0, 3), (1, 0, 1), (None, 0, 1), (32, 1, 1)])
+def test_detection_worker_count_honors_explicit_override(monkeypatch, tmp_path, cores, requested, expected):
     import gpustacker.pipeline as pipeline_module
 
     monkeypatch.setattr(pipeline_module, "select_backend", lambda *_args: SimpleNamespace(device="cpu"))
     monkeypatch.setattr(pipeline_module, "load_masters", lambda *_args: None)
+    monkeypatch.setattr(pipeline_module.os, "cpu_count", lambda: cores)
     messages = []
-    settings = PipelineSettings(lights=[], output=tmp_path / "workers.fit", workers=26)
+    settings = PipelineSettings(lights=[], output=tmp_path / "workers.fit", workers=requested)
 
     pipeline = StackingPipeline(settings, messages.append)
 
-    assert pipeline.cpu_workers == 8
-    assert any("Requested 26 detection workers; capped at 8" in message for message in messages)
+    assert pipeline.cpu_workers == expected
+    assert pipeline.io_workers == min(4, expected)
+    assert any(f"Workers: {expected} detection process(es)" in message for message in messages)
 
 
 def test_analysis_falls_back_when_windows_cannot_start_detection_worker(light_dir, tmp_path, monkeypatch):

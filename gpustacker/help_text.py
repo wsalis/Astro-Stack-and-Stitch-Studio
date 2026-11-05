@@ -186,7 +186,9 @@ Force CPU
   Ignore CUDA. Slow but useful for debugging or machines without a usable GPU.
 
 workers
-  CPU processes used for star detection and loading. 0 = all cores minus one.""",
+  CPU processes used for star detection and alignment. 0 = automatic (cores minus one, up to 8).
+  Positive values override the automatic count; Windows supports at most 61 processes.
+  More workers use more RAM and may not improve speed. Loading uses at most 4 threads.""",
     ),
     (
         "Frame filters",
